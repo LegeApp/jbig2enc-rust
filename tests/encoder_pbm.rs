@@ -1,6 +1,6 @@
 // Integration tests using PBM images
-const TEST_IMAGE_PBM: &str = "test_image.pbm";
-const TEST_IMAGE1_PBM: &str = "test_image1.pbm";
+const TEST_IMAGE_PBM: &str = "tests/fixtures/test_image.pbm";
+const TEST_IMAGE1_PBM: &str = "tests/fixtures/test_image1.pbm";
 
 use std::io::{BufReader, BufRead, Read, Seek, SeekFrom};
 
