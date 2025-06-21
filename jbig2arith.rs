@@ -313,7 +313,7 @@ impl Jbig2ArithCoder {
         self.byte_out();
 
 
-        if self.bp >= 0 {
+        if self.bp >= 0 && (with_marker || self.b != 0xFF) {
             self.data.push(self.b);
         }
         if with_marker {
@@ -452,7 +452,6 @@ impl Jbig2ArithCoder {
             template,
             at_pixels,
         )?;
-        coder.flush(false);
         Ok(coder.into_vec())
     }
 

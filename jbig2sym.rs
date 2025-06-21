@@ -5,6 +5,8 @@
 use bitvec::prelude::*;
 use bitvec::order::Msb0;
 use bitvec::slice::BitSlice;
+use once_cell::unsync::OnceCell;
+use std::cell::RefCell;
 use ndarray::Array2;
 use xxhash_rust::xxh3::xxh3_64;
 use std::collections::BTreeMap;
@@ -61,6 +63,7 @@ pub struct BitImage {
     pub height: usize,
     /// Bitmap data, stored in MSB-first order
     bits: BitVec<u8, Msb0>,
+    packed_cache: OnceCell<Vec<u32>>, 
 }
 
 impl BitImage {
@@ -104,6 +107,7 @@ impl BitImage {
             width: u32_to_usize(width),
             height: u32_to_usize(height),
             bits,
+            packed_cache: OnceCell::new(),
         })
     }
 
@@ -114,7 +118,7 @@ impl BitImage {
                    "Expected {} bytes for {}x{} bitmap, got {}",
                    expected_bytes, width, height, bytes.len());
         let bits = bytes_to_bitvec(bytes, width * height);
-        Self { width, height, bits }
+        Self { width, height, bits, packed_cache: OnceCell::new() }
     }
 
     /// Creates a bitmap from a bit slice.
@@ -126,6 +130,7 @@ impl BitImage {
             width,
             height,
             bits: bits.to_bitvec(),
+            packed_cache: OnceCell::new(),
         }
     }
 
@@ -155,23 +160,28 @@ impl BitImage {
         self.bits.get(idx).map_or(false, |b| *b)
     }
 
-    /// Converts to packed 32-bit words for efficient comparison.
+    /// Converts to packed 32-bit words for efficient comparison. Results are
+    /// cached to avoid repeated work when the same image is processed multiple
+    /// times.
     pub fn to_packed_words(&self) -> Vec<u32> {
-        let wpr = (self.width + 31) / 32;
-        let mut out = vec![0u32; wpr * self.height];
-        for y in 0..self.height {
-            for xw in 0..wpr {
-                let mut word = 0u32;
-                for bit in 0..32 {
-                    let x = xw * 32 + bit;
-                    if x < self.width && self.get(usize_to_u32(x), usize_to_u32(y)) {
-                        word |= 1u32 << (31 - bit);
+        let cached = self.packed_cache.get_or_init(|| {
+            let wpr = (self.width + 31) / 32;
+            let mut out = vec![0u32; wpr * self.height];
+            for y in 0..self.height {
+                for xw in 0..wpr {
+                    let mut word = 0u32;
+                    for bit in 0..32 {
+                        let x = xw * 32 + bit;
+                        if x < self.width && self.get(usize_to_u32(x), usize_to_u32(y)) {
+                            word |= 1u32 << (31 - bit);
+                        }
                     }
+                    out[y * wpr + xw] = word;
                 }
-                out[y * wpr + xw] = word;
             }
-        }
-        out
+            out
+        });
+        cached.clone()
     }
 
     /// Gets a pixel value at (x, y).
