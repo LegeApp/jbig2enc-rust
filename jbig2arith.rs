@@ -313,7 +313,7 @@ impl Jbig2ArithCoder {
         self.byte_out();
 
 
-        if self.bp >= 0 {
+        if self.bp >= 0 && (with_marker || self.b != 0xFF) {
             self.data.push(self.b);
         }
         if with_marker {
@@ -454,6 +454,7 @@ impl Jbig2ArithCoder {
         )?;
         coder.flush(true);
         Ok(coder.as_bytes().to_vec())
+        Ok(coder.into_vec())
     }
 
     fn encode_generic_region_inner(&mut self, packed_data: &[u32], width: usize, height: usize, template: u8, at_pixels: &[(i8, i8)]) -> Result<()> {
