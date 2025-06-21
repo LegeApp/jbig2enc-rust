@@ -134,8 +134,8 @@ fn main() -> Result<()> {
     let mut image_array = Array2::<u8>::from_shape_fn((height, width), |(r, c)| {
         let byte_idx = r * ((width + 7) / 8) + (c / 8);
         let bit_idx_in_byte = c % 8;
-        // PBM black is 1, but our library expects 0 for black. Invert the pixel.
-        if (data[byte_idx] >> (7 - bit_idx_in_byte)) & 1 == 0 { 1 } else { 0 }
+        // PBM uses 1 for black. Map directly to 1 for black and 0 for white.
+        (data[byte_idx] >> (7 - bit_idx_in_byte)) & 1
     });
     info!("Converted PBM to ndarray::Array2<u8>.");
 

@@ -288,7 +288,7 @@ fn test_arithmetic_coder_generic_region() {
     let at_pixels: Vec<(i8, i8)> = vec![]; // No adaptive pixels
 
     let expected_region_output = [
-        0xE8, 0x63 // Updated to match current output
+        0xE8, 0x63, 0xFF, 0xFF, 0xAC
     ];
 
     println!("Starting generic region encoding test...");

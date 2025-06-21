@@ -452,8 +452,8 @@ impl Jbig2ArithCoder {
             template,
             at_pixels,
         )?;
-        coder.flush(false);
-        Ok(coder.into_vec())
+        coder.flush(true);
+        Ok(coder.as_bytes().to_vec())
     }
 
     fn encode_generic_region_inner(&mut self, packed_data: &[u32], width: usize, height: usize, template: u8, at_pixels: &[(i8, i8)]) -> Result<()> {
