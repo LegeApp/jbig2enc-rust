@@ -452,6 +452,8 @@ impl Jbig2ArithCoder {
             template,
             at_pixels,
         )?;
+        coder.flush(true);
+        Ok(coder.as_bytes().to_vec())
         Ok(coder.into_vec())
     }
 
