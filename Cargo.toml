@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 name = "jbig2"
-path = "jbig2.rs"
+path = "src/jbig2.rs"
 
 [dependencies]
 tracing = { version = "0.1", features = ["std"], optional = true }

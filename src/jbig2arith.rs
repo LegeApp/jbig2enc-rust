@@ -581,17 +581,11 @@ impl Jbig2ArithCoder {
             gbats,
         )?;
 
-        // Finalize the arithmetic coder state
-        coder.renorm();
-        coder.c = coder.c.wrapping_add(coder.a as u32);
-        coder.byte_out();
-        coder.c = coder.c.wrapping_add(coder.a as u32);
-        coder.byte_out();
-        
-        // Flush any remaining bits
-        if coder.ct < 8 && coder.bp >= 0 {
-            coder.data.push(coder.b);
-        }
+        // Finalize the arithmetic coder state and append marker code
+        coder.flush(true);
+
+        // The flush call already appends the last buffered byte and marker,
+        // so no additional handling is required here.
         
         // Get the result
         let result = coder.data;

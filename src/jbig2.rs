@@ -216,18 +216,20 @@ impl<'a> RoiEncoder<'a> {
 
 /// Get the version string for the crate
 pub fn get_version() -> String {
+    let enc_version = option_env!("JBIG2ENC_VERSION").unwrap_or("unknown");
     format!(
         "jbig2-rs {}, jbig2enc {}",
         env!("CARGO_PKG_VERSION"),
-        env!("JBIG2ENC_VERSION", "JBIG2ENC_VERSION not set")
+        enc_version
     )
 }
 
 /// Get the build information string
 pub fn get_build_info() -> String {
+    let build_ts = option_env!("VERGEN_BUILD_TIMESTAMP").unwrap_or("unknown");
     format!(
         "{} (built with {})",
-        env!("VERGEN_BUILD_TIMESTAMP"),
+        build_ts,
         if cfg!(debug_assertions) { "debug" } else { "release" }
     )
 }
