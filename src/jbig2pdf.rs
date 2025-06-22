@@ -1,9 +1,9 @@
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
+use log::info;
 use lopdf::{
     content::{Content, Operation},
     Dictionary, Document, Object, Stream,
 };
-use log::info;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -31,16 +31,16 @@ pub struct Jbig2Input {
 
 #[derive(Debug)]
 pub struct Jbig2Roi {
-    pub stream: Vec<u8>,       // JBIG2-encoded ROI data
-    pub width: u32,            // Pixel width
-    pub height: u32,           // Pixel height
-    pub xres: u32,             // X-resolution (DPI)
-    pub yres: u32,             // Y-resolution (DPI)
-    pub pdf_x: f32,            // PDF coordinates (points)
+    pub stream: Vec<u8>, // JBIG2-encoded ROI data
+    pub width: u32,      // Pixel width
+    pub height: u32,     // Pixel height
+    pub xres: u32,       // X-resolution (DPI)
+    pub yres: u32,       // Y-resolution (DPI)
+    pub pdf_x: f32,      // PDF coordinates (points)
     pub pdf_y: f32,
     pub pdf_width: f32,
     pub pdf_height: f32,
-    pub page_index: usize,     // Page assignment (from JSON)
+    pub page_index: usize, // Page assignment (from JSON)
 }
 
 impl Jbig2Input {
@@ -85,11 +85,15 @@ impl Jbig2Input {
             // Extract PDF coordinates from JSON
             let page_idx = idx / pages_json.len(); // Simple assignment; adjust as needed
             let det_idx = idx % pages_json.len();
-            let page_json = &pages_json.get(page_idx).ok_or_else(|| anyhow::anyhow!("Missing page {}", page_idx))?;
+            let page_json = &pages_json
+                .get(page_idx)
+                .ok_or_else(|| anyhow::anyhow!("Missing page {}", page_idx))?;
             let detections = page_json["detections"]
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("Missing detections for page {}", page_idx))?;
-            let det = detections.get(det_idx).ok_or_else(|| anyhow::anyhow!("Missing detection {}", det_idx))?;
+            let det = detections
+                .get(det_idx)
+                .ok_or_else(|| anyhow::anyhow!("Missing detection {}", det_idx))?;
             let bbox_pdf = det["bbox_pdf"]
                 .as_object()
                 .ok_or_else(|| anyhow::anyhow!("Missing bbox_pdf for detection {}", det_idx))?;
@@ -126,32 +130,41 @@ pub fn jbig2_to_content_type(input: Jbig2Input, page_dims: &[(f32, f32)]) -> Res
     }
 
     let mut result = Vec::with_capacity(pages.len());
-    
+
     for (page_idx, rois) in &pages {
-        let (page_width, page_height) = page_dims
-            .get(*page_idx)
-            .copied()
-            .unwrap_or((612.0, 792.0)); // Default 8.5x11 inches
-            
+        let (page_width, page_height) = page_dims.get(*page_idx).copied().unwrap_or((612.0, 792.0)); // Default 8.5x11 inches
+
         // Create a simple representation of the page content
         let content = format!(
             "Page {} with {} ROIs ({}x{} points)",
-            page_idx, rois.len(), page_width, page_height
-        ).into_bytes();
-        
+            page_idx,
+            rois.len(),
+            page_width,
+            page_height
+        )
+        .into_bytes();
+
         result.push(Page {
             content,
             width: page_width,
             height: page_height,
         });
     }
-    
+
     Ok(result)
 }
 
 // Creates a PDF from JBIG2 input, producing a file compatible with lib.rs.
-pub fn create_jbig2_pdf(input: Jbig2Input, output_path: &str, page_dims: &[(f32, f32)]) -> Result<()> {
-    info!("Creating JBIG2 PDF with {} ROIs at {}", input.rois.len(), output_path);
+pub fn create_jbig2_pdf(
+    input: Jbig2Input,
+    output_path: &str,
+    page_dims: &[(f32, f32)],
+) -> Result<()> {
+    info!(
+        "Creating JBIG2 PDF with {} ROIs at {}",
+        input.rois.len(),
+        output_path
+    );
 
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
@@ -164,10 +177,7 @@ pub fn create_jbig2_pdf(input: Jbig2Input, output_path: &str, page_dims: &[(f32,
     }
 
     for (page_idx, rois) in &pages {
-        let (page_width, page_height) = page_dims
-            .get(*page_idx)
-            .copied()
-            .unwrap_or((612.0, 792.0)); // Default 8.5x11 inches
+        let (page_width, page_height) = page_dims.get(*page_idx).copied().unwrap_or((612.0, 792.0)); // Default 8.5x11 inches
 
         let page_id = doc.new_object_id();
         let mut page_dict = Dictionary::new();
@@ -186,7 +196,9 @@ pub fn create_jbig2_pdf(input: Jbig2Input, output_path: &str, page_dims: &[(f32,
         let mut resources = Dictionary::new();
         let mut xobjects = Dictionary::new();
 
-        let mut content = Content { operations: Vec::new() };
+        let mut content = Content {
+            operations: Vec::new(),
+        };
 
         for (idx, roi) in rois.iter().enumerate() {
             let mut img_dict = Dictionary::new();
@@ -197,7 +209,7 @@ pub fn create_jbig2_pdf(input: Jbig2Input, output_path: &str, page_dims: &[(f32,
             img_dict.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
             img_dict.set("BitsPerComponent", Object::Integer(1));
             img_dict.set("Filter", Object::Name(b"JBIG2Decode".to_vec()));
-            
+
             // Add symbol dictionary if present
             if let Some(sym_data) = &input.symbol_dict {
                 let mut sym_dict = Dictionary::new();
@@ -205,7 +217,7 @@ pub fn create_jbig2_pdf(input: Jbig2Input, output_path: &str, page_dims: &[(f32,
                 sym_dict.set("Subtype", Object::Name(b"JBIG2Decode".to_vec()));
                 let sym_stream = Stream::new(sym_dict, sym_data.clone());
                 let sym_id = doc.add_object(sym_stream);
-                
+
                 let mut decode_parms = Dictionary::new();
                 decode_parms.set("JBIG2Globals", Object::Reference(sym_id));
                 img_dict.set("DecodeParms", Object::Dictionary(decode_parms));
@@ -266,7 +278,8 @@ pub fn create_jbig2_pdf(input: Jbig2Input, output_path: &str, page_dims: &[(f32,
         (b"Type".to_vec(), Object::Name(b"Catalog".to_vec())),
         (b"Pages".to_vec(), Object::Reference(pages_id)),
     ]);
-    doc.objects.insert(catalog_id, Object::Dictionary(catalog_dict));
+    doc.objects
+        .insert(catalog_id, Object::Dictionary(catalog_dict));
     doc.trailer.set("Root", Object::Reference(catalog_id));
 
     // Save the PDF

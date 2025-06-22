@@ -85,20 +85,20 @@ impl Comparator {
                 // Convert BitImages to packed words representation for efficient comparison
                 let a_words = a.to_packed_words();
                 let b_words = b.to_packed_words();
-                
+
                 for row in 0..rows {
                     let a_row_idx = (row as i32 + y0 as i32 - dy) as usize * awpr;
                     let b_row_idx = (row as i32 + y0 as i32) as usize * bwpr;
-                    
+
                     // Ensure we don't go out of bounds
                     if a_row_idx >= a_words.len() || b_row_idx >= b_words.len() {
                         continue;
                     }
-                    
+
                     // Create slices for the current row
                     let a_row_end = std::cmp::min(a_row_idx + awpr, a_words.len());
                     let b_row_end = std::cmp::min(b_row_idx + bwpr, b_words.len());
-                    
+
                     let a_row = &a_words[a_row_idx..a_row_end];
                     let b_row = &b_words[b_row_idx..b_row_end];
 

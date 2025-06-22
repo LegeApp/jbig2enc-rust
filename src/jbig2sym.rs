@@ -2,21 +2,20 @@
 //! and provides utilities for their manipulation, such as sorting for optimal
 //! dictionary encoding.
 
-use bitvec::prelude::*;
 use bitvec::order::Msb0;
+use bitvec::prelude::*;
 use bitvec::slice::BitSlice;
+use ndarray::Array2;
 use once_cell::unsync::OnceCell;
 use std::cell::RefCell;
-use ndarray::Array2;
-use xxhash_rust::xxh3::xxh3_64;
 use std::collections::BTreeMap;
-use std::io::{Read, Seek};
-use std::path::Path;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::io::{Read, Seek};
+use std::path::Path;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::jbig2shared::{u32_to_usize, usize_to_u32};
-
 
 // ==============================================
 // Bit manipulation utilities
@@ -63,7 +62,7 @@ pub struct BitImage {
     pub height: usize,
     /// Bitmap data, stored in MSB-first order
     bits: BitVec<u8, Msb0>,
-    packed_cache: OnceCell<Vec<u32>>, 
+    packed_cache: OnceCell<Vec<u32>>,
 }
 
 impl BitImage {
@@ -93,10 +92,16 @@ impl BitImage {
     /// Creates a new blank bitmap with specified dimensions.
     pub fn new(width: u32, height: u32) -> Result<Self, String> {
         if width == 0 || width > Self::MAX_DIMENSION as u32 {
-            return Err(format!("width must be between 1 and {}", Self::MAX_DIMENSION));
+            return Err(format!(
+                "width must be between 1 and {}",
+                Self::MAX_DIMENSION
+            ));
         }
         if height == 0 || height > Self::MAX_DIMENSION as u32 {
-            return Err(format!("height must be between 1 and {}", Self::MAX_DIMENSION));
+            return Err(format!(
+                "height must be between 1 and {}",
+                Self::MAX_DIMENSION
+            ));
         }
 
         let total_bits = u32_to_usize(width) * u32_to_usize(height);
@@ -114,18 +119,35 @@ impl BitImage {
     /// Creates a bitmap from raw bytes.
     pub fn from_bytes(width: usize, height: usize, bytes: &[u8]) -> Self {
         let expected_bytes = (width * height + 7) / 8;
-        assert_eq!(bytes.len(), expected_bytes,
-                   "Expected {} bytes for {}x{} bitmap, got {}",
-                   expected_bytes, width, height, bytes.len());
+        assert_eq!(
+            bytes.len(),
+            expected_bytes,
+            "Expected {} bytes for {}x{} bitmap, got {}",
+            expected_bytes,
+            width,
+            height,
+            bytes.len()
+        );
         let bits = bytes_to_bitvec(bytes, width * height);
-        Self { width, height, bits, packed_cache: OnceCell::new() }
+        Self {
+            width,
+            height,
+            bits,
+            packed_cache: OnceCell::new(),
+        }
     }
 
     /// Creates a bitmap from a bit slice.
     pub fn from_bits(width: usize, height: usize, bits: &BitSlice<u8, Msb0>) -> Self {
-        assert_eq!(bits.len(), width * height,
-                   "Expected {} bits for {}x{} bitmap, got {}",
-                   width * height, width, height, bits.len());
+        assert_eq!(
+            bits.len(),
+            width * height,
+            "Expected {} bits for {}x{} bitmap, got {}",
+            width * height,
+            width,
+            height,
+            bits.len()
+        );
         Self {
             width,
             height,
@@ -229,9 +251,16 @@ impl BitImage {
 
     /// Crops the bitmap to a specified rectangle.
     pub fn crop(&self, rect: &Rect) -> Self {
-        assert!(rect.x + rect.width <= usize_to_u32(self.width), "crop x + width out of bounds");
-        assert!(rect.y + rect.height <= usize_to_u32(self.height), "crop y + height out of bounds");
-        let mut cropped = Self::new(rect.width, rect.height).expect("Failed to create cropped image");
+        assert!(
+            rect.x + rect.width <= usize_to_u32(self.width),
+            "crop x + width out of bounds"
+        );
+        assert!(
+            rect.y + rect.height <= usize_to_u32(self.height),
+            "crop y + height out of bounds"
+        );
+        let mut cropped =
+            Self::new(rect.width, rect.height).expect("Failed to create cropped image");
         for dy in 0..rect.height {
             for dx in 0..rect.width {
                 let src_idx = u32_to_usize(rect.y + dy) * self.width + u32_to_usize(rect.x + dx);
@@ -248,16 +277,21 @@ impl BitImage {
     pub fn trim(&self) -> (Rect, BitImage) {
         if self.bits.is_empty() || self.bits.not_any() {
             return (
-                Rect { x: 0, y: 0, width: 0, height: 0 },
-                Self::new(0, 0).expect("Failed to create empty image")
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+                Self::new(0, 0).expect("Failed to create empty image"),
             );
         }
-        
+
         let mut min_x = self.width;
         let mut min_y = self.height;
         let mut max_x = 0;
         let mut max_y = 0;
-        
+
         // First pass: find min_y and max_y by checking each row
         for y in 0..self.height {
             let row_has_pixels = (0..self.width).any(|x| self.get_usize(x, y));
@@ -266,7 +300,7 @@ impl BitImage {
                 break;
             }
         }
-        
+
         for y in (0..self.height).rev() {
             let row_has_pixels = (0..self.width).any(|x| self.get_usize(x, y));
             if row_has_pixels {
@@ -275,10 +309,16 @@ impl BitImage {
             }
         }
 
-        if min_y > max_y { // Should be unreachable if not_any() is false
+        if min_y > max_y {
+            // Should be unreachable if not_any() is false
             return (
-                Rect { x: 0, y: 0, width: 0, height: 0 },
-                Self::new(0, 0).expect("Failed to create empty image")
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+                Self::new(0, 0).expect("Failed to create empty image"),
             );
         }
 
@@ -292,10 +332,16 @@ impl BitImage {
             }
         }
 
-        if min_x > max_x { // Should be unreachable
+        if min_x > max_x {
+            // Should be unreachable
             return (
-                Rect { x: 0, y: 0, width: 0, height: 0 },
-                Self::new(0, 0).expect("Failed to create empty image")
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 0,
+                    height: 0,
+                },
+                Self::new(0, 0).expect("Failed to create empty image"),
             );
         }
 
@@ -316,7 +362,10 @@ impl BitImage {
     /// Performs a logical AND with another bitmap.
     pub fn and(&self, other: &Self) -> Self {
         assert_eq!(self.width, other.width, "Bitmaps must have the same width");
-        assert_eq!(self.height, other.height, "Bitmaps must have the same height");
+        assert_eq!(
+            self.height, other.height,
+            "Bitmaps must have the same height"
+        );
         let mut result = self.clone();
         result.bits &= &other.bits;
         result
@@ -325,7 +374,10 @@ impl BitImage {
     /// Performs a logical OR with another bitmap.
     pub fn or(&self, other: &Self) -> Self {
         assert_eq!(self.width, other.width, "Bitmaps must have the same width");
-        assert_eq!(self.height, other.height, "Bitmaps must have the same height");
+        assert_eq!(
+            self.height, other.height,
+            "Bitmaps must have the same height"
+        );
         let mut result = self.clone();
         result.bits |= &other.bits;
         result
@@ -334,7 +386,10 @@ impl BitImage {
     /// Performs a logical XOR with another bitmap.
     pub fn xor(&self, other: &Self) -> Self {
         assert_eq!(self.width, other.width, "Bitmaps must have the same width");
-        assert_eq!(self.height, other.height, "Bitmaps must have the same height");
+        assert_eq!(
+            self.height, other.height,
+            "Bitmaps must have the same height"
+        );
         let mut result = self.clone();
         result.bits ^= &other.bits;
         result
@@ -437,7 +492,6 @@ pub fn sort_symbols_for_dictionary<'a>(symbols: &[&'a BitImage]) -> Vec<Vec<&'a 
         .collect()
 }
 
-
 /// Computes a hash for a `BitImage` using xxh3.
 pub fn compute_glyph_hash(image: &BitImage) -> u64 {
     xxh3_64(image.as_bytes())
@@ -446,8 +500,9 @@ pub fn compute_glyph_hash(image: &BitImage) -> u64 {
 /// Converts an `ndarray::Array2<u8>` to a `BitImage`.
 pub fn array_to_bitimage(array: &Array2<u8>) -> BitImage {
     let (height, width) = array.dim();
-    let mut bit_image = BitImage::new(usize_to_u32(width), usize_to_u32(height)).expect("Failed to create image from array");
-    
+    let mut bit_image = BitImage::new(usize_to_u32(width), usize_to_u32(height))
+        .expect("Failed to create image from array");
+
     for (y, row) in array.rows().into_iter().enumerate() {
         for (x, &pixel) in row.iter().enumerate() {
             if pixel > 0 {
@@ -455,7 +510,7 @@ pub fn array_to_bitimage(array: &Array2<u8>) -> BitImage {
             }
         }
     }
-    
+
     bit_image
 }
 
@@ -464,14 +519,18 @@ pub fn load_pbm(path: &Path) -> Result<BitImage, String> {
     let mut file = File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
     let mut reader = BufReader::new(&mut file);
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| format!("Failed to read magic number: {}", e))?;
+    reader
+        .read_line(&mut line)
+        .map_err(|e| format!("Failed to read magic number: {}", e))?;
     if line.trim() != "P4" {
         return Err(format!("Unsupported PBM format: {}", line.trim()));
     }
 
     loop {
         line.clear();
-        reader.read_line(&mut line).map_err(|e| format!("Failed to read dimensions: {}", e))?;
+        reader
+            .read_line(&mut line)
+            .map_err(|e| format!("Failed to read dimensions: {}", e))?;
         let trimmed = line.trim();
         if !trimmed.starts_with('#') && !trimmed.is_empty() {
             break;
@@ -482,14 +541,22 @@ pub fn load_pbm(path: &Path) -> Result<BitImage, String> {
     if dimensions.len() != 2 {
         return Err("Invalid dimensions".to_string());
     }
-    let width = dimensions[0].parse::<usize>().map_err(|_| "Invalid width".to_string())?;
-    let height = dimensions[1].parse::<usize>().map_err(|_| "Invalid height".to_string())?;
+    let width = dimensions[0]
+        .parse::<usize>()
+        .map_err(|_| "Invalid width".to_string())?;
+    let height = dimensions[1]
+        .parse::<usize>()
+        .map_err(|_| "Invalid height".to_string())?;
 
-    let current_pos = reader.stream_position().map_err(|e| format!("Failed to get position: {}", e))?;
+    let current_pos = reader
+        .stream_position()
+        .map_err(|e| format!("Failed to get position: {}", e))?;
     let width_in_bytes = (width + 7) / 8;
     let mut data = vec![0u8; width_in_bytes * height];
-    file.seek(std::io::SeekFrom::Start(current_pos)).map_err(|e| format!("Seek failed: {}", e))?;
-    file.read_exact(&mut data).map_err(|e| format!("Read failed: {}", e))?;
+    file.seek(std::io::SeekFrom::Start(current_pos))
+        .map_err(|e| format!("Seek failed: {}", e))?;
+    file.read_exact(&mut data)
+        .map_err(|e| format!("Read failed: {}", e))?;
 
     Ok(BitImage::from_bytes(width, height, &data))
 }

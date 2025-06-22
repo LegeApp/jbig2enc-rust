@@ -38,7 +38,7 @@ vergen = { version = "9.0.0", default-features = false, features = ["build"] }
 
 [[bin]]
 name = "jbig2-tester"
-path = "bin/tester.rs"
+path = "src/bin/tester.rs"
 
 [features]
 default = []
@@ -48,6 +48,9 @@ trace_encoder = ["dep:tracing", "dep:tracing-subscriber"]
 [dev-dependencies]
 tracing = { version = "0.1", features = ["std"] }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "registry", "std"] }
+which = "4.0"
+tempfile = "3.2"
+hex-literal = "0.3"
 
 [profile.test]
 # Profile-specific settings go here

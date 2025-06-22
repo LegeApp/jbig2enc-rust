@@ -2,10 +2,10 @@
 const TEST_IMAGE_PBM: &str = "tests/fixtures/test_image.pbm";
 const TEST_IMAGE1_PBM: &str = "tests/fixtures/test_image1.pbm";
 
-use std::io::{BufReader, BufRead, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
-use jbig2::jbig2sym::{BitImage, array_to_bitimage};
-use jbig2::jbig2enc::{encode_page_with_symbol_dictionary, Jbig2EncConfig, encode_symbol_dict};
+use jbig2::jbig2enc::{encode_page_with_symbol_dictionary, encode_symbol_dict, Jbig2EncConfig};
+use jbig2::jbig2sym::{array_to_bitimage, BitImage};
 use ndarray::Array2;
 
 /// Load a PBM file and convert to BitImage
@@ -15,7 +15,7 @@ fn load_pbm(path: &str) -> BitImage {
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
     assert_eq!(line.trim(), "P4", "Only raw PBM (P4) supported");
-    
+
     // Skip comments and get dimensions
     line.clear();
     loop {
@@ -29,15 +29,15 @@ fn load_pbm(path: &str) -> BitImage {
     let parts: Vec<&str> = line.trim().split_whitespace().collect();
     let width = parts[0].parse::<usize>().unwrap();
     let height = parts[1].parse::<usize>().unwrap();
-    
+
     let current_file_pos = reader.stream_position().unwrap();
     file.seek(SeekFrom::Start(current_file_pos)).unwrap();
-    
+
     let width_in_bytes = (width + 7) / 8;
     let expected_data_len = height * width_in_bytes;
     let mut data = vec![0u8; expected_data_len];
     file.read_exact(&mut data).unwrap();
-    
+
     // Convert PBM bytes to Array2<u8>
     let mut image_array = Array2::<u8>::zeros((height, width));
     for r in 0..height {
