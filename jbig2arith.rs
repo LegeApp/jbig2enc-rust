@@ -167,43 +167,50 @@ const NUM_REFINEMENT_CX_STATES: usize = 17; // For GRTEMPLATE=0, contexts 0-16
 /// Initial index into CTBL for new contexts, typically 0 (MPS=0, Qe=0x5601).
 
 pub struct Jbig2ArithCoder {
-    b: u8,
-    c: u32,
-    a: u32,
-    ct: i32,
-    data: Vec<u8>,
+    a: u16,          // Range register A
+    c: u32,          // Code register C
+    b: u8,           // Current byte being built
+    ct: i8,         // Countdown register CT
+    bp: i32,         // Byte position in output
+    data: Vec<u8>,   // Output data
     context: Vec<usize>,
-    int_ctx: [[usize; 256]; 13],
-    iaid_ctx: [usize; 512],
-    refinement_contexts: [u8; 16],
+    int_ctx: [[usize; 256]; 13], // Contexts for integer encoding, storing CTBL indices
+    iaid_ctx: [usize; 512],   // Dynamically sized context for IAID symbols, storing CTBL indices
+    refinement_contexts: [u8; 16], // Contexts for GRTEMPLATE=0 (16 states)
 }
 
 impl Jbig2ArithCoder {
+    /// Returns a reference to the internal output buffer as a byte slice.
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
-
     const INITIAL_STATE: usize = 0;
 
+    /// Creates a new arithmetic encoder with initial state.
     pub fn new() -> Self {
-        Self {
-            b: 0,
+        let mut coder = Self {
+            a: 0,
             c: 0,
-            a: 0x10000,
-            ct: 12,
-            data: Vec::with_capacity(1024),
+            b: 0,
+            ct: 0,
+            bp: -1,
+            data: Vec::new(),
             context: vec![Self::INITIAL_STATE; 1 << 14],
             int_ctx: [[0; 256]; 13],
             iaid_ctx: [0; 512],
             refinement_contexts: [0; 16],
-        }
+        };
+        coder.reset();
+        coder
     }
 
+    /// Resets the encoder to its initial state, clearing output and contexts.
     pub fn reset(&mut self) {
-        self.a = 0x10000;
+        self.a = 0x8000;
         self.c = 0;
         self.ct = 12;
         self.b = 0;
+        self.bp = -1;
         self.data.clear();
         self.context.fill(Self::INITIAL_STATE);
         for ctx in self.int_ctx.iter_mut() {
@@ -213,48 +220,102 @@ impl Jbig2ArithCoder {
         self.refinement_contexts.fill(0);
     }
 
-    fn renorm_e(&mut self) {
-        while self.a < 0x8000 {
+    /// Finalizes the arithmetic coding stream.
+    pub fn finalize(&mut self, data: &mut Vec<u8>) -> Result<()> {
+        self.renorm();
+        self.c = self.c.wrapping_add(self.a as u32);
+        self.byte_out();
+        self.c = self.c.wrapping_add(self.a as u32);
+        self.byte_out();
+
+
+
+        Ok(())
+    }
+
+    /// Renormalizes the arithmetic coder state according to the JBIG2 standard's RENORME procedure (Figure E.8).
+    /// This is called when the range register A becomes too small.
+    fn renorm(&mut self) {
+        loop {
+            // Shift A and C left by 1 bit
             self.a <<= 1;
             self.c <<= 1;
+            
+            // Decrement the countdown register
             self.ct -= 1;
+            
+            // If CT reaches zero, perform byte out
             if self.ct == 0 {
                 self.byte_out();
+            }
+            
+            // Continue until A's high bit is set (A >= 0x8000)
+            if (self.a & 0x8000) != 0 {
+                break;
             }
         }
     }
 
     fn byte_out(&mut self) {
-        if !self.data.is_empty() { // Don't write the initial value of B
-            self.data.push(self.b);
-        }
         if self.b == 0xFF {
+            if self.bp >= 0 {
+                self.data.push(self.b);
+            }
             self.b = (self.c >> 20) as u8;
-            self.c &= 0x0FFF_FFFF;
+            self.bp += 1;
+            self.c &= 0x0F_FFFF;
+            self.ct = 7;
+            return;
+        }
+
+        if self.c < 0x800_0000 {
+            if self.bp >= 0 {
+                self.data.push(self.b);
+            }
+            self.b = (self.c >> 19) as u8;
+            self.bp += 1;
+            self.c &= 0x07_FFFF;
+            self.ct = 8;
+            return;
+        }
+
+        self.b = self.b.wrapping_add(1);
+        if self.b == 0xFF {
+            self.c &= 0x7_FFFF_FF;
+            if self.bp >= 0 {
+                self.data.push(self.b);
+            }
+            self.b = (self.c >> 20) as u8;
+            self.bp += 1;
+            self.c &= 0x0F_FFFF;
             self.ct = 7;
         } else {
+            if self.bp >= 0 {
+                self.data.push(self.b);
+            }
             self.b = (self.c >> 19) as u8;
-            self.c &= 0x0007_FFFF;
+            self.bp += 1;
+            self.c &= 0x07_FFFF;
             self.ct = 8;
         }
     }
 
+    /// Finalizes the arithmetic coding stream.
     pub fn flush(&mut self, with_marker: bool) {
-        let temp_c = self.c.wrapping_add(self.a);
+        let temp_c = self.c + self.a as u32;
         self.c |= 0x0000_FFFF;
         if self.c >= temp_c {
             self.c -= 0x8000;
         }
-        self.c <<= self.ct;
+        self.c <<= self.ct as u32;
         self.byte_out();
-        self.c <<= self.ct;
+        self.c <<= self.ct as u32;
         self.byte_out();
 
-        // write the final byte
-        if self.b != 0xFF {
+
+        if self.bp >= 0 && (with_marker || self.b != 0xFF) {
             self.data.push(self.b);
         }
-
         if with_marker {
             self.data.push(0xFF);
             self.data.push(0xAC);
@@ -271,32 +332,39 @@ impl Jbig2ArithCoder {
         let mut renorm_needed = false;
 
         if d != mps_val { // LPS path
-            self.a = self.a.wrapping_sub(u32::from(qe));
-            if self.a < u32::from(qe) {
-                self.c = self.c.wrapping_add(u32::from(qe));
+            self.a = self.a.wrapping_sub(qe);
+            if self.a < qe {
+                self.c = self.c.wrapping_add(qe as u32);
             } else {
-                self.a = u32::from(qe);
+                self.a = qe;
             }
             
             self.context[ctx] = state.nlps as usize;
             renorm_needed = true;
         } else { // MPS path
-            self.a = self.a.wrapping_sub(u32::from(qe));
+            self.a = self.a.wrapping_sub(qe);
             if (self.a & 0x8000) == 0 {
-                if self.a < u32::from(qe) {
-                    self.a = u32::from(qe);
+                if self.a < qe {
+                    self.a = qe;
                 } else {
-                    self.c = self.c.wrapping_add(u32::from(qe));
+                    self.c = self.c.wrapping_add(qe as u32);
                 }
                 self.context[ctx] = state.nmps as usize;
                 renorm_needed = true;
             } else {
-                self.c = self.c.wrapping_add(u32::from(qe));
+                self.c = self.c.wrapping_add(qe as u32);
             }
         }
 
         if renorm_needed {
-            self.renorm_e();
+            while (self.a & 0x8000) == 0 {
+                self.a <<= 1;
+                self.c <<= 1;
+                self.ct -= 1;
+                if self.ct == 0 {
+                    self.byte_out();
+                }
+            }
         }
     }
 
@@ -384,8 +452,7 @@ impl Jbig2ArithCoder {
             template,
             at_pixels,
         )?;
-        coder.flush(true);
-        Ok(coder.into_vec())
+        Ok(coder.into_vec_with_marker())
     }
 
     fn encode_generic_region_inner(&mut self, packed_data: &[u32], width: usize, height: usize, template: u8, at_pixels: &[(i8, i8)]) -> Result<()> {
@@ -437,5 +504,11 @@ impl Jbig2ArithCoder {
     pub fn into_vec(mut self) -> Vec<u8> {
         self.flush(false); // Flush any pending data, do not add JBIG2 marker
         std::mem::take(&mut self.data) // Assuming data field; ensure it's correct
+    }
+
+    /// Flushes the coder with the JBIG2 end-of-data marker and returns the encoded bytes.
+    pub fn into_vec_with_marker(mut self) -> Vec<u8> {
+        self.flush(true);
+        std::mem::take(&mut self.data)
     }
 }
