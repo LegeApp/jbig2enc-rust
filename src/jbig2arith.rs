@@ -334,14 +334,8 @@ impl Jbig2ArithCoder {
     }
 
     /// Finalizes the arithmetic coding stream.
-    pub fn finalize(&mut self, data: &mut Vec<u8>) -> Result<()> {
-        self.renorm();
-        self.c = self.c.wrapping_add(self.a as u32);
-        self.byte_out();
-        self.c = self.c.wrapping_add(self.a as u32);
-        self.byte_out();
-
-        Ok(())
+    pub fn finalize(&mut self, data: &mut Vec<u8>) {
+        self.flush(true);
     }
 
     /// Renormalizes the arithmetic coder state according to the JBIG2 standard's RENORME procedure (Figure E.8).
@@ -581,17 +575,11 @@ impl Jbig2ArithCoder {
             gbats,
         )?;
 
-        // Finalize the arithmetic coder state
-        coder.renorm();
-        coder.c = coder.c.wrapping_add(coder.a as u32);
-        coder.byte_out();
-        coder.c = coder.c.wrapping_add(coder.a as u32);
-        coder.byte_out();
-        
-        // Flush any remaining bits
-        if coder.ct < 8 && coder.bp >= 0 {
-            coder.data.push(coder.b);
-        }
+        // Finalize the arithmetic coder state and append marker code
+        coder.flush(true);
+
+        // The flush call already appends the last buffered byte and marker,
+        // so no additional handling is required here.
         
         // Get the result
         let result = coder.data;
@@ -629,13 +617,11 @@ impl Jbig2ArithCoder {
             (img[idx_word] >> bit_pos) & 1
         }
 
-        // JBIG2 Template-0 static neighbours (Table A.3-5), MSB→LSB
+        // JBIG2 Template-0 static neighbours (Table A.3‑5), MSB→LSB
         const STATIC_OFFSETS: [(i8, i8); 10] = [
-        (-1,  0), (-2,  0),          // bits 0–1: same row, just-coded and two-left
-        ( 1, -1), ( 0, -1),          // bits 2–3: one-right above, directly above
-        (-1, -1), (-2, -1),          // bits 4–5: one-left & two-left above
-        ( 1, -2), ( 0, -2),          // bits 6–7: one-right two rows up, directly two rows up
-        (-1, -2), (-2, -2),          // bits 8–9: one-left & two-left two rows up
+            (-1, -2), (0, -2), (1, -2), (2, -2),
+            (-2, -1), (-1, -1), (0, -1), (1, -1),
+            (-2, 0), (-1, 0),
         ];
 
         let gbats = &at_pixels[..at_pixels.len().min(4)];
@@ -646,7 +632,8 @@ impl Jbig2ArithCoder {
 
                 for (bit, &(dx, dy)) in STATIC_OFFSETS.iter().enumerate() {
                     let v = sample(packed_data, width, height, x + dx as i32, y + dy as i32);
-                    cx |= (v as usize) << bit;
+                    let shift = STATIC_OFFSETS.len() - 1 - bit;
+                    cx |= (v as usize) << shift;
                 }
 
                 for (bit, (dx, dy)) in gbats.iter().enumerate() {
