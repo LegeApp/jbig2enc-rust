@@ -290,7 +290,10 @@ fn test_arithmetic_coder_generic_region() {
 
     let expected_region_output = [0xE8, 0x63, 0xFF, 0xFF, 0xAC];
 
+    let expected_region_output = [0xE8, 0x63, 0xFF, 0xFF, 0xAC];
+
     let expected_region_output = [0xE8, 0x2C]
+
 
     println!("Starting generic region encoding test...");
     println!("Starting generic region encoding test...");

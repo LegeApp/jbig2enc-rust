@@ -578,6 +578,11 @@ impl Jbig2ArithCoder {
         // Finalize the arithmetic coder state with the JBIG2 terminator
         coder.flush(true);
 
+
+        // Finalize the arithmetic coder state with the JBIG2 terminator
+        coder.flush(true);
+        
+
         // Finalize the arithmetic coder state and append marker code
         coder.flush(true);
         // Get the result
@@ -616,18 +621,20 @@ impl Jbig2ArithCoder {
             (img[idx_word] >> bit_pos) & 1
         }
 
-
         // The context for template 0 uses the four previously coded pixels in
         // the current line ("line3"), five pixels from the previous line
         // ("line2"), three pixels from two lines above ("line1") and up to four
         // adaptive template pixels.  This mirrors the implementation in
         // jbig2dec and the ITU T.88 specification.
+
+
         // JBIG2 Template-0 static neighbours (Table A.3‑5), MSB→LSB
         const STATIC_OFFSETS: [(i8, i8); 10] = [
             (-1, -2), (0, -2), (1, -2), (2, -2),
             (-2, -1), (-1, -1), (0, -1), (1, -1),
             (-2, 0), (-1, 0),
         ];
+
 
 
         let gbats = &at_pixels[..at_pixels.len().min(4)];
@@ -645,6 +652,12 @@ impl Jbig2ArithCoder {
                     | (sample(packed_data, width, height, -2, y - 1) << 4);
             let mut line3: u32 = 0;
 
+            for x in 0..width as i32 {
+                let mut cx: usize = line3 as usize;
+                if let Some((dx, dy)) = gbats.get(0) {
+                    cx |= (sample(packed_data, width, height, x + *dx as i32, y + *dy as i32) as usize) << 4;
+
+
 
             for x in 0..width as i32 {
                 let mut cx: usize = line3 as usize;
@@ -655,6 +668,7 @@ impl Jbig2ArithCoder {
                     let v = sample(packed_data, width, height, x + dx as i32, y + dy as i32);
                     let shift = STATIC_OFFSETS.len() - 1 - bit;
                     cx |= (v as usize) << shift;
+
 
                 }
                 cx |= (line2 as usize) << 5;
