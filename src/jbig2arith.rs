@@ -308,7 +308,7 @@ impl Jbig2ArithCoder {
             ct: 0,
             bp: -1,
             data: Vec::new(),
-            context: vec![Self::INITIAL_STATE; 1 << 14],
+            context: vec![Self::INITIAL_STATE; 1 << 16],
             int_ctx: [[0; 256]; 13],
             iaid_ctx: [0; 512],
             refinement_contexts: [0; 16],
@@ -554,16 +554,17 @@ impl Jbig2ArithCoder {
         let packed_data = image.to_packed_words();
         let mut coder = Jbig2ArithCoder::new();
 
-        // For template 0 (generic region), use no AT-pixels and fixed 10-bit context
-        // For template > 0 (generic refinement), use up to 4 AT-pixels
-        let use_at = template != 0;
-        let gbats = if use_at { 
-            &at_pixels[..at_pixels.len().min(4)] 
-        } else { 
-            &[] 
+        // For template 0 the decoder uses a 16-bit context irrespective of the
+        // number of adaptive template pixels.  For refinement templates the
+        // context size depends on the number of AT pixels present.
+        let use_at = template != 0 || !at_pixels.is_empty();
+        let gbats = if use_at {
+            &at_pixels[..at_pixels.len().min(4)]
+        } else {
+            &[]
         };
-        
-        let n_ctx = if use_at { 10 + gbats.len() } else { 10 };
+
+        let n_ctx = if template == 0 { 16 } else { 10 + gbats.len() };
         coder.context.resize(1 << n_ctx, Jbig2ArithCoder::INITIAL_STATE);
 
         // Encode the image data
@@ -574,13 +575,11 @@ impl Jbig2ArithCoder {
             template,
             gbats,
         )?;
+        // Finalize the arithmetic coder state with the JBIG2 terminator
+        coder.flush(true);
 
         // Finalize the arithmetic coder state and append marker code
         coder.flush(true);
-
-        // The flush call already appends the last buffered byte and marker,
-        // so no additional handling is required here.
-        
         // Get the result
         let result = coder.data;
         
@@ -617,6 +616,12 @@ impl Jbig2ArithCoder {
             (img[idx_word] >> bit_pos) & 1
         }
 
+
+        // The context for template 0 uses the four previously coded pixels in
+        // the current line ("line3"), five pixels from the previous line
+        // ("line2"), three pixels from two lines above ("line1") and up to four
+        // adaptive template pixels.  This mirrors the implementation in
+        // jbig2dec and the ITU T.88 specification.
         // JBIG2 Template-0 static neighbours (Table A.3‑5), MSB→LSB
         const STATIC_OFFSETS: [(i8, i8); 10] = [
             (-1, -2), (0, -2), (1, -2), (2, -2),
@@ -624,26 +629,52 @@ impl Jbig2ArithCoder {
             (-2, 0), (-1, 0),
         ];
 
+
         let gbats = &at_pixels[..at_pixels.len().min(4)];
 
         for y in 0..height as i32 {
+            let mut line1: u32 =
+                sample(packed_data, width, height, 1, y - 2)
+                    | (sample(packed_data, width, height, 0, y - 2) << 1)
+                    | (sample(packed_data, width, height, -1, y - 2) << 2);
+            let mut line2: u32 =
+                sample(packed_data, width, height, 2, y - 1)
+                    | (sample(packed_data, width, height, 1, y - 1) << 1)
+                    | (sample(packed_data, width, height, 0, y - 1) << 2)
+                    | (sample(packed_data, width, height, -1, y - 1) << 3)
+                    | (sample(packed_data, width, height, -2, y - 1) << 4);
+            let mut line3: u32 = 0;
+
+
             for x in 0..width as i32 {
-                let mut cx: usize = 0;
+                let mut cx: usize = line3 as usize;
+                if let Some((dx, dy)) = gbats.get(0) {
+                    cx |= (sample(packed_data, width, height, x + *dx as i32, y + *dy as i32) as usize) << 4;
 
                 for (bit, &(dx, dy)) in STATIC_OFFSETS.iter().enumerate() {
                     let v = sample(packed_data, width, height, x + dx as i32, y + dy as i32);
                     let shift = STATIC_OFFSETS.len() - 1 - bit;
                     cx |= (v as usize) << shift;
-                }
 
-                for (bit, (dx, dy)) in gbats.iter().enumerate() {
-                    let sample_val =
-                        sample(packed_data, width, height, x + *dx as i32, y + *dy as i32);
-                    cx |= (sample_val as usize) << (10 + bit);
+                }
+                cx |= (line2 as usize) << 5;
+                if let Some((dx, dy)) = gbats.get(1) {
+                    cx |= (sample(packed_data, width, height, x + *dx as i32, y + *dy as i32) as usize) << 10;
+                }
+                if let Some((dx, dy)) = gbats.get(2) {
+                    cx |= (sample(packed_data, width, height, x + *dx as i32, y + *dy as i32) as usize) << 11;
+                }
+                cx |= (line1 as usize) << 12;
+                if let Some((dx, dy)) = gbats.get(3) {
+                    cx |= (sample(packed_data, width, height, x + *dx as i32, y + *dy as i32) as usize) << 15;
                 }
 
                 let pixel_val = sample(packed_data, width, height, x, y) != 0;
                 self.encode_bit(cx, pixel_val);
+
+                line1 = ((line1 << 1) | sample(packed_data, width, height, x + 2, y - 2)) & 0x07;
+                line2 = ((line2 << 1) | sample(packed_data, width, height, x + 3, y - 1)) & 0x1f;
+                line3 = ((line3 << 1) | (pixel_val as u32)) & 0x0f;
             }
         }
         Ok(())
