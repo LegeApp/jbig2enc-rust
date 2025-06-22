@@ -415,7 +415,8 @@ impl<'a> Jbig2Encoder<'a> {
                 // For generic regions (template=0), use empty AT-pixels array
                 let coder_data = Jbig2ArithCoder::encode_generic_payload(&page.image, 0, &[])?;
 
-                let mut generic_region_payload = Vec::with_capacity(18 + coder_data.len());
+                // Header is 26 bytes for template 0 (includes 8-byte GBAT)
+                let mut generic_region_payload = Vec::with_capacity(26 + coder_data.len());
                 generic_region_payload.write_u32::<BigEndian>(page.image.width as u32)?;
                 generic_region_payload.write_u32::<BigEndian>(page.image.height as u32)?;
                 generic_region_payload.write_u32::<BigEndian>(0)?; // X location
@@ -425,7 +426,16 @@ impl<'a> Jbig2Encoder<'a> {
                 let flags: u8 = 0x00; // MMR=0, GBTEMPLATE=0, TPGDON=0
                 generic_region_payload.push(flags);
 
-                // Per JBIG2 spec §6.2, AT pixels are not present for GBTEMPLATE=0.
+                // Default adaptive template pixels for template 0
+                // (see ITU T.88, Table 6.6)
+                let default_gbat: [i8; 8] = [
+                    3, -1,
+                    -3, -1,
+                    2, -2,
+                    -2, -2,
+                ];
+                generic_region_payload.extend(default_gbat.iter().map(|b| *b as u8));
+
                 generic_region_payload.extend_from_slice(&coder_data);
 
                 let generic_region_segment = Segment {
