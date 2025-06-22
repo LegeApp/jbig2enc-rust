@@ -1,11 +1,14 @@
 //! This module contains the main JBIG2 encoder logic.
-use anyhow::anyhow;
+use crate::jbig2arith::{IntProc, Jbig2ArithCoder};
 use crate::jbig2comparator::Comparator;
-use crate::jbig2lutz::{find_connected_components, extract_symbols};
-use crate::jbig2structs::{FileHeader, PageInfo, Segment, SegmentType, SymbolDictParams, TextRegionParams};
-use crate::jbig2sym::{BitImage, Rect, Symbol};
-use crate::jbig2arith::{Jbig2ArithCoder, IntProc};
 use crate::jbig2lutz::SymbolExtractionConfig;
+use crate::jbig2lutz::{extract_symbols, find_connected_components};
+use crate::jbig2structs::{
+    FileHeader, PageInfo, Segment, SegmentType, SymbolDictParams, TextRegionParams,
+};
+use crate::jbig2shared::jbig2wrapper;
+use crate::jbig2sym::{BitImage, Rect, Symbol};
+use anyhow::anyhow;
 
 use anyhow::Result;
 use byteorder::{BigEndian, WriteBytesExt};
@@ -60,15 +63,15 @@ pub struct SymbolCandidate {
 }
 
 /// Segment a document image into symbol candidates.
-/// 
+///
 /// This function finds connected components in the input image and returns
 /// them as symbol candidates. Each candidate has a bitmap and a bounding box.
 pub fn segment_symbols(image: &BitImage) -> Result<Vec<SymbolCandidate>> {
     // Find connected components with a minimum size of 10 pixels
     let components = find_connected_components(image, 10);
-    
+
     let mut candidates = Vec::with_capacity(components.len());
-    
+
     for component in components {
         // Create a rectangle from the component bounds
         let bbox = Rect {
@@ -77,13 +80,13 @@ pub fn segment_symbols(image: &BitImage) -> Result<Vec<SymbolCandidate>> {
             width: component.bounds.width,
             height: component.bounds.height,
         };
-        
+
         // Extract the bitmap for this symbol
         let bitmap = BitImage::from_sub_image(image, &bbox);
-        
+
         candidates.push(SymbolCandidate { bitmap, bbox });
     }
-    
+
     Ok(candidates)
 }
 
@@ -173,8 +176,8 @@ impl<'a> Jbig2Encoder<'a> {
             state: EncoderState {
                 pdf_mode: false, // start in raw mode
                 full_headers_remaining: cfg.want_full_headers,
-                segment: true, // Default to using segments
-                use_refinement: false, // Default to no refinement
+                segment: true,            // Default to using segments
+                use_refinement: false,    // Default to no refinement
                 use_delta_encoding: true, // Default to using delta encoding
             },
             global_symbols: Vec::new(),
@@ -192,7 +195,7 @@ impl<'a> Jbig2Encoder<'a> {
         self.state.pdf_mode = true;
         self
     }
-    
+
     /// Returns the number of pages currently added to the encoder
     pub fn get_page_count(&self) -> usize {
         self.pages.len()
@@ -217,7 +220,10 @@ impl<'a> Jbig2Encoder<'a> {
 
                 if let Some(bucket) = self.hash_map.get(&key) {
                     for &idx in bucket {
-                        if comparator.distance(&trimmed, &self.global_symbols[idx], 0).is_some() {
+                        if comparator
+                            .distance(&trimmed, &self.global_symbols[idx], 0)
+                            .is_some()
+                        {
                             self.symbol_usage[idx] += 1;
                             self.symbol_pages[idx].insert(page_num);
                             symbol_instances.push(SymbolInstance {
@@ -281,18 +287,25 @@ impl<'a> Jbig2Encoder<'a> {
 
         let mut output = Vec::new();
 
-        let global_symbol_indices: Vec<usize> = self.global_symbols.iter()
+        let global_symbol_indices: Vec<usize> = self
+            .global_symbols
+            .iter()
             .enumerate()
             .filter(|(i, _)| self.symbol_usage[*i] > 1 || self.pages.len() == 1)
             .map(|(i, _)| i)
             .collect();
 
-        let page_local_symbols: Vec<Vec<usize>> = self.pages.iter()
+        let page_local_symbols: Vec<Vec<usize>> = self
+            .pages
+            .iter()
             .enumerate()
             .map(|(page_num, _)| {
-                self.global_symbols.iter()
+                self.global_symbols
+                    .iter()
                     .enumerate()
-                    .filter(|(i, _)| self.symbol_usage[*i] == 1 && self.symbol_pages[*i].contains(&page_num))
+                    .filter(|(i, _)| {
+                        self.symbol_usage[*i] == 1 && self.symbol_pages[*i].contains(&page_num)
+                    })
                     .map(|(i, _)| i)
                     .collect()
             })
@@ -301,13 +314,15 @@ impl<'a> Jbig2Encoder<'a> {
         // Encode Global Symbol Dictionary (if not empty)
         if !global_symbol_indices.is_empty() {
             let refs: Vec<&BitImage> = global_symbol_indices
-                .iter().map(|&i| &self.global_symbols[i]).collect();
+                .iter()
+                .map(|&i| &self.global_symbols[i])
+                .collect();
             let global_dict_payload = encode_symbol_dict(&refs, &self.config, 0)?;
             let global_dict_segment = Segment {
                 number: current_segment_number,
                 seg_type: SegmentType::SymbolDictionary,
                 deferred_non_retain: false,
-                retain_flags: 0, // Default retention
+                retain_flags: 0,          // Default retention
                 page_association_type: 2, // Global (all pages)
                 referred_to: Vec::new(),
                 page: None, // Global dictionary
@@ -412,6 +427,7 @@ impl<'a> Jbig2Encoder<'a> {
                 current_segment_number += 1;
             } else {
                 // NON-SYMBOL MODE: GenericRegion will be written
+
                 // Default adaptive template pixels for template 0
                 // (see ITU T.88, Table 6.6)
                 let default_gbat: [(i8, i8); 4] = [
@@ -426,6 +442,24 @@ impl<'a> Jbig2Encoder<'a> {
 
                 // Header is 26 bytes for template 0 (includes 8-byte GBAT)
                 let mut generic_region_payload = Vec::with_capacity(26 + coder_data.len());
+
+                // For generic regions (template=0), use empty AT-pixels array
+                let default_gbats: &[(i8, i8)] = &[(3, -1), (-3, -1), (2, -2), (-2, -2)];
+                // Define the AT pixels that will be used for both the header and the payload.
+                // These are the nominal locations for GBTEMPLATE=0 from Table 5 of the spec.
+                let at_pixels_template0: &[(i8, i8)] = &[(3, -1), (-3, -1), (2, -2), (-2, -2)];
+
+                // Pass the AT pixels to the payload encoder.
+                let coder_data = Jbig2ArithCoder::encode_generic_payload(
+                    &page.image,
+                    0, // template 0
+                    at_pixels_template0,
+                )?;
+
+                // Header is 18 bytes for generic region header + 8 bytes for GBAT = 26 bytes
+                let mut generic_region_payload =
+                    Vec::with_capacity(18 + at_pixels_template0.len() * 2 + coder_data.len());
+
                 generic_region_payload.write_u32::<BigEndian>(page.image.width as u32)?;
                 generic_region_payload.write_u32::<BigEndian>(page.image.height as u32)?;
                 generic_region_payload.write_u32::<BigEndian>(0)?; // X location
@@ -439,6 +473,12 @@ impl<'a> Jbig2Encoder<'a> {
                 for &(dx, dy) in &default_gbat {
                     generic_region_payload.push(dx as i8 as u8);
                     generic_region_payload.push(dy as i8 as u8);
+
+                // Write the AT pixel coordinates to the header.
+                for &(x, y) in at_pixels_template0 {
+                    generic_region_payload.push(x as u8);
+                    generic_region_payload.push(y as u8);
+
                 }
 
                 generic_region_payload.extend_from_slice(&coder_data);
@@ -468,7 +508,6 @@ impl<'a> Jbig2Encoder<'a> {
                 payload: Vec::new(),
             };
             end_page_segment.write_into(&mut output)?;
-
         }
 
         self.next_segment_number = current_segment_number;
@@ -481,7 +520,10 @@ impl<'a> Jbig2Encoder<'a> {
             let mut j = i + 1;
             while j < self.global_symbols.len() {
                 let mut comparator = Comparator::default();
-                if comparator.distance(&self.global_symbols[i], &self.global_symbols[j], 0).is_some() {
+                if comparator
+                    .distance(&self.global_symbols[i], &self.global_symbols[j], 0)
+                    .is_some()
+                {
                     self.unite_templates(i, j)?;
                 } else {
                     j += 1;
@@ -506,7 +548,14 @@ impl<'a> Jbig2Encoder<'a> {
                 let mut j = i + 1;
                 while j < indices.len() {
                     let mut comparator = Comparator::default();
-                    if comparator.distance(&self.global_symbols[indices[i]], &self.global_symbols[indices[j]], 0).is_some() {
+                    if comparator
+                        .distance(
+                            &self.global_symbols[indices[i]],
+                            &self.global_symbols[indices[j]],
+                            0,
+                        )
+                        .is_some()
+                    {
                         self.unite_templates(indices[i], indices[j])?;
                         indices.remove(j);
                     } else {
@@ -589,12 +638,70 @@ impl<'a> Jbig2Encoder<'a> {
     }
 }
 
-pub fn encode_symbol_dict(symbols: &[&BitImage], _config: &Jbig2EncConfig, num_imported_symbols: u32) -> Result<Vec<u8>> {
+/// Encodes a generic region, optionally wrapping it in a complete JBIG2 file.
+/// This function is intended to be the top-level entry point for encoding a single generic region.
+pub fn encode_generic_region(
+    img: &BitImage,
+    cfg: &Jbig2EncConfig,
+) -> Result<Vec<u8>> {
+    // A. Produce the generic-region segment payload
+    let generic_region_payload = Jbig2ArithCoder::encode_generic_payload(
+        img,
+        0, // template 0 as per the prompt's implied generic region
+        &[], // no at_pixels for template 0 generic region
+    )?;
+
+    // Create the generic region segment (segment number 1)
+    let generic_region_segment = Segment {
+        number: 1, // Segment number 1
+        seg_type: SegmentType::ImmediateGenericRegion,
+        deferred_non_retain: false,
+        retain_flags: 0,
+        page_association_type: 0, // Explicit page association
+        referred_to: Vec::new(),
+        page: Some(1), // Page 1
+        payload: generic_region_payload.clone(), // Clone to avoid move
+    };
+
+    // If caller wants only the segment, we're done
+    if !cfg.want_full_headers {
+        let mut seg_bytes = Vec::new();
+        generic_region_segment.write_into(&mut seg_bytes)?;
+        return Ok(seg_bytes);
+    }
+
+    // Otherwise wrap it in a complete one-page JBIG2 file
+    let mut out = Vec::with_capacity(generic_region_payload.len() + 64);
+
+    // File header
+    jbig2wrapper::push_file_header(&mut out);
+
+    // Page Information segment (segment number 0)
+    jbig2wrapper::push_page_info(
+        &mut out,
+        img.width as u32,
+        img.height as u32,
+    );
+
+    // Generic region segment (segment number 1)
+    generic_region_segment.write_into(&mut out)?;
+
+    // EOF segment (segment number 2)
+    jbig2wrapper::push_eof(&mut out, 2);
+
+    Ok(out)
+}
+
+pub fn encode_symbol_dict(
+    symbols: &[&BitImage],
+    _config: &Jbig2EncConfig,
+    num_imported_symbols: u32,
+) -> Result<Vec<u8>> {
     // Validate input symbols
     if symbols.is_empty() {
         return Err(anyhow!("encode_symbol_dict: no symbols supplied"));
     }
-    
+
     // Deduplicate symbols by content hash
     let mut seen_hashes = std::collections::HashSet::new();
     let mut unique_symbols_list: Vec<&BitImage> = Vec::with_capacity(symbols.len());
@@ -608,56 +715,68 @@ pub fn encode_symbol_dict(symbols: &[&BitImage], _config: &Jbig2EncConfig, num_i
     // Verify symbol dimensions are within JBIG2 limits
     for (i, sym) in symbols.iter().enumerate() {
         if sym.width > (1 << 24) || sym.height > (1 << 24) {
-            return Err(anyhow!("Symbol at index {} exceeds maximum dimensions ({}x{})", 
-                i, sym.width, sym.height));
+            return Err(anyhow!(
+                "Symbol at index {} exceeds maximum dimensions ({}x{})",
+                i,
+                sym.width,
+                sym.height
+            ));
         }
     }
-    
+
     let mut payload = Vec::new();
     let mut coder = Jbig2ArithCoder::new();
 
     // Create symbol dictionary parameters
-    let mut params = SymbolDictParams { // Made params mutable
-        sd_template: 0,  // Use standard template 0
-        a1x: 0, a1y: 0, a2x: 0, a2y: 0, a3x: 0, a3y: 0, a4x: 0, a4y: 0,  // Default AT pixels
+    let mut params = SymbolDictParams {
+        // Made params mutable
+        sd_template: 0, // Use standard template 0
+        a1x: 0,
+        a1y: 0,
+        a2x: 0,
+        a2y: 0,
+        a3x: 0,
+        a3y: 0,
+        a4x: 0,
+        a4y: 0,                        // Default AT pixels
         exsyms: num_imported_symbols,  // Number of exported symbols
-        newsyms: symbols.len() as u32,  // Number of new symbols
+        newsyms: symbols.len() as u32, // Number of new symbols
     };
 
     // Set number of exported symbols to match number of new symbols (export all)
     let num_export_syms = symbols.len() as u32;
     params.exsyms = num_export_syms;
-    
+
     if cfg!(debug_assertions) {
         debug!("encode_symbol_dict: Exporting {} symbols", num_export_syms);
         trace!("encode_symbol_dict: SymbolDictParams details: {:?}", params);
     }
-    
+
     // Write the symbol dictionary parameters
     payload.extend(params.to_bytes());
-    
+
     // Encode the export flags using IAID arithmetic integer procedure
     let k = (32 - num_export_syms.leading_zeros()).max(1) as u8;
-    
+
     // Run of exported symbols from the imported dictionary (length is 0)
     coder.encode_int_with_ctx(0, k as i32, IntProc::Iaex);
-    
+
     // Run of exported symbols from the new symbols in this dict (length is all of them)
     coder.encode_int_with_ctx(num_export_syms as i32, k as i32, IntProc::Iaex);
-    
+
     // No terminating IAID(0) as per JBIG2 specification §7.4.3.1.7
-    
+
     // No flush/align between export flags and symbol data - we need a continuous stream
-    
+
     // 2. Group symbols by height using jbig2sym's utility function
     let height_classes = crate::jbig2sym::sort_symbols_for_dictionary(&symbols);
-    
+
     let mut last_height = 0;
-    
+
     // 4. Encode the height classes
     for symbols_in_class in &height_classes {
         let h = symbols_in_class[0].height; // All symbols in class have same height
-        // A. Encode Delta Height
+                                            // A. Encode Delta Height
         let delta_h = h as i32 - last_height as i32;
         coder.encode_integer(crate::jbig2arith::IntProc::Iadh, delta_h);
         last_height = h;
@@ -681,26 +800,26 @@ pub fn encode_symbol_dict(symbols: &[&BitImage], _config: &Jbig2EncConfig, num_i
                 &[(-1, -1), (3, -1), (-3, -1), (-2, -2)],
             )?;
         }
-        
+
         // Encode OOB (Out-Of-Band) value for IADW after all symbols in this height class
         // Removed the call to encode_oob_iadw
     }
 
     // 5. flush the coder ONCE
     coder.flush(true);
-    
+
     // 6. Append the single, complete arithmetic payload
     payload.extend(coder.as_bytes());
-    
+
     Ok(payload)
 }
 
 /// Computes the bounding box that contains all symbol instances.
-/// 
+///
 /// # Arguments
 /// * `instances` - Slice of symbol instances to compute bounds for
 /// * `all_known_symbols` - All available symbol bitmaps
-/// 
+///
 /// # Returns
 /// A tuple of (min_x, min_y, width, height) representing the bounding box
 fn compute_region_bounds(
@@ -714,39 +833,39 @@ fn compute_region_bounds(
     let mut min_y = u32::MAX;
     let mut max_x_coord = 0u32;
     let mut max_y_coord = 0u32;
-    
+
     for instance in instances {
         let sym_idx = instance.symbol_id as usize;
         if sym_idx >= all_known_symbols.len() {
             continue; // Skip invalid symbol indices
         }
-        
+
         let pos = Rect {
-            x: instance.x as u32,  // Convert i32 to u32
-            y: instance.y as u32,  // Convert i32 to u32
+            x: instance.x as u32, // Convert i32 to u32
+            y: instance.y as u32, // Convert i32 to u32
             width: crate::jbig2shared::usize_to_u32(all_known_symbols[sym_idx].width),
             height: crate::jbig2shared::usize_to_u32(all_known_symbols[sym_idx].height),
         };
-        
+
         min_x = min_x.min(pos.x);
         min_y = min_y.min(pos.y);
         max_x_coord = max_x_coord.max(pos.x + pos.width);
         max_y_coord = max_y_coord.max(pos.y + pos.height);
     }
-    
+
     // Handle potential underflow if max < min (shouldn't happen with valid coordinates)
     let region_width = if max_x_coord > min_x {
         max_x_coord - min_x
     } else {
         0
     };
-    
+
     let region_height = if max_y_coord > min_y {
         max_y_coord - min_y
     } else {
         0
     };
-    
+
     (min_x, min_y, region_width, region_height)
 }
 
@@ -757,8 +876,7 @@ pub fn encode_refine(
     coder: &mut Jbig2ArithCoder,
 ) -> Result<()> {
     // 1. Compute region bounds
-    let (min_x, min_y, region_w, region_h) =
-        compute_region_bounds(instances, all_known_symbols);
+    let (min_x, min_y, region_w, region_h) = compute_region_bounds(instances, all_known_symbols);
     let width = region_w.max(1);
     let height = region_h.max(1);
 
@@ -788,8 +906,7 @@ pub fn encode_refine(
     coder.encode_int_with_ctx(num_inst as i32, 16, IntProc::Iaai);
 
     // 4. Initialize an empty region buffer to track already emitted pixels
-    let mut region_buf = BitImage::new(width, height)
-        .expect("region bitmap too large");
+    let mut region_buf = BitImage::new(width, height).expect("region bitmap too large");
 
     // 5. Emit each instance
     for inst in instances {
@@ -851,7 +968,7 @@ pub fn encode_refine(
 }
 
 /// Encodes a text region segment to the output.
-/// 
+///
 /// This function takes a list of symbols and their instances in the text region,
 /// and encodes them according to JBIG2 spec §6.4.10. It supports both absolute coordinates
 /// and IADW/IADH delta encoding for more efficient compression.
@@ -866,31 +983,46 @@ pub fn encode_text_region(
     if instances.is_empty() {
         return Err(anyhow!("No symbol instances provided for text region"));
     }
-    
+
     // Validate global dictionary indices
-    if global_dict_indices.iter().any(|&idx| idx >= all_known_symbols.len()) {
+    if global_dict_indices
+        .iter()
+        .any(|&idx| idx >= all_known_symbols.len())
+    {
         return Err(anyhow!("Invalid global dictionary index in text region"));
     }
-    
+
     // Validate local dictionary indices if provided
     if !local_dict_indices.is_empty() {
-        if local_dict_indices.iter().any(|&idx| idx >= all_known_symbols.len()) {
+        if local_dict_indices
+            .iter()
+            .any(|&idx| idx >= all_known_symbols.len())
+        {
             return Err(anyhow!("Invalid local dictionary index in text region"));
         }
     }
-    
+
     // Validate each instance
     for (i, instance) in instances.iter().enumerate() {
         if instance.symbol_index >= all_known_symbols.len() {
-            return Err(anyhow!("Symbol instance {} references invalid symbol index {} (max {})",
-                i, instance.symbol_index, all_known_symbols.len() - 1));
+            return Err(anyhow!(
+                "Symbol instance {} references invalid symbol index {} (max {})",
+                i,
+                instance.symbol_index,
+                all_known_symbols.len() - 1
+            ));
         }
-        
+
         let symbol = &all_known_symbols[instance.symbol_index];
-        if instance.position.x as u64 + symbol.width as u64 > u32::MAX as u64 ||
-           instance.position.y as u64 + symbol.height as u64 > u32::MAX as u64 {
-            return Err(anyhow!("Symbol instance {} at position ({}, {}) would overflow 32-bit coordinates",
-                i, instance.position.x, instance.position.y));
+        if instance.position.x as u64 + symbol.width as u64 > u32::MAX as u64
+            || instance.position.y as u64 + symbol.height as u64 > u32::MAX as u64
+        {
+            return Err(anyhow!(
+                "Symbol instance {} at position ({}, {}) would overflow 32-bit coordinates",
+                i,
+                instance.position.x,
+                instance.position.y
+            ));
         }
     }
     let mut payload = Vec::new();
@@ -910,16 +1042,24 @@ pub fn encode_text_region(
             let sym_idx_in_all_known_list = instance.symbol_index();
             let symbol_width = all_known_symbols[sym_idx_in_all_known_list].width as i32;
             let symbol_height = all_known_symbols[sym_idx_in_all_known_list].height as i32;
-            
+
             min_x = min_x.min(pos.x as u32);
             min_y = min_y.min(pos.y as u32);
             max_x_coord = max_x_coord.max((pos.x as i32 + symbol_width) as u32);
             max_y_coord = max_y_coord.max((pos.y as i32 + symbol_height) as u32);
         }
     }
-    
-    let region_width = if max_x_coord > min_x { max_x_coord - min_x } else { 0 };
-    let region_height = if max_y_coord > min_y { max_y_coord - min_y } else { 0 };
+
+    let region_width = if max_x_coord > min_x {
+        max_x_coord - min_x
+    } else {
+        0
+    };
+    let region_height = if max_y_coord > min_y {
+        max_y_coord - min_y
+    } else {
+        0
+    };
 
     let params = TextRegionParams {
         width: region_width,
@@ -940,12 +1080,16 @@ pub fn encode_text_region(
     // Write the flags byte (ensuring TRHUFF is 0 for arithmetic coding)
     let mut flags = 0u8;
     // flags |= 0x80;  // TRHUFF bit (bit 7) - MUST BE 0 for arithmetic coding
-    if params.refine { flags |= 0x40; }  // TRREF
-    flags |= (params.comb_op & 0x7) << 2;  // TRDT (bits 2-4)
-    if params.refine_template != 0 { flags |= 0x08; }  // TRTP (bit 3)
-    
+    if params.refine {
+        flags |= 0x40;
+    } // TRREF
+    flags |= (params.comb_op & 0x7) << 2; // TRDT (bits 2-4)
+    if params.refine_template != 0 {
+        flags |= 0x08;
+    } // TRTP (bit 3)
+
     payload.push(flags);
-    
+
     // Write the rest of the parameters
     payload.extend(params.to_bytes());
 
@@ -955,29 +1099,39 @@ pub fn encode_text_region(
 
     // Initialize variables for text region encoding as per JBIG2 spec (single strip model)
     let mut current_t_strip = 0; // T-coordinate of the current strip, initialized to 0 (spec 6.4.5.1)
-    let mut last_s_coord = 0;    // Last S-coordinate for delta encoding
+    let mut last_s_coord = 0; // Last S-coordinate for delta encoding
     let mut is_first_instance_in_strip = true;
 
     // These are from the original code and needed for symbol ID encoding
     let num_total_dict_symbols = (global_dict_indices.len() + local_dict_indices.len()) as u32;
     let symbol_id_bits = log2up(num_total_dict_symbols.max(1)).max(1);
 
-    for instance in instances.iter() { // Iterate through instances
+    for instance in instances.iter() {
+        // Iterate through instances
         let sym_idx_in_all_known_list = instance.symbol_index();
         let symbol_props = &all_known_symbols[sym_idx_in_all_known_list];
-        
+
         // Ensure instance_abs_pos has correct width and height
-        let mut instance_abs_pos = instance.position(); 
+        let mut instance_abs_pos = instance.position();
         instance_abs_pos.width = symbol_props.width as u32;
         instance_abs_pos.height = symbol_props.height as u32;
 
         // Determine the symbol ID to encode (logic from original, confirmed correct by plan)
-        let symbol_id_to_encode = if let Some(pos_global) = global_dict_indices.iter().position(|&idx| idx == sym_idx_in_all_known_list) {
+        let symbol_id_to_encode = if let Some(pos_global) = global_dict_indices
+            .iter()
+            .position(|&idx| idx == sym_idx_in_all_known_list)
+        {
             pos_global as u32
-        } else if let Some(pos_local) = local_dict_indices.iter().position(|&idx| idx == sym_idx_in_all_known_list) {
+        } else if let Some(pos_local) = local_dict_indices
+            .iter()
+            .position(|&idx| idx == sym_idx_in_all_known_list)
+        {
             (global_dict_indices.len() + pos_local) as u32
         } else {
-            anyhow::bail!("Symbol instance (index {}) not found in referred dictionaries!", sym_idx_in_all_known_list);
+            anyhow::bail!(
+                "Symbol instance (index {}) not found in referred dictionaries!",
+                sym_idx_in_all_known_list
+            );
         };
 
         if cfg!(debug_assertions) {
@@ -1009,12 +1163,16 @@ pub fn encode_text_region(
             let delta_s = instance_abs_pos.x as i32 - last_s_coord;
             coder.encode_integer(IntProc::Iads, delta_s);
         }
-        
+
         // Always update last_s_coord for the next delta calculation
         last_s_coord = instance_abs_pos.x as i32;
 
         // Encode the Symbol ID itself (IAID)
-        coder.encode_int_with_ctx(symbol_id_to_encode as i32, symbol_id_bits as i32, IntProc::Iads);
+        coder.encode_int_with_ctx(
+            symbol_id_to_encode as i32,
+            symbol_id_bits as i32,
+            IntProc::Iads,
+        );
     }
     coder.flush(true);
     payload.extend(coder.as_bytes());
@@ -1029,7 +1187,9 @@ fn compute_symbol_hash(symbol: &BitImage) -> u32 {
 }
 
 fn log2up(v: u32) -> u32 {
-    if v == 0 { return 0; }
+    if v == 0 {
+        return 0;
+    }
     let is_pow_of_2 = (v & (v - 1)) == 0;
     let mut r = 0;
     let mut val = v;
@@ -1039,8 +1199,6 @@ fn log2up(v: u32) -> u32 {
     }
     r + if is_pow_of_2 { 0 } else { 1 }
 }
-
-
 
 pub fn encode_document(images: &[Array2<u8>], config: &Jbig2EncConfig) -> Result<Vec<u8>> {
     let mut encoder = Jbig2Encoder::new(config);
@@ -1077,12 +1235,12 @@ impl TextRegionSymbolInstance {
             height: 0, // These will be set by the caller
         }
     }
-    
+
     /// Returns the symbol index for this instance.
     pub fn symbol_index(&self) -> usize {
         self.symbol_id as usize
     }
-    
+
     /// Converts to a SymbolInstance
     pub fn to_symbol_instance(&self, symbol_bitmap: &BitImage) -> SymbolInstance {
         SymbolInstance {
@@ -1155,9 +1313,13 @@ pub fn encode_page_with_symbol_dictionary(
 
     // 2. Build the symbol dictionary and get symbol instances
     let mut comparator = Comparator::default();
-    let (dictionary_symbols, text_region_instances) = 
+    let (dictionary_symbols, text_region_instances) =
         build_dictionary_and_get_instances(&extracted_symbols, &mut comparator);
-    println!("[DEBUG] Built dictionary with {} symbols and {} instances", dictionary_symbols.len(), text_region_instances.len());
+    println!(
+        "[DEBUG] Built dictionary with {} symbols and {} instances",
+        dictionary_symbols.len(),
+        text_region_instances.len()
+    );
 
     let mut output = Vec::new();
     let mut current_segment_number = next_segment_num;
@@ -1189,9 +1351,10 @@ pub fn encode_page_with_symbol_dictionary(
     let mut encoder = Jbig2Encoder::new(config);
     let region_payload = if encoder.state.use_refinement {
         let mut coder = Jbig2ArithCoder::new();
-        
+
         // Convert TextRegionSymbolInstance to SymbolInstance with instance_bitmap
-        let symbol_instances: Vec<SymbolInstance> = text_region_instances.iter()
+        let symbol_instances: Vec<SymbolInstance> = text_region_instances
+            .iter()
             .map(|instance| {
                 let symbol_bitmap = if (instance.symbol_id as usize) < dictionary_symbols.len() {
                     &dictionary_symbols[instance.symbol_id as usize]
@@ -1201,10 +1364,10 @@ pub fn encode_page_with_symbol_dictionary(
                 instance.to_symbol_instance(symbol_bitmap)
             })
             .collect();
-        
+
         // Create a vector of references to the dictionary symbols
         let dict_refs: Vec<&BitImage> = dictionary_symbols.iter().collect();
-        
+
         encode_text_region(
             &symbol_instances,
             config,
@@ -1214,7 +1377,8 @@ pub fn encode_page_with_symbol_dictionary(
         )?
     } else {
         // Convert TextRegionSymbolInstance to SymbolInstance with instance_bitmap
-        let symbol_instances: Vec<SymbolInstance> = text_region_instances.iter()
+        let symbol_instances: Vec<SymbolInstance> = text_region_instances
+            .iter()
             .map(|instance| {
                 let symbol_bitmap = if (instance.symbol_id as usize) < dictionary_symbols.len() {
                     &dictionary_symbols[instance.symbol_id as usize]
@@ -1224,10 +1388,10 @@ pub fn encode_page_with_symbol_dictionary(
                 instance.to_symbol_instance(symbol_bitmap)
             })
             .collect();
-        
+
         // Create a vector of references to the dictionary symbols
         let dict_refs: Vec<&BitImage> = dictionary_symbols.iter().collect();
-        
+
         encode_text_region(
             &symbol_instances,
             config,
@@ -1242,7 +1406,7 @@ pub fn encode_page_with_symbol_dictionary(
         seg_type: SegmentType::ImmediateTextRegion,
         retain_flags: 0,
         referred_to: vec![dictionary_segment_number], // Refers to the dictionary
-        page: Some(1), // Assuming page 1
+        page: Some(1),                                // Assuming page 1
         payload: region_payload,
         ..Default::default()
     };

@@ -1,5 +1,4 @@
 /// Pruned Rust equivalents of JBIG2 structs and segment headers
-
 use byteorder::{BigEndian, WriteBytesExt};
 use std::io::{self, Write};
 
@@ -182,7 +181,10 @@ impl TryFrom<u8> for SegmentType {
             53 => Ok(SegmentType::Tables),
             54 => Ok(SegmentType::ColorPalette),
             62 => Ok(SegmentType::Extension),
-            _ => Err(io::Error::new(io::ErrorKind::InvalidData, format!("Invalid segment type: {}", value))),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid segment type: {}", value),
+            )),
         }
     }
 }
@@ -191,9 +193,9 @@ impl TryFrom<u8> for SegmentType {
 // File header (magic + flags + number of pages)
 // -----------------------------------------------------------------------------
 pub struct FileHeader {
-    pub organisation_type: bool,  // 1 bit
-    pub unknown_n_pages: bool,    // 1 bit
-    pub n_pages: u32,             // big-endian
+    pub organisation_type: bool, // 1 bit
+    pub unknown_n_pages: bool,   // 1 bit
+    pub n_pages: u32,            // big-endian
 }
 
 impl FileHeader {
@@ -206,8 +208,12 @@ impl FileHeader {
         buf.extend_from_slice(MAGIC);
 
         let mut flags = 0u8;
-        if self.organisation_type { flags |= 0x01; }
-        if self.unknown_n_pages   { flags |= 0x02; }
+        if self.organisation_type {
+            flags |= 0x01;
+        }
+        if self.unknown_n_pages {
+            flags |= 0x02;
+        }
         buf.push(flags);
         buf.write_u32::<BigEndian>(self.n_pages).unwrap();
         buf
@@ -219,18 +225,18 @@ impl FileHeader {
 // -----------------------------------------------------------------------------
 #[derive(Debug)]
 pub struct PageInfo {
-    pub width: u32,                // big-endian
-    pub height: u32,               // big-endian
-    pub xres: u32,                 // big-endian
-    pub yres: u32,                 // big-endian
-    pub is_lossless: bool,         // bit0
-    pub contains_refinements: bool,// bit1
-    pub default_pixel: bool,       // bit2
-    pub default_operator: u8,      // bits3-4
-    pub aux_buffers: bool,         // bit5
-    pub operator_override: bool,   // bit6
-    pub reserved: bool,            // bit7 (must be zero)
-    pub segment_flags: u16,        // big-endian (often 0)
+    pub width: u32,                 // big-endian
+    pub height: u32,                // big-endian
+    pub xres: u32,                  // big-endian
+    pub yres: u32,                  // big-endian
+    pub is_lossless: bool,          // bit0
+    pub contains_refinements: bool, // bit1
+    pub default_pixel: bool,        // bit2
+    pub default_operator: u8,       // bits3-4
+    pub aux_buffers: bool,          // bit5
+    pub operator_override: bool,    // bit6
+    pub reserved: bool,             // bit7 (must be zero)
+    pub segment_flags: u16,         // big-endian (often 0)
 }
 
 impl Default for PageInfo {
@@ -238,8 +244,8 @@ impl Default for PageInfo {
         PageInfo {
             width: 0,
             height: 0,
-            xres: 300,  // Default 300 DPI
-            yres: 300,  // Default 300 DPI
+            xres: 300, // Default 300 DPI
+            yres: 300, // Default 300 DPI
             is_lossless: false,
             contains_refinements: false,
             default_pixel: false,
@@ -254,19 +260,29 @@ impl Default for PageInfo {
 
 impl PageInfo {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(4*4 + 1 + 2);
+        let mut buf = Vec::with_capacity(4 * 4 + 1 + 2);
         buf.write_u32::<BigEndian>(self.width).unwrap();
         buf.write_u32::<BigEndian>(self.height).unwrap();
         buf.write_u32::<BigEndian>(self.xres).unwrap();
         buf.write_u32::<BigEndian>(self.yres).unwrap();
         // pack 8 flags into one byte
         let mut b = 0u8;
-        if self.is_lossless           { b |= 0x01; }
-        if self.contains_refinements  { b |= 0x02; }
-        if self.default_pixel         { b |= 0x04; }
+        if self.is_lossless {
+            b |= 0x01;
+        }
+        if self.contains_refinements {
+            b |= 0x02;
+        }
+        if self.default_pixel {
+            b |= 0x04;
+        }
         b |= (self.default_operator & 0x03) << 3;
-        if self.aux_buffers           { b |= 0x20; }
-        if self.operator_override     { b |= 0x40; }
+        if self.aux_buffers {
+            b |= 0x20;
+        }
+        if self.operator_override {
+            b |= 0x40;
+        }
         // bit7 reserved = 0
         buf.push(b);
         buf.write_u16::<BigEndian>(self.segment_flags).unwrap();
@@ -280,14 +296,18 @@ impl PageInfo {
 #[derive(Debug)]
 pub struct SymbolDictParams {
     // Only core flags for text-only; all other refinement flags omitted
-    pub sd_template: u8,   // 0..3
+    pub sd_template: u8, // 0..3
     // Adaptive template coords (usually zero for default)
-    pub a1x: i8, pub a1y: i8,
-    pub a2x: i8, pub a2y: i8,
-    pub a3x: i8, pub a3y: i8,
-    pub a4x: i8, pub a4y: i8,
-    pub exsyms: u32,       // big-endian
-    pub newsyms: u32,      // big-endian
+    pub a1x: i8,
+    pub a1y: i8,
+    pub a2x: i8,
+    pub a2y: i8,
+    pub a3x: i8,
+    pub a3y: i8,
+    pub a4x: i8,
+    pub a4y: i8,
+    pub exsyms: u32,  // big-endian
+    pub newsyms: u32, // big-endian
 }
 
 impl SymbolDictParams {
@@ -316,16 +336,16 @@ impl SymbolDictParams {
 // -----------------------------------------------------------------------------
 #[derive(Debug)]
 pub struct TextRegionParams {
-    pub width: u32,       // big-endian
-    pub height: u32,      // big-endian
-    pub x: u32,           // big-endian
-    pub y: u32,           // big-endian
-    pub ds_offset: u8,    // SBDSOFFSET (signed 5 bits, effectively 0-31 for positive offset)
-    pub refine: bool,     // SBREFINE flag (bit 1)
-    pub log_strips: u8,   // LOGSBSTRIPS (bits 2-3)
-    pub ref_corner: u8,   // REFCORNER (bits 4-5)
-    pub transposed: bool, // TRANSPOSED flag (bit 6)
-    pub comb_op: u8,      // SBCOMBOP (bits 7-8)
+    pub width: u32,          // big-endian
+    pub height: u32,         // big-endian
+    pub x: u32,              // big-endian
+    pub y: u32,              // big-endian
+    pub ds_offset: u8,       // SBDSOFFSET (signed 5 bits, effectively 0-31 for positive offset)
+    pub refine: bool,        // SBREFINE flag (bit 1)
+    pub log_strips: u8,      // LOGSBSTRIPS (bits 2-3)
+    pub ref_corner: u8,      // REFCORNER (bits 4-5)
+    pub transposed: bool,    // TRANSPOSED flag (bit 6)
+    pub comb_op: u8,         // SBCOMBOP (bits 7-8)
     pub refine_template: u8, // SBRTEMPLATE (bit 15) and GRTEMPLATE value (0 or 1)
 }
 
@@ -339,7 +359,7 @@ impl TextRegionParams {
         buf.write_u32::<BigEndian>(self.y).unwrap();
 
         // Assemble the 16-bit SBRFLAGS field (Figure 36 from ISO/IEC 14492:2001)
-        let _sbhuff_flag: u16 = 0;     // Bit 0: SBHUFF (0 for arithmetic coding)
+        let _sbhuff_flag: u16 = 0; // Bit 0: SBHUFF (0 for arithmetic coding)
         let _sbdefpixel_flag: u16 = 0; // Bit 9: SBDEFPIXEL (0 for default pixel value)
 
         let mut sbrflags: u16 = 0;
@@ -393,11 +413,11 @@ pub struct Segment {
     pub number: u32,
     pub seg_type: SegmentType,
     pub deferred_non_retain: bool, // Bit 7 of Flags1: 0 = retain, 1 = non-retain (if deferred)
-    pub retain_flags: u8,          // Bits 2-4 of Flags2: Referred-to segment retention flags (3 bits)
+    pub retain_flags: u8, // Bits 2-4 of Flags2: Referred-to segment retention flags (3 bits)
     pub page_association_type: u8, // Bits 0-1 of Flags2: 00=explicit, 01=deferred, 10=all pages
-    pub referred_to: Vec<u32>,     // List of referred-to segment numbers
-    pub page: Option<u32>,         // Page number if page_association_type is explicit (00) or deferred (01)
-    pub payload: Vec<u8>,          // Segment data
+    pub referred_to: Vec<u32>, // List of referred-to segment numbers
+    pub page: Option<u32>, // Page number if page_association_type is explicit (00) or deferred (01)
+    pub payload: Vec<u8>, // Segment data
 }
 
 fn encode_varint(mut v: u32, buf: &mut Vec<u8>) {
@@ -417,8 +437,12 @@ impl Segment {
         // --- Segment header flags (2 bytes) ---
         // Flags Byte 1 (Flags1)
         let page_num_val = self.page.unwrap_or(0); // Use 0 if page is None, though it might not be written
-        let page_size_is_4_bytes_bit = if self.page_association_type <= 1 && page_num_val > 0xFF { 1 } else { 0 }; // 1 if 4-byte page #, 0 if 1-byte. Only relevant if PA type is explicit or deferred.
-        
+        let page_size_is_4_bytes_bit = if self.page_association_type <= 1 && page_num_val > 0xFF {
+            1
+        } else {
+            0
+        }; // 1 if 4-byte page #, 0 if 1-byte. Only relevant if PA type is explicit or deferred.
+
         let flags1 = (self.seg_type as u8 & 0x3F) // Bits 0-5: Segment type
                    | (page_size_is_4_bytes_bit << 6)    // Bit 6: Page association size (0 for 1-byte, 1 for 4-byte page #)
                    | ((self.deferred_non_retain as u8) << 7); // Bit 7: Deferred non-retain
@@ -427,11 +451,13 @@ impl Segment {
         // Flags Byte 2 (Flags2)
         let referred_to_count = self.referred_to.len();
         let mut referred_to_count_is_extended = false;
-        let flags2 = if referred_to_count > 4 { 
+        let flags2 = if referred_to_count > 4 {
             referred_to_count_is_extended = true;
             (self.page_association_type & 0x03) | ((self.retain_flags & 0x07) << 2) | (0b111 << 5)
-        } else { 
-            (self.page_association_type & 0x03) | ((self.retain_flags & 0x07) << 2) | ((referred_to_count as u8) << 5)
+        } else {
+            (self.page_association_type & 0x03)
+                | ((self.retain_flags & 0x07) << 2)
+                | ((referred_to_count as u8) << 5)
         };
         w.write_u8(flags2)?;
 
@@ -444,9 +470,13 @@ impl Segment {
 
         // Referred-to segment numbers
         // Size depends on current segment's number (self.number) - Spec 7.3.5
-        let ref_num_size = if self.number <= 0xFF { 1 } 
-                           else if self.number <= 0xFFFF { 2 } 
-                           else { 4 };
+        let ref_num_size = if self.number <= 0xFF {
+            1
+        } else if self.number <= 0xFFFF {
+            2
+        } else {
+            4
+        };
 
         for &r_num in &self.referred_to {
             match ref_num_size {
@@ -457,11 +487,14 @@ impl Segment {
         }
 
         // Page number (if page_association_type is explicit or deferred)
-        if self.page_association_type <= 1 { // 00 (explicit) or 01 (deferred)
+        if self.page_association_type <= 1 {
+            // 00 (explicit) or 01 (deferred)
             if let Some(p_num) = self.page {
-                if page_size_is_4_bytes_bit == 1 { // 4-byte page number
+                if page_size_is_4_bytes_bit == 1 {
+                    // 4-byte page number
                     w.write_u32::<BigEndian>(p_num)?;
-                } else { // 1-byte page number
+                } else {
+                    // 1-byte page number
                     w.write_u8(p_num as u8)?;
                 }
             }
@@ -473,10 +506,10 @@ impl Segment {
         let payload_len = self.payload.len() as u32;
         debug!("Segment {} payload length: {}", self.number, payload_len);
         w.write_u32::<BigEndian>(payload_len)?;
-        
+
         // Segment data
         w.write_all(&self.payload)?;
-        
+
         debug!(
             "Segment::write_into: Wrote segment {}: Type={:?}, Page={:?}, PA Type={}, Data Length={}", 
             self.number, self.seg_type, self.page, self.page_association_type, payload_len

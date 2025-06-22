@@ -334,14 +334,8 @@ impl Jbig2ArithCoder {
     }
 
     /// Finalizes the arithmetic coding stream.
-    pub fn finalize(&mut self, data: &mut Vec<u8>) -> Result<()> {
-        self.renorm();
-        self.c = self.c.wrapping_add(self.a as u32);
-        self.byte_out();
-        self.c = self.c.wrapping_add(self.a as u32);
-        self.byte_out();
-
-        Ok(())
+    pub fn finalize(&mut self, data: &mut Vec<u8>) {
+        self.flush(true);
     }
 
     /// Renormalizes the arithmetic coder state according to the JBIG2 standard's RENORME procedure (Figure E.8).
@@ -556,7 +550,7 @@ impl Jbig2ArithCoder {
             !at_pixels.is_empty() || template == 0,
             "Generic refinement regions (template > 0) must have AT-pixels defined"
         );
-        
+
         let packed_data = image.to_packed_words();
         let mut coder = Jbig2ArithCoder::new();
 
@@ -571,7 +565,12 @@ impl Jbig2ArithCoder {
         };
 
         let n_ctx = if template == 0 { 16 } else { 10 + gbats.len() };
+
         coder.context.resize(1 << n_ctx, Jbig2ArithCoder::INITIAL_STATE);
+
+        coder
+            .context
+            .resize(1 << n_ctx, Jbig2ArithCoder::INITIAL_STATE);
 
         // Encode the image data
         coder.encode_generic_region_inner(
@@ -581,21 +580,32 @@ impl Jbig2ArithCoder {
             template,
             gbats,
         )?;
+        // Finalize the arithmetic coder state with the JBIG2 terminator
+        coder.flush(true);
 
         // Finalize the arithmetic coder state with the JBIG2 terminator
         coder.flush(true);
+
         
+
+
+        // Finalize the arithmetic coder state and append marker code
+        coder.flush(true);
         // Get the result
         let result = coder.data;
-        
+
         debug_assert!(
             !result.is_empty(),
             "empty arithmetic stream – context generation broken"
         );
-        
-        eprintln!("generic-region payload {} bytes (template={} at_pixels={})", 
-                 result.len(), template, gbats.len());
-                 
+
+        eprintln!(
+            "generic-region payload {} bytes (template={} at_pixels={})",
+            result.len(),
+            template,
+            gbats.len()
+        );
+
         Ok(result)
     }
 
@@ -621,12 +631,49 @@ impl Jbig2ArithCoder {
             (img[idx_word] >> bit_pos) & 1
         }
 
+
         // Use the first four AT pixels if provided
+        // The context for template 0 uses the four previously coded pixels in
+        // the current line ("line3"), five pixels from the previous line
+        // ("line2"), three pixels from two lines above ("line1") and up to four
+        // adaptive template pixels.  This mirrors the implementation in
+        // jbig2dec and the ITU T.88 specification.
+
+        // JBIG2 Template-0 static neighbours (Table A.3‑5), MSB→LSB
+        const STATIC_OFFSETS: [(i8, i8); 10] = [
+            (-1, -2),
+            (0, -2),
+            (1, -2),
+            (2, -2),
+            (-2, -1),
+            (-1, -1),
+            (0, -1),
+            (1, -1),
+            (-2, 0),
+            (-1, 0),
+        ];
+
+
         let gbats = &at_pixels[..at_pixels.len().min(4)];
 
         for y in 0..height as i32 {
+            let mut line1: u32 = sample(packed_data, width, height, 1, y - 2)
+                | (sample(packed_data, width, height, 0, y - 2) << 1)
+                | (sample(packed_data, width, height, -1, y - 2) << 2);
+            let mut line2: u32 = sample(packed_data, width, height, 2, y - 1)
+                | (sample(packed_data, width, height, 1, y - 1) << 1)
+                | (sample(packed_data, width, height, 0, y - 1) << 2)
+                | (sample(packed_data, width, height, -1, y - 1) << 3)
+                | (sample(packed_data, width, height, -2, y - 1) << 4);
+            let mut line3: u32 = 0;
+
             for x in 0..width as i32 {
-                let mut cx: usize = 0;
+                let mut cx: usize = line3 as usize;
+                if let Some((dx, dy)) = gbats.get(0) {
+                    cx |= (sample(packed_data, width, height, x + *dx as i32, y + *dy as i32)
+                        as usize)
+                        << 4;
+                }
 
                 // Static neighbours (bit order as used by jbig2dec)
                 cx |= (sample(packed_data, width, height, x - 1, y) as usize) << 0;  // X1
@@ -644,10 +691,37 @@ impl Jbig2ArithCoder {
                 // Adaptive template pixels (up to four)
                 for (i, &(dx, dy)) in gbats.iter().enumerate() {
                     cx |= (sample(packed_data, width, height, x + dx as i32, y + dy as i32) as usize) << (10 + i);
+
+                for (bit, &(dx, dy)) in STATIC_OFFSETS.iter().enumerate() {
+                    let v = sample(packed_data, width, height, x + dx as i32, y + dy as i32);
+                    let shift = STATIC_OFFSETS.len() - 1 - bit;
+                    cx |= (v as usize) << shift;
+                }
+                cx |= (line2 as usize) << 5;
+                if let Some((dx, dy)) = gbats.get(1) {
+                    cx |= (sample(packed_data, width, height, x + *dx as i32, y + *dy as i32)
+                        as usize)
+                        << 10;
+                }
+                if let Some((dx, dy)) = gbats.get(2) {
+                    cx |= (sample(packed_data, width, height, x + *dx as i32, y + *dy as i32)
+                        as usize)
+                        << 11;
+                }
+                cx |= (line1 as usize) << 12;
+                if let Some((dx, dy)) = gbats.get(3) {
+                    cx |= (sample(packed_data, width, height, x + *dx as i32, y + *dy as i32)
+                        as usize)
+                        << 15;
+
                 }
 
                 let pixel_val = sample(packed_data, width, height, x, y) != 0;
                 self.encode_bit(cx, pixel_val);
+
+                line1 = ((line1 << 1) | sample(packed_data, width, height, x + 2, y - 2)) & 0x07;
+                line2 = ((line2 << 1) | sample(packed_data, width, height, x + 3, y - 1)) & 0x1f;
+                line3 = ((line3 << 1) | (pixel_val as u32)) & 0x0f;
             }
         }
         Ok(())

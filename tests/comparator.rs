@@ -29,14 +29,16 @@ fn slow_distance(a: &BitImage, b: &BitImage, search_radius: i32, max_err: u32) -
 
             for y in y0..y1 {
                 for x in x0..x1 {
-                    if a.get(x as u32, y as u32) !=
-                       b.get((x + dx) as u32, (y + dy) as u32)
-                    {
+                    if a.get(x as u32, y as u32) != b.get((x + dx) as u32, (y + dy) as u32) {
                         err += 1;
-                        if err >= best_err { break; }
+                        if err >= best_err {
+                            break;
+                        }
                     }
                 }
-                if err >= best_err { break; }
+                if err >= best_err {
+                    break;
+                }
             }
             best_err = best_err.min(err);
         }
@@ -61,52 +63,22 @@ fn img_from_strings(rows: &[&str]) -> BitImage {
 
 #[test]
 fn fast_and_slow_distance_match() {
-    const R: i32 = 2;          // SEARCH_RADIUS in production code
+    const R: i32 = 2; // SEARCH_RADIUS in production code
     const MAX_ERR: u32 = 10_000;
 
     // A few representative glyph pairs: identical, shifted, mixed.
     let fixtures = vec![
         (
-            img_from_strings(&[
-                "11110000",
-                "11110000",
-                "00001111",
-                "00001111",
-            ]),
-            img_from_strings(&[
-                "11110000",
-                "11110000",
-                "00001111",
-                "00001111",
-            ]),
+            img_from_strings(&["11110000", "11110000", "00001111", "00001111"]),
+            img_from_strings(&["11110000", "11110000", "00001111", "00001111"]),
         ),
         (
-            img_from_strings(&[
-                "11110000",
-                "11110000",
-                "00001111",
-                "00001111",
-            ]),
-            img_from_strings(&[
-                "00111100",
-                "00111100",
-                "11000011",
-                "11000011",
-            ]),
+            img_from_strings(&["11110000", "11110000", "00001111", "00001111"]),
+            img_from_strings(&["00111100", "00111100", "11000011", "11000011"]),
         ),
         (
-            img_from_strings(&[
-                "11001100",
-                "11001100",
-                "00110011",
-                "00110011",
-            ]),
-            img_from_strings(&[
-                "00110011",
-                "00110011",
-                "11001100",
-                "11001100",
-            ]),
+            img_from_strings(&["11001100", "11001100", "00110011", "00110011"]),
+            img_from_strings(&["00110011", "00110011", "11001100", "11001100"]),
         ),
     ];
 
@@ -119,7 +91,8 @@ fn fast_and_slow_distance_match() {
             fast_err,
             Some(slow),
             "Mismatch for fixture\nfast = {:?}, slow = {:?}",
-            fast_err, slow
+            fast_err,
+            slow
         );
     }
 }

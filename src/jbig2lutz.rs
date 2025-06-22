@@ -3,8 +3,8 @@
 //! Lutz algorithm for the initial component finding and then applies a series of
 //! heuristics for dot merging and glyph splitting to produce clean symbols.
 
-use crate::jbig2sym::{BitImage, Rect, Symbol, compute_glyph_hash};
 use crate::jbig2shared::{save_debug_pbm, usize_to_u32};
+use crate::jbig2sym::{compute_glyph_hash, BitImage, Rect, Symbol};
 // Image import removed as it's not used
 use std::collections::HashSet;
 
@@ -53,7 +53,6 @@ pub fn find_connected_components(image: &BitImage, min_size: usize) -> Vec<Conne
 
     result
 }
-
 
 // ==============================================
 // Symbol extraction and processing logic
@@ -123,7 +122,11 @@ pub struct WidthTracker {
 
 impl WidthTracker {
     pub fn new(max_len: usize) -> Self {
-        Self { buf: Vec::with_capacity(max_len), sum: 0, max_len }
+        Self {
+            buf: Vec::with_capacity(max_len),
+            sum: 0,
+            max_len,
+        }
     }
 
     /// Push a new width, evicting the oldest if needed
@@ -138,14 +141,20 @@ impl WidthTracker {
 
     /// Current average width (or 1.0 if empty)
     pub fn avg(&self) -> f32 {
-        if self.buf.is_empty() { 1.0 }
-        else { self.sum as f32 / self.buf.len() as f32 }
+        if self.buf.is_empty() {
+            1.0
+        } else {
+            self.sum as f32 / self.buf.len() as f32
+        }
     }
 }
 
-
 /// Detects potential dots in the components
-fn detect_dots(components: &[ConnectedComponent], config: &SymbolExtractionConfig, tracker: &mut WidthTracker) -> Vec<usize> {
+fn detect_dots(
+    components: &[ConnectedComponent],
+    config: &SymbolExtractionConfig,
+    tracker: &mut WidthTracker,
+) -> Vec<usize> {
     if components.is_empty() {
         return Vec::new();
     }
@@ -164,7 +173,11 @@ fn detect_dots(components: &[ConnectedComponent], config: &SymbolExtractionConfi
     let mut dot_indices = Vec::new();
     for (i, c) in components.iter().enumerate() {
         let ar = c.bounds.width as f32 / c.bounds.height as f32;
-        if c.pixel_count <= max_dot_size && c.bounds.height <= max_dot_height && ar >= min_ar && ar <= max_ar {
+        if c.pixel_count <= max_dot_size
+            && c.bounds.height <= max_dot_height
+            && ar >= min_ar
+            && ar <= max_ar
+        {
             dot_indices.push(i);
         } else {
             tracker.push(c.bounds.width as usize);
@@ -179,14 +192,18 @@ fn calculate_vertical_merge_distance(components: &[ConnectedComponent], sample_s
         return 10;
     }
     let actual_sample_size = std::cmp::min(sample_size, components.len());
-    let avg_height = components.iter()
+    let avg_height = components
+        .iter()
         .take(actual_sample_size)
         .map(|c| c.bounds.height as f32)
-        .sum::<f32>() / actual_sample_size as f32;
-    let variance = components.iter()
+        .sum::<f32>()
+        / actual_sample_size as f32;
+    let variance = components
+        .iter()
         .take(actual_sample_size)
         .map(|c| (c.bounds.height as f32 - avg_height).powi(2))
-        .sum::<f32>() / actual_sample_size as f32;
+        .sum::<f32>()
+        / actual_sample_size as f32;
     let std_dev = variance.sqrt();
     let vertical_distance = (avg_height * 0.6 + std_dev * 0.5) as u32;
     std::cmp::max(5, std::cmp::min(vertical_distance, 30))
@@ -215,14 +232,21 @@ fn merge_dots(
         let mut min_vertical_distance = u32::MAX;
 
         for (i, candidate) in components.iter().enumerate() {
-            if i == dot_idx || dot_indices.contains(&i) || skip_indices.contains(&i) || candidate.bounds.y <= dot_bottom {
+            if i == dot_idx
+                || dot_indices.contains(&i)
+                || skip_indices.contains(&i)
+                || candidate.bounds.y <= dot_bottom
+            {
                 continue;
             }
             let candidate_left = candidate.bounds.x.saturating_sub(MAX_HORIZONTAL_TOLERANCE);
-            let candidate_right = candidate.bounds.x + candidate.bounds.width + MAX_HORIZONTAL_TOLERANCE;
+            let candidate_right =
+                candidate.bounds.x + candidate.bounds.width + MAX_HORIZONTAL_TOLERANCE;
             if dot_center_x >= candidate_left && dot_center_x <= candidate_right {
                 let vertical_distance = candidate.bounds.y - dot_bottom;
-                if vertical_distance <= max_vertical_distance && vertical_distance < min_vertical_distance {
+                if vertical_distance <= max_vertical_distance
+                    && vertical_distance < min_vertical_distance
+                {
                     min_vertical_distance = vertical_distance;
                     best_match = Some(i);
                 }
@@ -252,17 +276,27 @@ fn apply_merges(components: &mut Vec<ConnectedComponent>, merges: &[(usize, usiz
             } else {
                 (base_idx, dot_idx)
             };
-            
+
             // Split the vector into three parts to get mutable references to both components
             let (left, right) = components.split_at_mut(second);
-            let dot = if first < left.len() { &left[first] } else { continue };
-            let base = if !right.is_empty() { &mut right[0] } else { continue };
-            
+            let dot = if first < left.len() {
+                &left[first]
+            } else {
+                continue;
+            };
+            let base = if !right.is_empty() {
+                &mut right[0]
+            } else {
+                continue;
+            };
+
             // Update the base component's bounds to include the dot
             base.bounds.x = base.bounds.x.min(dot.bounds.x);
             base.bounds.y = base.bounds.y.min(dot.bounds.y);
-            let right_edge = (base.bounds.x + base.bounds.width).max(dot.bounds.x + dot.bounds.width);
-            let bottom_edge = (base.bounds.y + base.bounds.height).max(dot.bounds.y + dot.bounds.height);
+            let right_edge =
+                (base.bounds.x + base.bounds.width).max(dot.bounds.x + dot.bounds.width);
+            let bottom_edge =
+                (base.bounds.y + base.bounds.height).max(dot.bounds.y + dot.bounds.height);
             base.bounds.width = right_edge - base.bounds.x;
             base.bounds.height = bottom_edge - base.bounds.y;
             base.pixels.extend(dot.pixels.iter().copied());
@@ -278,7 +312,6 @@ fn apply_merges(components: &mut Vec<ConnectedComponent>, merges: &[(usize, usiz
         }
     }
 }
-
 
 /// Attempt to split a glyph if it is abnormally wide.
 /// Returns one or two `BitImage` slices and the split x-coordinate (if split).
@@ -316,17 +349,17 @@ pub fn maybe_split_glyph(
         }
         if gap_run >= required_gap_height {
             let mut left = x;
-            while left > 0 && (0..h).all(|y| !glyph.get_usize(left-1, y)) {
+            while left > 0 && (0..h).all(|y| !glyph.get_usize(left - 1, y)) {
                 left -= 1;
             }
             let mut right = x;
-            while right+1 < w && (0..h).all(|y| !glyph.get_usize(right+1, y)) {
+            while right + 1 < w && (0..h).all(|y| !glyph.get_usize(right + 1, y)) {
                 right += 1;
             }
             let gap_width = right - left + 1;
             if gap_width > best_gap_size {
                 best_gap_size = gap_width;
-                best_split = Some((left + gap_width/2) as usize);
+                best_split = Some((left + gap_width / 2) as usize);
             }
         }
     }
@@ -335,11 +368,21 @@ pub fn maybe_split_glyph(
         if split_x >= config.min_subglyph_width && (w - split_x) >= config.min_subglyph_width {
             let left_img = BitImage::from_sub_image(
                 glyph,
-                &Rect { x: 0, y: 0, width: usize_to_u32(split_x), height: usize_to_u32(h) }
+                &Rect {
+                    x: 0,
+                    y: 0,
+                    width: usize_to_u32(split_x),
+                    height: usize_to_u32(h),
+                },
             );
             let right_img = BitImage::from_sub_image(
                 glyph,
-                &Rect { x: usize_to_u32(split_x), y: 0, width: usize_to_u32(w - split_x), height: usize_to_u32(h) }
+                &Rect {
+                    x: usize_to_u32(split_x),
+                    y: 0,
+                    width: usize_to_u32(w - split_x),
+                    height: usize_to_u32(h),
+                },
             );
             tracker.push(left_img.width);
             tracker.push(right_img.width);
@@ -353,7 +396,7 @@ pub fn maybe_split_glyph(
 /// Extracts symbols from a page image by finding, merging, and splitting components.
 pub fn extract_symbols(image: &BitImage, config: SymbolExtractionConfig) -> Vec<(Rect, Symbol)> {
     let _ = save_debug_pbm(image, "00_original.pbm");
-    
+
     let mut components = find_connected_components(image, config.min_component_size);
     if components.is_empty() {
         return Vec::new();
@@ -382,49 +425,55 @@ pub fn extract_symbols(image: &BitImage, config: SymbolExtractionConfig) -> Vec<
             } else {
                 rect.x + split_x.unwrap_or(rect.width as usize / 2) as u32 + piece_rect.x
             };
-            
+
             let hash = compute_glyph_hash(&trimmed_piece);
             // Validate symbol dimensions
             if trimmed_piece.width == 0 || trimmed_piece.height == 0 {
                 continue; // Skip empty symbols
             }
-            
+
             // Check symbol size limits (JBIG2 maximum dimensions are 2^32-1)
             if trimmed_piece.width > 10_000 || trimmed_piece.height > 10_000 {
-                eprintln!("Warning: Skipping oversized symbol: {}x{}", 
-                    trimmed_piece.width, trimmed_piece.height);
+                eprintln!(
+                    "Warning: Skipping oversized symbol: {}x{}",
+                    trimmed_piece.width, trimmed_piece.height
+                );
                 continue;
             }
-            
+
             let symbol = Symbol {
                 image: trimmed_piece,
                 hash,
             };
-            
+
             // Verify the hash is unique
             if !processed.insert(hash) {
                 // if cfg!(debug_assertions) {
                 //     eprintln!("Warning: Duplicate symbol hash detected: {}", hash);
                 // }
             }
-            
+
             if cfg!(debug_assertions) {
                 let _ = save_debug_pbm(
-                    &symbol.image, 
-                    &format!("02_symbol_{:04}.pbm", symbols.len())
+                    &symbol.image,
+                    &format!("02_symbol_{:04}.pbm", symbols.len()),
                 );
             }
-            
-            symbols.push((Rect {
-                x: piece_x,
-                y: rect.y + piece_rect.y,
-                width: usize_to_u32(symbol.image.width),
-                height: usize_to_u32(symbol.image.height),
-            }, symbol));
+
+            symbols.push((
+                Rect {
+                    x: piece_x,
+                    y: rect.y + piece_rect.y,
+                    width: usize_to_u32(symbol.image.width),
+                    height: usize_to_u32(symbol.image.height),
+                },
+                symbol,
+            ));
         }
-        
+
         if cfg!(debug_assertions) {
-            let mut comp_image = BitImage::new(component.bounds.width, component.bounds.height).unwrap();
+            let mut comp_image =
+                BitImage::new(component.bounds.width, component.bounds.height).unwrap();
             for &(x, y) in &component.pixels {
                 comp_image.set(x - component.bounds.x, y - component.bounds.y, true);
             }

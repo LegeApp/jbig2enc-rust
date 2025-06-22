@@ -14,21 +14,19 @@ pub use ndarray::Array2;
 pub mod jbig2arith;
 pub mod jbig2comparator;
 pub mod jbig2enc;
-pub mod jbig2structs;
-pub mod jbig2pdf;
 pub mod jbig2lutz;
-pub mod jbig2sym;
+pub mod jbig2pdf;
 pub mod jbig2shared;
-
+pub mod jbig2structs;
+pub mod jbig2sym;
 
 // Re-export the main encode functions
-pub use jbig2enc::{encode_document, encode_page_with_symbol_dictionary, Jbig2EncConfig};
 pub use crate::jbig2arith::Jbig2ArithCoder;
+pub use jbig2enc::{encode_document, encode_page_with_symbol_dictionary, Jbig2EncConfig};
 
-use std::{error::Error, env};
-use log::{info, debug}; // For logging
 use jbig2enc::Jbig2Encoder;
-
+use log::{debug, info}; // For logging
+use std::{env, error::Error};
 
 // Constants for default thresholds (symbol classification only)
 const JBIG2_THRESHOLD_DEF: f32 = 0.92;
@@ -53,47 +51,51 @@ impl Jbig2Context {
     pub fn new() -> Self {
         Self::default()
     }
-    
+
     /// Get the threshold value
     pub fn get_threshold(&self) -> f32 {
         self.threshold
     }
-    
+
     /// Get the weight value
     pub fn get_weight(&self) -> f32 {
         self.weight
     }
-    
+
     /// Get the symbol mode setting
     pub fn get_symbol_mode(&self) -> bool {
         self.symbol_mode
     }
-    
+
     /// Get the refine setting
     pub fn get_refine(&self) -> bool {
         self.refine
     }
-    
+
     /// Get the duplicate line removal setting
     pub fn get_duplicate_line_removal(&self) -> bool {
         self.duplicate_line_removal
     }
-    
+
     /// Get the auto threshold setting
     pub fn get_auto_thresh(&self) -> bool {
         self.auto_thresh
     }
-    
+
     /// Get the hash setting
     pub fn get_use_hash(&self) -> bool {
         self.hash
     }
-    
+
     /// Get the DPI setting
     pub fn get_dpi(&self) -> u32 {
-        if self.dpi == 0 { 300 } else { self.dpi }
+        if self.dpi == 0 {
+            300
+        } else {
+            self.dpi
+        }
     }
-    
+
     /// Get the PDF mode setting
     pub fn get_pdf_mode(&self) -> bool {
         self.pdf_mode
@@ -126,8 +128,6 @@ pub fn encode_rois(
         dpi: ctx.get_dpi(),
         want_full_headers: !ctx.get_pdf_mode(), // PDF mode uses fragments
     };
-    
-    
 
     // If we have a global dictionary, encode it and all ROIs
     let global_dict = if ctx.get_symbol_mode() && ctx.get_pdf_mode() {
@@ -136,9 +136,9 @@ pub fn encode_rois(
     } else {
         None
     };
-    
+
     let mut roi_streams = Vec::with_capacity(rois.len());
-    
+
     // Encode each ROI
     for (idx, roi) in rois.iter().enumerate() {
         debug!("Encoding ROI {}...", idx);
@@ -172,12 +172,12 @@ pub fn build_page_dict(
     if ctx.get_pdf_mode() {
         encoder = encoder.dict_only();
     }
-    
+
     // Add all ROIs to the encoder
     for roi in rois {
         encoder.add_page(roi)?;
     }
-    
+
     encoder.flush_dict()
 }
 
@@ -187,7 +187,7 @@ impl<'a> RoiEncoder<'a> {
         if config.want_full_headers {
             encoder = encoder.dict_only();
         }
-        
+
         Self {
             encoder,
             roi_indices: Vec::new(),
@@ -230,6 +230,14 @@ pub fn get_build_info() -> String {
     format!(
         "{} (built with {})",
         build_ts,
+
         if cfg!(debug_assertions) { "debug" } else { "release" }
+
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+
     )
 }

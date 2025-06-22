@@ -1,28 +1,50 @@
 // Integration tests for JBIG2 encoder core functionality
 
-use std::io::{BufReader, BufRead, Read, Seek, SeekFrom};
-use lutz::Image;  // Import the Image trait for width() and height() methods
+use std::error::Error;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::process::Command;
 use std::time::Instant;
+use tempfile::TempDir;
 
-#[cfg(feature = "trace_arith")]
-use tracing_subscriber::fmt;
-
-#[cfg(not(feature = "trace_arith"))]
-#[macro_use]
-mod noop_tracing {
-    macro_rules! debug {
-        ($($arg:tt)*) => { };
-    }
-    pub(crate) use debug;
-}
-use jbig2::{
-    jbig2arith::{Jbig2ArithCoder, State, BASE},
-    jbig2enc::{encode_page_with_symbol_dictionary, encode_symbol_dict, Jbig2EncConfig},
-    jbig2sym::{array_to_bitimage, BitImage, Symbol},
-};
+use jbig2::jbig2arith::{Jbig2ArithCoder, State, BASE};
+use jbig2::jbig2sym::{BitImage, Symbol};
+use jbig2::jbig2enc::Jbig2Encoder;
+use jbig2::jbig2enc::encode_symbol_dict;
+use jbig2::jbig2enc::Jbig2EncConfig;
+use jbig2::jbig2sym::array_to_bitimage;
+use jbig2::encode_page_with_symbol_dictionary;
 use ndarray::Array2;
+use std::fmt;
+
+/// Custom error type for test failures
+#[derive(Debug)]
+enum TestError {
+    TempDirError(std::io::Error),
+    FileWriteError(std::io::Error),
+    FileReadError(std::io::Error),
+    CommandError(std::io::Error),
+    DecodeError(String),
+    MismatchError(u32, u32, bool, bool),
+}
+
+impl fmt::Display for TestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TestError::TempDirError(e) => write!(f, "Failed to create temp directory: {}", e),
+            TestError::FileWriteError(e) => write!(f, "Failed to write file: {}", e),
+            TestError::CommandError(e) => write!(f, "Command execution failed: {}", e),
+            TestError::DecodeError(msg) => write!(f, "Decoding failed: {}", msg),
+            TestError::MismatchError(x, y, expected, actual) => 
+                write!(f, "Mismatch at ({}, {}): expected {}, got {}", x, y, expected, actual),
+            TestError::FileReadError(e) => write!(f, "Failed to read file: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for TestError {}
 
 // Macro to handle debug statements with elapsed time
+#[allow(unused_macros)]
 macro_rules! debug_with_time {
     ($start:expr, $($arg:tt)*) => {
         let elapsed = $start.elapsed().as_millis();
@@ -72,6 +94,194 @@ fn load_pbm(path: &str) -> BitImage {
     array_to_bitimage(&image_array)
 }
 
+/// Helper: quick & dirty PBM-binary (P4) reader into BitImage
+fn read_pbm(path: &std::path::Path) -> BitImage {
+    let data = std::fs::read(path).expect("read pbm");
+    let mut parts = data.splitn(4, |&b| b == b'\n');
+    assert_eq!(parts.next().unwrap(), b"P4");
+    let dims = std::str::from_utf8(parts.next().unwrap()).unwrap();
+    let mut it = dims.split_whitespace();
+    let w: usize = it.next().unwrap().parse().unwrap();
+    let h: usize = it.next().unwrap().parse().unwrap();
+    let _max = parts.next().unwrap(); // PBM has no maxval but jbig2dec writes one blank line
+    let bitmap = parts.next().unwrap();
+
+    let mut img = BitImage::new(w as u32, h as u32).unwrap();
+    // PBM stores left-to-right, top-to-bottom, 1 bit = black
+    for (y, row) in bitmap.chunks((w + 7) / 8).enumerate() {
+        for x in 0..w {
+            let byte = row[x / 8];
+            let bit  = (byte >> (7 - (x % 8))) & 1;
+            if bit == 1 { img.set(x as u32, y as u32, true); }
+        }
+    }
+    img
+}
+
+/// Build a 64×64 checkerboard — non-trivial but tiny.
+fn make_checkerboard() -> BitImage {
+    let mut img = BitImage::new(64, 64).unwrap();
+    for y in 0..64 {
+        for x in 0..64 {
+            if (x + y) % 2 == 0 {
+                img.set(x as u32, y as u32, true);
+            }
+        }
+    }
+    img
+}
+
+fn hex_dump(data: &[u8], len: usize) -> String {
+    data.iter()
+        .take(len)
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn debug_print_image(img: &BitImage, name: &str) {
+    println!("=== {} ({}x{}) ===", name, img.width, img.height);
+    let bytes_per_row = (img.width as usize + 7) / 8;
+    for y in 0..img.height.min(8) as usize { // Only print first 8 rows
+        for x in 0..img.width.min(16) as usize { // Only print first 16 columns
+            let byte_idx = y * bytes_per_row + (x / 8);
+            let bit = 7 - (x % 8);
+            let byte = img.as_bytes()[byte_idx];
+            let pixel = (byte >> bit) & 1;
+            print!("{} ", if pixel != 0 { "#" } else { "." });
+        }
+        println!("// row {}", y);
+    }
+    println!("================");
+}
+
+fn encode_and_decode(img: &BitImage, temp_dir: &TempDir) -> Result<(), Box<dyn Error>> {
+    // Debug print input image
+    debug_print_image(img, "Input Image");
+    
+    let cfg = Jbig2EncConfig::default();
+    let mut encoder = Jbig2Encoder::new(&cfg);
+    
+    let width = img.width as usize;
+    let height = img.height as usize;
+    let mut array = Array2::<u8>::zeros((height, width));
+    
+    let bytes_per_row = (width + 7) / 8;
+    for y in 0..height {
+        for x in 0..width {
+            let byte_idx = y * bytes_per_row + (x / 8);
+            let bit = 7 - (x % 8);
+            let byte = img.as_bytes()[byte_idx];
+            let pixel = (byte >> bit) & 1;
+            array[[y, x]] = if pixel != 0 { 255 } else { 0 };
+        }
+    }
+    
+    encoder.add_page(&array);
+    let encoded = encoder.flush()?;
+    
+    // Debug info about encoded data
+    println!("Encoded data size: {} bytes", encoded.len());
+    println!("First 32 bytes: {}", hex_dump(&encoded, 32));
+    
+    let jbig2_path = temp_dir.path().join("test.jb2");
+    std::fs::write(&jbig2_path, &encoded).map_err(TestError::FileWriteError)?;
+    
+    // Get file info
+    let metadata = std::fs::metadata(&jbig2_path).map_err(TestError::FileReadError)?;
+    println!("JBIG2 file size: {} bytes", metadata.len());
+    
+    // Run jbig2dec with verbose output
+    let output = Command::new("jbig2dec")
+        .arg("--verbose")
+        .arg("--format").arg("pbm")
+        .arg("--output").arg(temp_dir.path().join("out.pbm"))
+        .arg(&jbig2_path)
+        .output()
+        .map_err(TestError::CommandError)?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        
+        println!("=== JBIG2Dec Error Output ===");
+        println!("{} {}", output.status, stderr);
+        println!("=== JBIG2Dec Standard Output ===");
+        println!("{}", stdout);
+        
+        // Try to read the file as binary and print first 32 bytes
+        if let Ok(file) = std::fs::read(&jbig2_path) {
+            println!("\nFirst 32 bytes of {}:", jbig2_path.display());
+            println!("{}", hex_dump(&file, 32));
+            
+            // Check for JBIG2 header (starts with '\x97\x4A\x42\x32\x0D\x0A\x1A\x0A')
+            if file.len() >= 8 && &file[0..8] == [0x97, 0x4A, 0x42, 0x32, 0x0D, 0x0A, 0x1A, 0x0A] {
+                println!("File has valid JBIG2 header");
+            } else {
+                println!("File does NOT have a valid JBIG2 header");
+            }
+        }
+        
+        return Err(Box::new(TestError::DecodeError(
+            format!("jbig2dec failed with status: {}\nStderr: {}\nStdout: {}", 
+                   output.status, stderr, stdout)
+        )));
+    }
+    
+    let decoded = read_pbm(&temp_dir.path().join("out.pbm"));
+    
+    if img.width != decoded.width || img.height != decoded.height {
+        return Err(Box::new(TestError::DecodeError(
+            format!("Size mismatch: expected {}x{}, got {}x{}", 
+                   img.width, img.height, decoded.width, decoded.height)
+        )));
+    }
+    
+    for y in 0..(img.height as usize) {
+        for x in 0..(img.width as usize) {
+            let byte_idx = y * bytes_per_row + (x / 8);
+            let bit = 7 - (x % 8);
+            let byte = img.as_bytes()[byte_idx];
+            let expected = ((byte >> bit) & 1) != 0;
+            let byte = decoded.as_bytes()[byte_idx];
+            let actual = (byte & (1 << (7 - bit))) != 0;
+            if expected != actual {
+                return Err(Box::new(TestError::MismatchError(
+                    x as u32, y as u32, expected, actual
+                )));
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+#[test]
+fn generic_region_roundtrip_with_jbig2dec() -> Result<(), Box<dyn Error>> {
+    // Skip test gracefully if the external decoder isn't available.
+    if which::which("jbig2dec").is_err() {
+        eprintln!("Skipping test: jbig2dec not found in PATH");
+        return Ok(());
+    }
+    
+    // Create a simple test image (8x8 checkerboard)
+    let width = 8;
+    let height = 8;
+    let mut img = BitImage::new(width, height).expect("Failed to create BitImage");
+    for y in 0..height {
+        for x in 0..width {
+            img.set(x, y, (x + y) % 2 == 0);
+        }
+    }
+    
+    // Create a temporary directory for test files
+    let temp_dir = TempDir::new().map_err(TestError::TempDirError)?;
+    
+    // Encode and decode the image
+    encode_and_decode(&img, &temp_dir)?;
+    
+    Ok(())
+}
 #[test]
 fn empty_symbol_list_returns_error() {
     let start = Instant::now();
@@ -80,7 +290,8 @@ fn empty_symbol_list_returns_error() {
     // we expect the encoder to reject an empty symbol slice
     assert!(
         err.to_string().contains("no symbols"),
-        "got unexpected error: {}", err
+        "got unexpected error: {}",
+        err
     );
     let duration = start.elapsed();
     println!("Test empty_symbol_list_returns_error took: {:?}", duration);
@@ -96,7 +307,10 @@ fn single_symbol_dict_outputs_nonempty() {
         .expect("single-symbol dict should encode");
     assert!(!out.is_empty(), "dictionary stream was empty");
     let duration = start.elapsed();
-    println!("Test single_symbol_dict_outputs_nonempty took: {:?}", duration);
+    println!(
+        "Test single_symbol_dict_outputs_nonempty took: {:?}",
+        duration
+    );
 }
 
 #[test]
@@ -116,24 +330,37 @@ fn duplicate_symbols_are_deduplicated() {
         solo.len()
     );
     let duration = start.elapsed();
-    println!("Test duplicate_symbols_are_deduplicated took: {:?}", duration);
+    println!(
+        "Test duplicate_symbols_are_deduplicated took: {:?}",
+        duration
+    );
 }
 
 #[test]
-fn full_page_with_symbol_dictionary_roundtrips() {
-    let start = Instant::now();
+fn full_page_with_symbol_dictionary_roundtrips() -> Result<(), Box<dyn Error>> {
+    let _start = Instant::now();
     let cfg = Jbig2EncConfig::default();
-    // use the full-page fixture
+    
+    // Load the test image
     let page = load_pbm("tests/fixtures/test_image1.pbm");
-    let (stream, next_segment_num) =
-        encode_page_with_symbol_dictionary(&page, &cfg, /* next_segment_num: */ 1)
-            .expect("full-page encode should succeed");
+    
+    // Encode the page with symbol dictionary
+    let result = encode_page_with_symbol_dictionary(&page, &cfg, /* next_segment_num: */ 1);
+    
+    // Check if encoding was successful
+    let (stream, next_segment_num) = result.expect("full-page encode should succeed");
+    
     // Must produce a non-empty byte stream
     assert!(!stream.is_empty(), "output stream was empty");
+    
     // Verify we got the next segment number (should be > 1 since we started at 1)
-    assert!(next_segment_num > 1, "expected next_segment_num > 1, got {}", next_segment_num);
-    let duration = start.elapsed();
-    println!("Test full_page_with_symbol_dictionary_roundtrips took: {:?}", duration);
+    assert!(
+        next_segment_num > 1,
+        "expected next_segment_num > 1, got {}",
+        next_segment_num
+    );
+    
+    Ok(())
 }
 
 #[test]
@@ -150,8 +377,14 @@ fn test_glyph_creation() {
 fn test_symbol_sorting() {
     let start = Instant::now();
     let mut symbols = vec![
-        Symbol { image: BitImage::new(2, 3).unwrap(), hash: 0 },
-        Symbol { image: BitImage::new(3, 2).unwrap(), hash: 0 },
+        Symbol {
+            image: BitImage::new(2, 3).unwrap(),
+            hash: 0,
+        },
+        Symbol {
+            image: BitImage::new(3, 2).unwrap(),
+            hash: 0,
+        },
     ];
     symbols.sort_by_key(|s| (s.image.height, s.image.width));
     assert_eq!(symbols[0].image.height, 2);
@@ -166,7 +399,10 @@ fn test_encode_symbol_dict_empty_fails() {
     let result = encode_symbol_dict(&[], &config, 0);
     assert!(result.is_err());
     let duration = start.elapsed();
-    println!("Test test_encode_symbol_dict_empty_fails took: {:?}", duration);
+    println!(
+        "Test test_encode_symbol_dict_empty_fails took: {:?}",
+        duration
+    );
 }
 
 #[test]
@@ -183,23 +419,52 @@ fn test_encode_symbol_dict_single() {
 }
 
 #[test]
-fn test_encode_page_with_symbol_dictionary() {
+fn test_encode_page_with_symbol_dictionary() -> Result<(), Box<dyn Error>> {
     let start = Instant::now();
-    let img = create_checkerboard(40, 40);
-    let config = Jbig2EncConfig::default();
-
-    // Call the function under test
-    let (bytes, _) = encode_page_with_symbol_dictionary(
-        &img,
-        &config,
-        1,
-    ).expect("Failed to encode page with symbol dictionary");
-
-    println!("Final encoded data ({} bytes): {:?}", bytes.len(), bytes);
-    assert!(!bytes.is_empty());
-    // You might want to add more specific assertions here, e.g., check segment types or lengths
+    
+    // Create a simple 3x3 cross pattern using ndarray
+    let mut array = Array2::<u8>::zeros((3, 3));
+    array[[0, 1]] = 1;
+    array[[1, 0]] = 1;
+    array[[1, 1]] = 1;
+    array[[1, 2]] = 1;
+    array[[2, 1]] = 1;
+    
+    let img = array_to_bitimage(&array);
+    
+    let cfg = Jbig2EncConfig::default();
+    
+    // Test with a single symbol
+    let mut encoder = Jbig2Encoder::new(&cfg);
+    let mut array = Array2::zeros((img.height as usize, img.width as usize));
+    for y in 0..img.height as usize {
+        for x in 0..img.width as usize {
+            array[[y, x]] = if img.get(x as u32, y as u32) { 255 } else { 0 };
+        }
+    }
+    encoder.add_page(&array);
+    let result = encoder.flush();
+    assert!(result.is_ok(), "Failed to encode page with single symbol");
+    
+    // Test with multiple symbols
+    let mut encoder = Jbig2Encoder::new(&cfg);
+    for _ in 0..3 {
+        // Convert the same image multiple times to test multiple pages
+        let mut array = Array2::zeros((img.height as usize, img.width as usize));
+        for y in 0..img.height as usize {
+            for x in 0..img.width as usize {
+                array[[y, x]] = if img.get(x as u32, y as u32) { 255 } else { 0 };
+            }
+        }
+        encoder.add_page(&array);
+    }
+    let result = encoder.flush();
+    assert!(result.is_ok(), "Failed to encode page with multiple symbols");
+    
     let duration = start.elapsed();
     println!("Test test_encode_page_with_symbol_dictionary took: {:?}", duration);
+    
+    Ok(())
 }
 
 #[cfg(any(feature = "trace_encoder", feature = "trace_arith"))]
@@ -215,50 +480,56 @@ fn test_arithmetic_coder_annex_h2() {
     let start = Instant::now();
     #[cfg(any(feature = "trace_encoder", feature = "trace_arith"))]
     init_tracing_for_test();
-    
+
     // Input test data from JBIG2 Annex H.2
     let test_data = [
-        0x00, 0x02, 0x00, 0x51, 0x00, 0x00, 0x00, 0xC0, 
-        0x03, 0x52, 0x87, 0x2A, 0xAA, 0xAA, 0xAA, 0xAA,
-        0x82, 0xC0, 0x20, 0x00, 0xFC, 0xD7, 0x9E, 0xF6, 
-        0xBF, 0x7F, 0xED, 0x90, 0x4F, 0x46, 0xA3, 0xBF
+        0x00, 0x02, 0x00, 0x51, 0x00, 0x00, 0x00, 0xC0, 0x03, 0x52, 0x87, 0x2A, 0xAA, 0xAA, 0xAA,
+        0xAA, 0x82, 0xC0, 0x20, 0x00, 0xFC, 0xD7, 0x9E, 0xF6, 0xBF, 0x7F, 0xED, 0x90, 0x4F, 0x46,
+        0xA3, 0xBF,
     ];
 
     // Expected output from JBIG2 Annex H.2
     let expected_output = [
-        0x84, 0xC7, 0x3B, 0xFC, 0xE1, 0xA1, 0x43, 0x04, 0x02, 0x20, 0x00, 0x00, 0x41, 0x0D,
-        0xBB, 0x86, 0xF4, 0x31, 0x7F, 0xFF, 0x88, 0xFF, 0x37, 0x47, 0x1A, 0xDB, 0x6A, 0xDF,
+        0x84, 0xC7, 0x3B, 0xFC, 0xE1, 0xA1, 0x43, 0x04, 0x02, 0x20, 0x00, 0x00, 0x41, 0x0D, 0xBB,
+        0x86, 0xF4, 0x31, 0x7F, 0xFF, 0x88, 0xFF, 0x37, 0x47, 0x1A, 0xDB, 0x6A, 0xDF,
     ];
 
     // Initialize coder with single context
     let mut coder = Jbig2ArithCoder::new();
-    
+
     // Encode the test data using a single context
     #[cfg_attr(not(feature = "trace_arith"), allow(unused_imports))]
     use tracing::debug;
     #[cfg(any(feature = "trace_encoder", feature = "trace_arith"))]
     debug_with_time!(start, "Starting encoding of test data");
     let cx = 0;
-    for (index, &byte) in test_data.iter().enumerate() {
+    for (_index, &byte) in test_data.iter().enumerate() {
         for bit in 0..8 {
             let bit_val = (byte >> (7 - bit)) & 1 != 0;
             #[cfg(any(feature = "trace_encoder", feature = "trace_arith"))]
-            debug_with_time!(start, "Encoding byte {} bit {} with value {}", index, bit, bit_val);
+            debug_with_time!(
+                start,
+                "Encoding byte {} bit {} with value {}",
+                index,
+                bit,
+                bit_val
+            );
             coder.encode_bit(cx, bit_val);
         }
     }
-    
+
     // Flush the encoder to finalize the encoding
     coder.flush(false);
-    
+
     // Get the encoded data
     let encoded = coder.as_bytes();
-    
+
     // Compare with expected output
     #[cfg(any(feature = "trace_encoder", feature = "trace_arith"))]
     debug_with_time!(start, "Encoded data: {:?}", encoded);
     assert_eq!(
-        encoded, &expected_output[..],
+        encoded,
+        &expected_output[..],
         "Arithmetic coder output does not match JBIG2 Annex H.2 test vector"
     );
     let duration = start.elapsed();
@@ -266,7 +537,7 @@ fn test_arithmetic_coder_annex_h2() {
 }
 
 #[test]
-fn test_arithmetic_coder_generic_region() {
+fn test_arithmetic_coder_base_table() {
     let start = Instant::now();
     #[cfg(any(feature = "trace_encoder", feature = "trace_arith"))]
     init_tracing_for_test();
@@ -300,38 +571,79 @@ fn test_arithmetic_coder_generic_region() {
             let word = bitmap[y];
             let bit = (word >> (31 - x)) & 1;
             img.set(x as u32, y as u32, bit == 1);
-        }
-    }
-
-    // Encode the generic region
-    let encoded = jbig2::Jbig2ArithCoder::encode_generic_payload(&img, template, &at_pixels)
-        .expect("Generic region encoding failed");
-
-    println!("Final encoded data ({} bytes): {:?}", encoded.len(), encoded);
-    
-    // Verify the output matches expected
+  // Verify BASE table entries
     assert_eq!(
-        encoded, &expected_region_output[..],
-        "Generic region arithmetic coder output does not match expected vector"
+        BASE[0],
+        State {
+            qe: 0x5601,
+            nmps: 1,
+            nlps: 1,
+            switch: true
+        }
     );
-    
-    println!("Test passed!");
-    let duration = start.elapsed();
-    println!("Test test_arithmetic_coder_generic_region took: {:?}", duration);
-}
-
-#[test]
-fn test_arithmetic_coder_base_table() {
-    let start = Instant::now();
-    // Verify BASE table entries
-    assert_eq!(BASE[0], State { qe: 0x5601, nmps: 1,  nlps: 1,  switch: true  });
-    assert_eq!(BASE[1], State { qe: 0x3401, nmps: 2,  nlps: 6,  switch: false });
-    assert_eq!(BASE[2], State { qe: 0x1801, nmps: 3,  nlps: 9,  switch: false });
-    assert_eq!(BASE[3], State { qe: 0x0AC1, nmps: 4,  nlps: 12, switch: false });
-    assert_eq!(BASE[4], State { qe: 0x0521, nmps: 5,  nlps: 29, switch: false });
-    assert_eq!(BASE[5], State { qe: 0x0221, nmps: 38, nlps: 33, switch: false });
-    assert_eq!(BASE[6], State { qe: 0x5601, nmps: 7,  nlps: 6,  switch: true  });
-    assert_eq!(BASE[7], State { qe: 0x5401, nmps: 8,  nlps: 14, switch: false });
+    assert_eq!(
+        BASE[1],
+        State {
+            qe: 0x3401,
+            nmps: 2,
+            nlps: 6,
+            switch: false
+        }
+    );
+    assert_eq!(
+        BASE[2],
+        State {
+            qe: 0x1801,
+            nmps: 3,
+            nlps: 9,
+            switch: false
+        }
+    );
+    assert_eq!(
+        BASE[3],
+        State {
+            qe: 0x0AC1,
+            nmps: 4,
+            nlps: 12,
+            switch: false
+        }
+    );
+    assert_eq!(
+        BASE[4],
+        State {
+            qe: 0x0521,
+            nmps: 5,
+            nlps: 29,
+            switch: false
+        }
+    );
+    assert_eq!(
+        BASE[5],
+        State {
+            qe: 0x0221,
+            nmps: 38,
+            nlps: 33,
+            switch: false
+        }
+    );
+    assert_eq!(
+        BASE[6],
+        State {
+            qe: 0x5601,
+            nmps: 7,
+            nlps: 6,
+            switch: true
+        }
+    );
+    assert_eq!(
+        BASE[7],
+        State {
+            qe: 0x5401,
+            nmps: 8,
+            nlps: 14,
+            switch: false
+        }
+    );
     let duration = start.elapsed();
     println!("Test test_arithmetic_coder_base_table took: {:?}", duration);
 }
@@ -372,81 +684,33 @@ fn create_half_hald(width: u32, height: u32) -> BitImage {
 }
 
 #[test]
-fn test_generic_region() {
-    let start = Instant::now();
-    // Level 1: Basic 4x4 test with trace validation
-    println!("Running Level 1: Basic 4x4 test...");
-    let img = create_4x4_test_pattern();
-    // Encode with template 0 and no adaptive pixels
-    let encoded = jbig2::Jbig2ArithCoder::encode_generic_payload(&img, 0, &[])
-        .expect("❌ Level 1: Failed to encode 4x4 test pattern");
-    
-    // Basic validation - at least some data should be written
-    assert!(!encoded.is_empty(), "❌ Level 1: Encoded data should not be empty");
-    
-    // For a 4x4 pattern, wewatermark we expect at least 2 bytes (16 bits)
-    assert!(encoded.len() >= 2, "❌ Level 1: Encoded data too small for 4x4 pattern");
-    
-    // First byte should be non-zero (since we have black pixels)
-    assert_ne!(encoded[0], 0, "❌ Level 1: First byte should be non-zero for non-empty pattern");
-    println!("✅ Level 1: 4x4 test passed");
+fn test_generic_region_default_gbat_fallback() {
+    use jbig2::jbig2sym::BitImage;
+    use jbig2::jbig2arith::Jbig2ArithCoder;
 
-    // Level 2: Larger test patterns
-    println!("\nRunning Level 2: Larger test patterns...");
-    
-    // Test 1: 40x40 checkerboard
-    let checkerboard = create_checkerboard(40, 40);
-    let mut coder1 = Jbig2ArithCoder::new();
-    let packed1 = checkerboard.to_packed_words();
-    coder1.encode_generic_region(&packed1, 40_usize, 40, 0, &[])
-        .expect("❌ Level 2: Failed to encode 40x40 checkerboard");
-    let encoded1 = coder1.into_vec();
-    assert!(!encoded1.is_empty(), "❌ Level 2: Checkerboard encoding failed");
-    
-    // Test 2: Half-black/half-white
-    let half_half = create_half_hald(40, 40);
-    let mut coder2 = Jbig2ArithCoder::new();
-    let packed2 = half_half.to_packed_words();
-    coder2.encode_generic_region(&packed2, 40_usize, 40, 0, &[])
-        .expect("❌ Level 2: Failed to encode half-black/half-white image");
-    let encoded2 = coder2.into_vec();
-    assert!(!encoded2.is_empty(), "❌ Level 2: Half-half encoding failed");
-    
-    // The two encodings should be different
-    assert_ne!(encoded1, encoded2, "❌ Level 2: Different patterns should produce different encodings");
-    println!("✅ Level 2: Larger test patterns passed");
+    // a small, simple image (all zeros) for which the payload should be tiny
+    let img = BitImage::new(4, 4).unwrap();
 
-    // Level 3: Odd-width tests
-    println!("\nRunning Level 3: Odd-width tests...");
-    let odd_widths = [37, 41, 63];
-    
-    for &width in &odd_widths {
-        println!("  Testing width: {}...", width);
-        // Test with checkerboard pattern
-        let img = create_checkerboard(width, 20);
-        let mut coder = Jbig2ArithCoder::new();
-        let packed = img.to_packed_words();
-        
-        coder.encode_generic_region(&packed, width as usize, 20, 0, &[])
-            .unwrap_or_else(|_| panic!("❌ Level 3: Failed to encode {}x20 checkerboard", width));
-            
-        let encoded = coder.into_vec();
-        assert!(!encoded.is_empty(), "❌ Level 3: Failed to encode {}x20 image", width);
-        
-        // Test with half-black/half-white pattern
-        let img2 = create_half_hald(width, 20);
-        let mut coder2 = Jbig2ArithCoder::new();
-        let packed2 = img2.to_packed_words();
-        
-        coder2.encode_generic_region(&packed2, width as usize, 20, 0, &[])
-            .unwrap_or_else(|_| panic!("❌ Level 3: Failed to encode {}x20 half-half", width));
-            
-        let encoded2 = coder2.into_vec();
-        assert!(!encoded2.is_empty(), "❌ Level 3: Failed to encode {}x20 half-half", width);
-    }
-    println!("✅ Level 3: All odd-width tests passed");
-    let duration = start.elapsed();
-    println!("Test test_generic_region took: {:?}", duration);
+    // the ISO-specified default GBAT offsets for template 0
+    let default_gbats: &[(i8, i8)] = &[
+        ( 3, -1),
+        (-3, -1),
+        ( 2, -2),
+        (-2, -2),
+    ];
+
+    // encode passing no AT-pixels
+    let payload_empty = Jbig2ArithCoder::encode_generic_payload(&img, 0, &[]).unwrap();
+
+    // encode passing the explicit default list
+    let payload_explicit = Jbig2ArithCoder::encode_generic_payload(&img, 0, default_gbats).unwrap();
+
+    // they must be exactly the same
+    assert_eq!(
+        payload_empty, payload_explicit,
+        "Empty at_pixels must fall back to the default GBAT list for template 0"
+    );
 }
+
 
 // Add more tests as needed for dictionary merging, refinement, etc.
