@@ -427,6 +427,22 @@ impl<'a> Jbig2Encoder<'a> {
                 current_segment_number += 1;
             } else {
                 // NON-SYMBOL MODE: GenericRegion will be written
+
+                // Default adaptive template pixels for template 0
+                // (see ITU T.88, Table 6.6)
+                let default_gbat: [(i8, i8); 4] = [
+                    (3, -1),
+                    (-3, -1),
+                    (2, -2),
+                    (-2, -2),
+                ];
+
+                let coder_data =
+                    Jbig2ArithCoder::encode_generic_payload(&page.image, 0, &default_gbat)?;
+
+                // Header is 26 bytes for template 0 (includes 8-byte GBAT)
+                let mut generic_region_payload = Vec::with_capacity(26 + coder_data.len());
+
                 // For generic regions (template=0), use empty AT-pixels array
                 let default_gbats: &[(i8, i8)] = &[(3, -1), (-3, -1), (2, -2), (-2, -2)];
                 // Define the AT pixels that will be used for both the header and the payload.
@@ -443,6 +459,7 @@ impl<'a> Jbig2Encoder<'a> {
                 // Header is 18 bytes for generic region header + 8 bytes for GBAT = 26 bytes
                 let mut generic_region_payload =
                     Vec::with_capacity(18 + at_pixels_template0.len() * 2 + coder_data.len());
+
                 generic_region_payload.write_u32::<BigEndian>(page.image.width as u32)?;
                 generic_region_payload.write_u32::<BigEndian>(page.image.height as u32)?;
                 generic_region_payload.write_u32::<BigEndian>(0)?; // X location
@@ -452,10 +469,16 @@ impl<'a> Jbig2Encoder<'a> {
                 let flags: u8 = 0x00; // MMR=0, GBTEMPLATE=0, TPGDON=0
                 generic_region_payload.push(flags);
 
+                // Write the same adaptive template pixels used for encoding
+                for &(dx, dy) in &default_gbat {
+                    generic_region_payload.push(dx as i8 as u8);
+                    generic_region_payload.push(dy as i8 as u8);
+
                 // Write the AT pixel coordinates to the header.
                 for &(x, y) in at_pixels_template0 {
                     generic_region_payload.push(x as u8);
                     generic_region_payload.push(y as u8);
+
                 }
 
                 generic_region_payload.extend_from_slice(&coder_data);

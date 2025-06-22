@@ -539,7 +539,39 @@ fn test_arithmetic_coder_annex_h2() {
 #[test]
 fn test_arithmetic_coder_base_table() {
     let start = Instant::now();
-    // Verify BASE table entries
+    #[cfg(any(feature = "trace_encoder", feature = "trace_arith"))]
+    init_tracing_for_test();
+
+    // Test a 4x4 bitmap, with each row in a u32:
+    // Row 0: 1100...
+    // Row 1: 0110...
+    // Row 2: 0011...
+    // Row 3: 0001...
+    let bitmap: Vec<u32> = vec![
+        0b11000000_00000000_00000000_00000000, // 0xC0000000
+        0b01100000_00000000_00000000_00000000, // 0x60000000
+        0b00110000_00000000_00000000_00000000, // 0x30000000
+        0b00010000_00000000_00000000_00000000, // 0x10000000
+    ];
+    let width = 4;
+    let height = 4;
+    let template = 0;
+    let at_pixels: Vec<(i8, i8)> = vec![]; // No adaptive pixels
+
+    // This vector corresponds to encoding the 4x4 image using the
+    // neighbour ordering matching jbig2dec.
+    let expected_region_output = [0xE8, 0x63, 0xFF, 0xFF, 0xAC];
+
+    println!("Starting generic region encoding test...");
+    println!("Starting generic region encoding test...");
+
+    let mut img = BitImage::new(width as u32, height as u32).unwrap();
+    for y in 0..height {
+        for x in 0..width {
+            let word = bitmap[y];
+            let bit = (word >> (31 - x)) & 1;
+            img.set(x as u32, y as u32, bit == 1);
+  // Verify BASE table entries
     assert_eq!(
         BASE[0],
         State {

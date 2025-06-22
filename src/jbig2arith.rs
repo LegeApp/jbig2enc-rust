@@ -565,6 +565,9 @@ impl Jbig2ArithCoder {
         };
 
         let n_ctx = if template == 0 { 16 } else { 10 + gbats.len() };
+
+        coder.context.resize(1 << n_ctx, Jbig2ArithCoder::INITIAL_STATE);
+
         coder
             .context
             .resize(1 << n_ctx, Jbig2ArithCoder::INITIAL_STATE);
@@ -582,6 +585,9 @@ impl Jbig2ArithCoder {
 
         // Finalize the arithmetic coder state with the JBIG2 terminator
         coder.flush(true);
+
+        
+
 
         // Finalize the arithmetic coder state and append marker code
         coder.flush(true);
@@ -625,6 +631,8 @@ impl Jbig2ArithCoder {
             (img[idx_word] >> bit_pos) & 1
         }
 
+
+        // Use the first four AT pixels if provided
         // The context for template 0 uses the four previously coded pixels in
         // the current line ("line3"), five pixels from the previous line
         // ("line2"), three pixels from two lines above ("line1") and up to four
@@ -644,6 +652,7 @@ impl Jbig2ArithCoder {
             (-2, 0),
             (-1, 0),
         ];
+
 
         let gbats = &at_pixels[..at_pixels.len().min(4)];
 
@@ -666,6 +675,23 @@ impl Jbig2ArithCoder {
                         << 4;
                 }
 
+                // Static neighbours (bit order as used by jbig2dec)
+                cx |= (sample(packed_data, width, height, x - 1, y) as usize) << 0;  // X1
+                cx |= (sample(packed_data, width, height, x - 2, y) as usize) << 1;  // X2
+                let (adx1, ady1) = gbats.get(0).copied().unwrap_or((2, -1));
+                cx |= (sample(packed_data, width, height, x + adx1 as i32, y + ady1 as i32) as usize) << 2; // A1
+                cx |= (sample(packed_data, width, height, x + 1, y - 1) as usize) << 3; // X3
+                cx |= (sample(packed_data, width, height, x,     y - 1) as usize) << 4; // X4
+                cx |= (sample(packed_data, width, height, x - 1, y - 1) as usize) << 5; // X5
+                cx |= (sample(packed_data, width, height, x - 2, y - 1) as usize) << 6; // X6
+                cx |= (sample(packed_data, width, height, x + 1, y - 2) as usize) << 7; // X7
+                cx |= (sample(packed_data, width, height, x,     y - 2) as usize) << 8; // X8
+                cx |= (sample(packed_data, width, height, x - 1, y - 2) as usize) << 9; // X9
+
+                // Adaptive template pixels (up to four)
+                for (i, &(dx, dy)) in gbats.iter().enumerate() {
+                    cx |= (sample(packed_data, width, height, x + dx as i32, y + dy as i32) as usize) << (10 + i);
+
                 for (bit, &(dx, dy)) in STATIC_OFFSETS.iter().enumerate() {
                     let v = sample(packed_data, width, height, x + dx as i32, y + dy as i32);
                     let shift = STATIC_OFFSETS.len() - 1 - bit;
@@ -687,6 +713,7 @@ impl Jbig2ArithCoder {
                     cx |= (sample(packed_data, width, height, x + *dx as i32, y + *dy as i32)
                         as usize)
                         << 15;
+
                 }
 
                 let pixel_val = sample(packed_data, width, height, x, y) != 0;

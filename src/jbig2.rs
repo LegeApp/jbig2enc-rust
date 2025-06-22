@@ -230,10 +230,14 @@ pub fn get_build_info() -> String {
     format!(
         "{} (built with {})",
         build_ts,
+
+        if cfg!(debug_assertions) { "debug" } else { "release" }
+
         if cfg!(debug_assertions) {
             "debug"
         } else {
             "release"
         }
+
     )
 }
