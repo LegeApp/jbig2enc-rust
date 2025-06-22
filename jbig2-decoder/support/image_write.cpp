@@ -8,9 +8,11 @@
 #include <iterator>    
 #include <stdexcept>  
 
+#ifdef _MSC_VER
 #define STBI_MSC_SECURE_CRT
+#endif
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h" // http://nothings.org/stb/stb_image_write.h 
+#include "stb_image_write.h" // http://nothings.org/stb/stb_image_write.h
 
 std::vector<unsigned char> BitPerPixelToBytePerPixel(const CJBig2_Image* img)
 {
