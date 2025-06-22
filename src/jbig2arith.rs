@@ -334,14 +334,8 @@ impl Jbig2ArithCoder {
     }
 
     /// Finalizes the arithmetic coding stream.
-    pub fn finalize(&mut self, data: &mut Vec<u8>) -> Result<()> {
-        self.renorm();
-        self.c = self.c.wrapping_add(self.a as u32);
-        self.byte_out();
-        self.c = self.c.wrapping_add(self.a as u32);
-        self.byte_out();
-
-        Ok(())
+    pub fn finalize(&mut self, data: &mut Vec<u8>) {
+        self.flush(true);
     }
 
     /// Renormalizes the arithmetic coder state according to the JBIG2 standard's RENORME procedure (Figure E.8).
@@ -581,10 +575,16 @@ impl Jbig2ArithCoder {
             template,
             gbats,
         )?;
+        // Finalize the arithmetic coder state with the JBIG2 terminator
+        coder.flush(true);
+
 
         // Finalize the arithmetic coder state with the JBIG2 terminator
         coder.flush(true);
         
+
+        // Finalize the arithmetic coder state and append marker code
+        coder.flush(true);
         // Get the result
         let result = coder.data;
         
@@ -627,6 +627,16 @@ impl Jbig2ArithCoder {
         // adaptive template pixels.  This mirrors the implementation in
         // jbig2dec and the ITU T.88 specification.
 
+
+        // JBIG2 Template-0 static neighbours (Table A.3‑5), MSB→LSB
+        const STATIC_OFFSETS: [(i8, i8); 10] = [
+            (-1, -2), (0, -2), (1, -2), (2, -2),
+            (-2, -1), (-1, -1), (0, -1), (1, -1),
+            (-2, 0), (-1, 0),
+        ];
+
+
+
         let gbats = &at_pixels[..at_pixels.len().min(4)];
 
         for y in 0..height as i32 {
@@ -646,6 +656,20 @@ impl Jbig2ArithCoder {
                 let mut cx: usize = line3 as usize;
                 if let Some((dx, dy)) = gbats.get(0) {
                     cx |= (sample(packed_data, width, height, x + *dx as i32, y + *dy as i32) as usize) << 4;
+
+
+
+            for x in 0..width as i32 {
+                let mut cx: usize = line3 as usize;
+                if let Some((dx, dy)) = gbats.get(0) {
+                    cx |= (sample(packed_data, width, height, x + *dx as i32, y + *dy as i32) as usize) << 4;
+
+                for (bit, &(dx, dy)) in STATIC_OFFSETS.iter().enumerate() {
+                    let v = sample(packed_data, width, height, x + dx as i32, y + dy as i32);
+                    let shift = STATIC_OFFSETS.len() - 1 - bit;
+                    cx |= (v as usize) << shift;
+
+
                 }
                 cx |= (line2 as usize) << 5;
                 if let Some((dx, dy)) = gbats.get(1) {
