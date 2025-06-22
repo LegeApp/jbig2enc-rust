@@ -287,9 +287,9 @@ fn test_arithmetic_coder_generic_region() {
     let template = 0;
     let at_pixels: Vec<(i8, i8)> = vec![]; // No adaptive pixels
 
-    let expected_region_output = [
-        0xE8, 0x63, 0xFF, 0xFF, 0xAC
-    ];
+    // This vector corresponds to encoding the 4x4 image using the
+    // neighbour ordering matching jbig2dec.
+    let expected_region_output = [0xE8, 0x63, 0xFF, 0xFF, 0xAC];
 
     println!("Starting generic region encoding test...");
     println!("Starting generic region encoding test...");
