@@ -158,8 +158,32 @@ fn debug_print_image(img: &BitImage, name: &str) {
 fn encode_and_decode(img: &BitImage, temp_dir: &TempDir) -> Result<(), Box<dyn Error>> {
     // Debug print input image
     debug_print_image(img, "Input Image");
+    #[cfg(debug_assertions)] {
+        // Compute first black pixel in input BitImage
+        let mut first_input_pixel = None;
+        let bytes_per_row = (img.width as usize + 7) / 8;
+        for y in 0..img.height as usize {
+            for x in 0..img.width as usize {
+                let byte_idx = y * bytes_per_row + (x / 8);
+                let bit = (img.as_bytes()[byte_idx] >> (7 - (x % 8))) & 1;
+                if bit == 1 {
+                    first_input_pixel = Some((x, y));
+                    break;
+                }
+            }
+            if first_input_pixel.is_some() {
+                break;
+            }
+        }
+        if let Some((col, row)) = first_input_pixel {
+            println!("first black pixel in input image: ({}, {})", col, row);
+        } else {
+            println!("first black pixel in input image: none");
+        }
+    }
     
-    let cfg = Jbig2EncConfig::default();
+    let mut cfg = Jbig2EncConfig::default();
+    cfg.want_full_headers = true;
     let mut encoder = Jbig2Encoder::new(&cfg);
     
     let width = img.width as usize;
@@ -229,6 +253,29 @@ fn encode_and_decode(img: &BitImage, temp_dir: &TempDir) -> Result<(), Box<dyn E
     }
     
     let decoded = read_pbm(&temp_dir.path().join("out.pbm"));
+    #[cfg(debug_assertions)] {
+        // Compute first black pixel in decoded image
+        let mut first_decoded_pixel = None;
+        let bytes_per_row_dec = (decoded.width as usize + 7) / 8;
+        for y in 0..decoded.height as usize {
+            for x in 0..decoded.width as usize {
+                let byte_idx = y * bytes_per_row_dec + (x / 8);
+                let bit = (decoded.as_bytes()[byte_idx] >> (7 - (x % 8))) & 1;
+                if bit == 1 {
+                    first_decoded_pixel = Some((x, y));
+                    break;
+                }
+            }
+            if first_decoded_pixel.is_some() {
+                break;
+            }
+        }
+        if let Some((col, row)) = first_decoded_pixel {
+            println!("first black pixel in decoded PBM: ({}, {})", col, row);
+        } else {
+            println!("first black pixel in decoded PBM: none");
+        }
+    }
     
     if img.width != decoded.width || img.height != decoded.height {
         return Err(Box::new(TestError::DecodeError(
@@ -571,7 +618,10 @@ fn test_arithmetic_coder_base_table() {
             let word = bitmap[y];
             let bit = (word >> (31 - x)) & 1;
             img.set(x as u32, y as u32, bit == 1);
-  // Verify BASE table entries
+        }
+    }
+
+    // Verify BASE table entries
     assert_eq!(
         BASE[0],
         State {
@@ -644,6 +694,7 @@ fn test_arithmetic_coder_base_table() {
             switch: false
         }
     );
+    
     let duration = start.elapsed();
     println!("Test test_arithmetic_coder_base_table took: {:?}", duration);
 }
