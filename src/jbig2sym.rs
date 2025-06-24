@@ -186,25 +186,35 @@ impl BitImage {
     /// cached to avoid repeated work when the same image is processed multiple
     /// times.
     pub fn to_packed_words(&self) -> Vec<u32> {
-        let cached = self.packed_cache.get_or_init(|| {
-            let wpr = (self.width + 31) / 32;
-            let mut out = vec![0u32; wpr * self.height];
-            for y in 0..self.height {
-                for xw in 0..wpr {
-                    let mut word = 0u32;
-                    for bit in 0..32 {
-                        let x = xw * 32 + bit;
-                        if x < self.width && self.get(usize_to_u32(x), usize_to_u32(y)) {
-                            word |= 1u32 << bit;
+    let cached = self.packed_cache.get_or_init(|| {
+        let words_per_row = (self.width + 31) / 32;
+        let mut out = Vec::with_capacity(words_per_row * self.height);
+
+        for y in 0..self.height {
+            for word_x in 0..words_per_row {
+                let mut w = 0u32;
+
+                // pack up to 32 pixels, MSb-first in each u32 word
+                for bit in 0..32 {
+                    let x = word_x * 32 + bit;
+                    if x < self.width {
+                        // self.get(x,y) returns true for a black pixel
+                        if self.get_usize(x, y) {
+                            // shift so that bit 31 is leftmost, bit 0 is rightmost
+                            w |= 1u32 << (31 - bit);
                         }
                     }
-                    out[y * wpr + xw] = word;
                 }
+
+                out.push(w);
             }
-            out
-        });
-        cached.clone()
-    }
+        }
+
+        out
+    });
+
+    cached.clone()
+}
 
     /// Gets a pixel value at (x, y).
     #[inline]

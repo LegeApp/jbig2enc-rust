@@ -957,5 +957,11 @@ pub fn encode_generic_region_inner(
         std::mem::take(&mut self.data) // Assuming data field; ensure it's correct
     }
 }
-
+#[test]
+fn pbm_packing_row_major_msb_first() {
+    let img = load_test_pbm("checker_8x8.pbm");      // row0 = 0xAA, row1 = 0x55 …
+    let packed = to_packed_words(&img);
+    assert_eq!(packed[0], 0xAA000000);               // row 0, first word
+    assert_eq!(packed[1], 0x55000000);               // row 1, first word
+}
 // End of Jbig2ArithCoder implementation
