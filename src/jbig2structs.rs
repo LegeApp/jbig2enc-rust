@@ -195,7 +195,7 @@ impl GenericRegionParams {
         buf.write_u32::<BigEndian>(self.x).unwrap();
         buf.write_u32::<BigEndian>(self.y).unwrap();
         buf.push(self.comb_operator);
-
+        
         let mut flags = 0u8;
         if self.mmr {
             flags |= 0x01; // Bit 0: MMR (only for MMR coding)
@@ -208,10 +208,11 @@ impl GenericRegionParams {
         buf.push(flags);
 
         // Write AT coordinates: all 4 pairs if template == 0, first 2 pairs otherwise
-        let at_count = if self.template == 0 { 4 } else { 2 };
-        for i in 0..at_count {
-            buf.push(self.at[i].0 as u8); // Cast i8 to u8 preserves two's complement
-            buf.push(self.at[i].1 as u8);
+        let at_count = match self.template {
+            0 => 4,   // Header requires 4 but context uses 0
+            1 => 1,   // Template 1 uses 1 AT pixel
+            _ => 0,   // Templates 2-3 use 0
+        };
         }
         buf
     }

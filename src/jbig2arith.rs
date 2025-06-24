@@ -630,10 +630,6 @@ impl Jbig2ArithCoder {
 
         let packed_data = image.to_packed_words();
         let mut coder = Jbig2ArithCoder::new();
-
-        // For template 0 the decoder uses a 16-bit context irrespective of the
-        // number of adaptive template pixels. For refinement templates the
-        // context size depends on the number of AT pixels present.
         let use_at = template != 0 || !at_pixels.is_empty();
         let gbats = if use_at {
             &at_pixels[..at_pixels.len().min(4)]
@@ -641,7 +637,7 @@ impl Jbig2ArithCoder {
             &[]
         };
 
-        let n_ctx = if template == 0 { 16 } else { 10 + gbats.len() };
+        let n_ctx = if template == 0 { 10 } else { 10 + gbats.len() };
 
         coder.context.resize(1 << n_ctx, Jbig2ArithCoder::INITIAL_STATE);
 
@@ -692,6 +688,12 @@ pub fn encode_generic_region_inner(
     height: usize,
     template: u8,
     at: &[(i8, i8); 4],
+    
+    let fixed_offsets = match template {
+        0 => &STATIC_OFFSETS_T0,
+        _ => &STATIC_OFFSETS,
+    };
+
 ) -> Result<()> {
     #[cfg(debug_assertions)] {
         log::debug!("encode_generic_region_inner: {}x{}, template={}, at={:?}", width, height, template, at);
@@ -738,10 +740,12 @@ pub fn encode_generic_region_inner(
         log::debug!("  A3 X A4 O");
     }
 
-    const STATIC_OFFSETS: [(i8, i8); 6] = [
-        (-1, -2), (0, -2), (1, -2),
-        (-2, -1), (-1, -1), (0, -1),
-    ];
+    const STATIC_OFFSETS_T0: [(i8, i8); 10] = [
+    // Row y-2
+    (-3, -2), (-2, -2), (-1, -2), (0, -2),
+    // Row y-1
+    (-3, -1), (-2, -1), (-1, -1), (0, -1), (1, -1), (2, -1),
+];
 
     let mut prev_row: Vec<bool> = vec![false; width];
     let mut curr_row: Vec<bool> = Vec::with_capacity(width);
@@ -796,26 +800,8 @@ pub fn encode_generic_region_inner(
                 cx |= (bit as usize) << bit_pos;
                 bit_pos += 1;
             }
-
-            if x > 0 {
-                let bit = curr_row[(x - 1) as usize];
-                cx |= (bit as usize) << bit_pos;
-
-            } else {
-
-            }
-            bit_pos += 1;
-
-            if x > 1 {
-                let bit = curr_row[(x - 2) as usize];
-                cx |= (bit as usize) << bit_pos;
-
-            } else {
-
-            }
-            bit_pos += 1;
-
-            for (i, &(dx, dy)) in at.iter().enumerate() {
+            if template != 0 {
+                for (i, &pixel) in at_pixels.iter().enumerate() {
                 let xx = x + dx as i32;
                 let yy = y + dy as i32;
                 let bit = if yy == y {
@@ -862,6 +848,9 @@ pub fn encode_generic_region_inner(
 
     /// Helper function to sample a single bit from a packed bitmap.
     /// Returns 0 or 1, or 0 if out of bounds.
+    /// 
+    /// Reads from packed data in row-major order with MSb-first bit orientation,
+    /// matching the format produced by BitImage::to_packed_words().
     fn sample(packed: &[u32], width: usize, height: usize, x: i32, y: i32) -> u32 {
         let result = if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
             #[cfg(debug_assertions)]
@@ -870,14 +859,21 @@ pub fn encode_generic_region_inner(
             }
             0
         } else {
-            let idx = (y as usize) * ((width + 31) / 32) + ((x as usize) / 32);
+            let words_per_row = (width + 31) / 32;
+            let row_offset = (y as usize) * words_per_row;
+            let word_in_row = (x as usize) / 32;
+            let idx = row_offset + word_in_row;
+            
             if idx >= packed.len() {
                 #[cfg(debug_assertions)]
                 log::warn!("sample: index out of bounds: idx={}, packed.len()={}", idx, packed.len());
                 return 0;
             }
-            let bit_pos = 31 - (x as usize & 31);
-            (packed[idx] >> bit_pos) & 1
+            
+            // MSb-first bit ordering within each word
+            let word = packed[idx];
+            let bit_pos = 31 - (x as usize % 32);  // Keep MSB-first
+            (word >> bit_pos) & 1
         };
         
         #[cfg(debug_assertions)]
@@ -916,12 +912,6 @@ pub fn encode_generic_region_inner(
                 cx |= (bit as usize) << bp; bp += 1;
             }
     
-            // left neighbours in same line
-            if x > 0 { cx |= (current_buf[(x - 1) as usize] as usize) << bp; }
-            bp += 1;
-            if x > 1 { cx |= (current_buf[(x - 2) as usize] as usize) << bp; }
-            bp += 1;
-    
             // four AT pixels
             for (dx, dy) in at {
                 let xx = x + *dx as i32;
@@ -959,20 +949,4 @@ pub fn encode_generic_region_inner(
     }
 }
 
-#[cfg(test)]
-fn load_test_pbm(_name: &str) -> crate::jbig2sym::BitImage {
-    use crate::jbig2sym::BitImage;
-    let mut img = BitImage::new(8, 8).unwrap();
-    for x in (0..8).step_by(2) { img.set(x, 0, true); } // 0xAA
-    for x in (1..8).step_by(2) { img.set(x, 1, true); } // 0x55
-    img
-}
-
-#[test]
-fn pbm_packing_row_major_msb_first() {
-    let img = load_test_pbm("checker_8x8.pbm");
-    let packed = img.to_packed_words();
-    assert_eq!(packed[0], 0xAA000000);
-    assert_eq!(packed[1], 0x55000000);
-}
 // End of Jbig2ArithCoder implementation

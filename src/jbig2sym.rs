@@ -198,7 +198,7 @@ impl BitImage {
                 for bit in 0..32 {
                     let x = word_x * 32 + bit;
                     if x < self.width {
-                        // self.get(x,y) returns true for a black pixel
+                        // self.get_usize(x,y) -> true means a black pixel at (x,y)
                         if self.get_usize(x, y) {
                             // shift so that bit 31 is leftmost, bit 0 is rightmost
                             w |= 1u32 << (31 - bit);
@@ -215,6 +215,7 @@ impl BitImage {
 
     cached.clone()
 }
+
 
     /// Gets a pixel value at (x, y).
     #[inline]

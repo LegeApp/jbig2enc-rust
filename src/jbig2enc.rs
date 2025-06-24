@@ -307,6 +307,17 @@ impl<'a> Jbig2Encoder<'a> {
         }
 
         let mut output = Vec::new();
+		
+		if self.state.full_headers_remaining {
+            let header = FileHeader {
+                organisation_type: true,
+                unknown_n_pages: false,
+                n_pages: self.pages.len() as u32,
+            };
+            output.extend(header.to_bytes());
+            // only write the header once
+            self.state.full_headers_remaining = false;
+        }
 
         let global_symbol_indices: Vec<usize> = self
             .global_symbols
