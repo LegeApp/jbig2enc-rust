@@ -876,7 +876,8 @@ pub fn encode_generic_region_inner(
                 log::warn!("sample: index out of bounds: idx={}, packed.len()={}", idx, packed.len());
                 return 0;
             }
-            (packed[idx] >> ((x % 32) as usize)) & 1
+            let bit_pos = 31 - (x as usize & 31);
+            (packed[idx] >> bit_pos) & 1
         };
         
         #[cfg(debug_assertions)]
@@ -957,11 +958,21 @@ pub fn encode_generic_region_inner(
         std::mem::take(&mut self.data) // Assuming data field; ensure it's correct
     }
 }
+
+#[cfg(test)]
+fn load_test_pbm(_name: &str) -> crate::jbig2sym::BitImage {
+    use crate::jbig2sym::BitImage;
+    let mut img = BitImage::new(8, 8).unwrap();
+    for x in (0..8).step_by(2) { img.set(x, 0, true); } // 0xAA
+    for x in (1..8).step_by(2) { img.set(x, 1, true); } // 0x55
+    img
+}
+
 #[test]
 fn pbm_packing_row_major_msb_first() {
-    let img = load_test_pbm("checker_8x8.pbm");      // row0 = 0xAA, row1 = 0x55 …
-    let packed = to_packed_words(&img);
-    assert_eq!(packed[0], 0xAA000000);               // row 0, first word
-    assert_eq!(packed[1], 0x55000000);               // row 1, first word
+    let img = load_test_pbm("checker_8x8.pbm");
+    let packed = img.to_packed_words();
+    assert_eq!(packed[0], 0xAA000000);
+    assert_eq!(packed[1], 0x55000000);
 }
 // End of Jbig2ArithCoder implementation
