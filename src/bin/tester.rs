@@ -1,69 +1,16 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
 use jbig2::jbig2enc::{Jbig2EncConfig, Jbig2Encoder, encode_generic_region};
-
 use jbig2::jbig2sym::array_to_bitimage;
 use log::info;
+use env_logger::Builder;
+use env_logger::Env;
+use log::LevelFilter;
 use ndarray::Array2;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-#[cfg(any(feature = "trace_encoder", feature = "trace_arith"))]
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use std::path::Path;
 
-// Define no-op macros when tracing is not available
-#[cfg(not(any(feature = "trace_encoder", feature = "trace_arith")))]
-macro_rules! info {
-    ($($arg:tt)*) => { println!($($arg)*) };
-}
-
-#[cfg(not(any(feature = "trace_encoder", feature = "trace_arith")))]
-#[macro_export]
-macro_rules! debug {
-    ($($arg:tt)*) => {};
-}
-
-#[cfg(not(any(feature = "trace_encoder", feature = "trace_arith")))]
-#[macro_export]
-macro_rules! error {
-    ($($arg:tt)*) => { eprintln!($($arg)*) };
-}
-
-/// Initialize logging with appropriate verbosity based on features
-#[cfg(any(feature = "trace_encoder", feature = "trace_arith"))]
-fn init_logging() -> Result<()> {
-    let filter = if std::env::var_os("RUST_LOG").is_some() {
-        EnvFilter::from_default_env()
-    } else {
-        let mut filter = EnvFilter::new("info");
-        if cfg!(feature = "trace_encoder") {
-            filter = filter.add_directive("jbig2::jbig2enc=debug".parse()?);
-        }
-        if cfg!(feature = "trace_arith") {
-            filter = filter.add_directive("jbig2_arith=debug".parse()?);
-        }
-        filter
-    };
-    let subscriber = fmt()
-        .with_ansi(false)
-        .with_writer(std::io::stdout)
-        .with_env_filter(filter)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("Failed to set global default subscriber");
-    info!("Tracing initialized. Running with debug output.");
-    Ok(())
-}
-
-#[cfg(not(any(feature = "trace_encoder", feature = "trace_arith")))]
-fn init_logging() -> Result<()> {
-    println!("Running with basic output (enable 'trace_encoder' or 'trace_arith' features for detailed logging)");
-    Ok(())
-}
-
-use jbig2::jbig2pdf;
-use jbig2::jbig2pdf::{Jbig2Input, Jbig2Roi};
-
-/// JBIG2 Encoder Tester Application
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
@@ -96,10 +43,68 @@ struct Args {
     log_file: Option<String>,
 }
 
+fn init_logging(args: &Args) -> Result<()> {
+    let default_log_level = if cfg!(debug_assertions) {
+        // In debug builds, default to debug level
+        "debug"
+    } else {
+        // In release builds, default to info level
+        "info"
+    };
+    
+    let mut builder = Builder::from_env(Env::new().default_filter_or(default_log_level));
+
+    // Set appropriate log levels for our crates
+    if cfg!(debug_assertions) {
+        // In debug builds, enable debug logging for our crates
+        builder.filter_module("jbig2", LevelFilter::Debug);
+        builder.filter_module("jbig2_arith", LevelFilter::Debug);
+    } else {
+        // In release builds, respect the default level from RUST_LOG
+        builder.filter_module("jbig2", LevelFilter::Info);
+        builder.filter_module("jbig2_arith", LevelFilter::Info);
+    }
+    builder.filter_module("jbig2::jbig2enc", LevelFilter::Debug);
+    builder.filter_module("jbig2_arith", LevelFilter::Debug); // Matches jbig2arith.rs module
+
+    // Enable trace logs for specific modules only if trace features are enabled
+    #[cfg(any(feature = "trace_encoder", feature = "trace_arith"))]
+    {
+        if cfg!(feature = "trace_encoder") {
+            builder.filter_module("jbig2::jbig2enc", LevelFilter::Trace);
+        }
+        if cfg!(feature = "trace_arith") {
+            builder.filter_module("jbig2_arith", LevelFilter::Trace);
+        }
+    }
+
+    // If console is disabled, suppress console output (logs go to file only if configured)
+    if !args.console {
+        builder.is_test(true);
+    }
+
+    // Set up file logging if log_dir and log_file are specified
+    if let Some(dir) = &args.log_dir {
+        let log_file = args.log_file.as_deref().unwrap_or("jbig2_trace.log");
+        let log_path = Path::new(dir).join(log_file);
+        std::fs::create_dir_all(dir)?;
+        let file = File::create(&log_path)?;
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+    }
+
+    builder.init();
+    info!("Logging initialized with console={}, log_dir={:?}, log_file={:?}",
+          args.console, args.log_dir, args.log_file);
+    Ok(())
+}
+
+use jbig2::jbig2pdf;
+use jbig2::jbig2pdf::{Jbig2Input, Jbig2Roi};
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Set up environment for logging
+    // Set environment variables for logging configuration
     if args.console {
         std::env::set_var("RUST_LOG_CONSOLE", "1");
     }
@@ -111,7 +116,7 @@ fn main() -> Result<()> {
     }
 
     // Initialize logging
-    init_logging()?;
+    init_logging(&args)?;
 
     info!("JBIG2 Encoder Tester");
     info!(
@@ -143,51 +148,39 @@ fn main() -> Result<()> {
     let image_array = Array2::<u8>::from_shape_fn((height, width), |(r, c)| {
         let byte_idx = r * ((width + 7) / 8) + (c / 8);
         let bit_idx_in_byte = c % 8;
-
-        // PBM uses 1 for black and 0 for white. Our BitImage representation
-        // expects the same convention, so keep the original bit value.
         ((data[byte_idx] >> (7 - bit_idx_in_byte)) & 1) as u8
-
-        // PBM black is 1, but our library expects 0 for black. Invert the pixel.
-        if (data[byte_idx] >> (7 - bit_idx_in_byte)) & 1 == 0 {
-            1
-        } else {
-            0
-        }
-
     });
     info!("Converted PBM to ndarray::Array2<u8>.");
 
     // 3. Configure the encoder
-    let mut config = Jbig2EncConfig { // Make config mutable
+    let config = Jbig2EncConfig {
         symbol_mode: args.symbol_mode,
-        want_full_headers: true, // Always include full headers for standalone mode
+        want_full_headers: true,
+        mmr: false, // Force arithmetic coding
+        tpgdon: false, // Override tpgdon: false in the encoder config for testing (match C behavior)
         ..Jbig2EncConfig::default()
     };
+    println!("[DEBUG] Jbig2EncConfig.mmr = {}", config.mmr);
     
-    // Log the configuration
-    println!("Using encoder config: symbol_mode={}, want_full_headers={}", 
-             config.symbol_mode, config.want_full_headers);
-    info!("Using encoder config: {:?}", config);
+    info!("Using encoder config: symbol_mode={}, want_full_headers={}",
+          config.symbol_mode, config.want_full_headers);
 
     // 4. Initialize and use the Jbig2Encoder
-    // If not in PDF mode, we'll use the new encode_generic_region directly.
-    // If in PDF mode, we still need the encoder to produce fragments.
     let encoded_data = if args.pdf_mode {
         let mut encoder = Jbig2Encoder::new(&config);
         encoder.add_page(&image_array)?;
-        println!("Finalizing JBIG2 encoding...");
+        info!("Finalizing JBIG2 encoding...");
         encoder.flush()?
     } else {
-        println!("Standalone mode: Using encode_generic_region to produce full JBIG2 file.");
-        let bit_image = array_to_bitimage(&image_array); // Convert Array2 to BitImage
-        encode_generic_region(&bit_image, &config)? // Use the new function
+        info!("Standalone mode: Using encode_generic_region to produce full JBIG2 file.");
+        let bit_image = array_to_bitimage(&image_array);
+        encode_generic_region(&bit_image, &config)?
     };
 
     // 5. Write the output file
     if args.pdf_mode {
         let output_path = args.output.replace(".jb2", ".pdf");
-        println!("PDF Mode: Creating PDF file at {}", output_path);
+        info!("PDF Mode: Creating PDF file at {}", output_path);
 
         let jbig2_roi = Jbig2Roi {
             stream: encoded_data,
@@ -206,16 +199,14 @@ fn main() -> Result<()> {
         let page_dims = vec![(width as f32, height as f32)];
 
         jbig2pdf::create_jbig2_pdf(jbig2_input, &output_path, &page_dims)?;
-        println!("Successfully created PDF with JBIG2 fragment.");
+        info!("Successfully created PDF with JBIG2 fragment.");
     } else {
         let mut file = File::create(&args.output)?;
-        // The encoded_data now contains the full JBIG2 file from encode_generic_region
         file.write_all(&encoded_data)?;
-        println!("Successfully wrote full JBIG2 file to {}", args.output);
+        info!("Successfully wrote full JBIG2 file to {}", args.output);
     }
 
-    println!("Encoded data written successfully.");
-
+    info!("Encoded data written successfully.");
     Ok(())
 }
 
@@ -228,7 +219,7 @@ fn read_pbm(path: &str) -> Result<(usize, usize, Vec<u8>)> {
     if line.trim() != "P4" {
         return Err(anyhow!("Unsupported PBM magic number: {}", line.trim()));
     }
-    println!("PBM magic number: {}", line.trim());
+    info!("PBM magic number: {}", line.trim());
 
     line.clear();
     loop {
@@ -245,14 +236,14 @@ fn read_pbm(path: &str) -> Result<(usize, usize, Vec<u8>)> {
     }
     let width = parts[0].parse::<usize>()?;
     let height = parts[1].parse::<usize>()?;
-    println!("PBM dimensions: {}x{}", width, height);
+    info!("PBM dimensions: {}x{}", width, height);
 
     let current_file_pos = reader.stream_position()?;
     file.seek(SeekFrom::Start(current_file_pos))?;
 
     let width_in_bytes = (width + 7) / 8;
     let expected_data_len = height * width_in_bytes;
-    println!(
+    info!(
         "Calculated PBM data length ( H * ((W+7)/8) ): {} bytes",
         expected_data_len
     );

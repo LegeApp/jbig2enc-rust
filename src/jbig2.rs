@@ -25,7 +25,7 @@ pub use crate::jbig2arith::Jbig2ArithCoder;
 pub use jbig2enc::{encode_document, encode_page_with_symbol_dictionary, Jbig2EncConfig};
 
 use jbig2enc::Jbig2Encoder;
-use log::{debug, info}; // For logging
+use log::info; // For logging
 use std::{env, error::Error};
 
 // Constants for default thresholds (symbol classification only)
@@ -127,6 +127,7 @@ pub fn encode_rois(
         hash: ctx.get_use_hash(),
         dpi: ctx.get_dpi(),
         want_full_headers: !ctx.get_pdf_mode(), // PDF mode uses fragments
+        ..Default::default()
     };
 
     // If we have a global dictionary, encode it and all ROIs
@@ -227,17 +228,6 @@ pub fn get_version() -> String {
 /// Get the build information string
 pub fn get_build_info() -> String {
     let build_ts = option_env!("VERGEN_BUILD_TIMESTAMP").unwrap_or("unknown");
-    format!(
-        "{} (built with {})",
-        build_ts,
-
-        if cfg!(debug_assertions) { "debug" } else { "release" }
-
-        if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        }
-
-    )
+    let build_type = if cfg!(debug_assertions) { "debug" } else { "release" };
+    format!("{} (built with {})", build_ts, build_type)
 }

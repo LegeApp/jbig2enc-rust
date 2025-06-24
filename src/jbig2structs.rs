@@ -3,18 +3,10 @@ use byteorder::{BigEndian, WriteBytesExt};
 use std::io::{self, Write};
 
 #[cfg(feature = "trace_encoder")]
-use tracing::debug;
+use log::debug;
 
 #[cfg(not(feature = "trace_encoder"))]
-#[macro_use]
-mod trace_stubs {
-    macro_rules! debug {
-        ($($arg:tt)*) => { std::convert::identity(format_args!($($arg)*)) };
-    }
-}
-
-#[cfg(not(feature = "trace_encoder"))]
-use trace_stubs::*;
+use crate::debug;
 
 /// JBIG2 file format magic number
 pub const JB2_MAGIC: &[u8; 10] = b"\x97JBIG2\r\n\x1A\n";
@@ -22,7 +14,7 @@ pub const JB2_MAGIC: &[u8; 10] = b"\x97JBIG2\r\n\x1A\n";
 /// JBIG2 file format version
 pub const JB2_VERSION: u8 = 0x02;
 
-/// JBIG2 segment types
+/// JBIG2 segment types as defined in the specification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SegmentType {
     #[default]
@@ -47,111 +39,8 @@ pub enum SegmentType {
     Profiles = 52,
     Tables = 53,
     ColorPalette = 54,
+    FileHeader = 56,
     Extension = 62,
-}
-
-/// JBIG2 compression type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompressionType {
-    None = 0,
-    MMR = 1,
-    Arithmetic = 2,
-    JB2 = 3,
-}
-
-/// JBIG2 refinement template
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefinementTemplate {
-    TPL1 = 0,
-    TPL2 = 1,
-}
-
-/// JBIG2 symbol dictionary flags
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SymbolDictFlags {
-    pub sd_huff: bool,
-    pub sd_ref_agg: bool,
-    pub sd_huff_dh: u8,
-    pub sd_huff_dw: u8,
-    pub sd_huff_bm_size: u8,
-    pub sd_huff_agg_inst: u8,
-    pub sd_ex_sym: bool,
-    pub sd_agg_inst_only: bool,
-}
-
-impl Default for SymbolDictFlags {
-    fn default() -> Self {
-        Self {
-            sd_huff: false,
-            sd_ref_agg: false,
-            sd_huff_dh: 0,
-            sd_huff_dw: 0,
-            sd_huff_bm_size: 0,
-            sd_huff_agg_inst: 0,
-            sd_ex_sym: false,
-            sd_agg_inst_only: false,
-        }
-    }
-}
-
-/// JBIG2 text region flags
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TextRegionFlags {
-    pub sb_huff: bool,
-    pub sb_refine: bool,
-    pub log_sb_stripes: u8,
-    pub sb_refine_template: bool,
-    pub sb_def_pixel: bool,
-    pub sb_ds_offset: i32,
-    pub sb_refine_at: bool,
-    pub sb_transposed: bool,
-    pub sb_combo_op: u8,
-    pub sb_huff_dw: u8,
-    pub sb_huff_dh: u8,
-    pub sb_huff_bm_size: u8,
-    pub sb_huff_inst_width: u8,
-    pub sb_huff_inst: u8,
-}
-
-impl Default for TextRegionFlags {
-    fn default() -> Self {
-        Self {
-            sb_huff: false,
-            sb_refine: false,
-            log_sb_stripes: 0,
-            sb_refine_template: false,
-            sb_def_pixel: false,
-            sb_ds_offset: 0,
-            sb_refine_at: false,
-            sb_transposed: false,
-            sb_combo_op: 0,
-            sb_huff_dw: 0,
-            sb_huff_dh: 0,
-            sb_huff_bm_size: 0,
-            sb_huff_inst_width: 0,
-            sb_huff_inst: 0,
-        }
-    }
-}
-
-/// JBIG2 generic region flags
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GenericRegionFlags {
-    pub gr_template: u8,
-    pub gr_refine: bool,
-    pub gr_at_x: [i8; 4],
-    pub gr_at_y: [i8; 4],
-}
-
-impl Default for GenericRegionFlags {
-    fn default() -> Self {
-        Self {
-            gr_template: 0,
-            gr_refine: false,
-            gr_at_x: [0, 0, 0, 0],
-            gr_at_y: [0, 0, 0, 0],
-        }
-    }
 }
 
 impl TryFrom<u8> for SegmentType {
@@ -180,6 +69,7 @@ impl TryFrom<u8> for SegmentType {
             52 => Ok(SegmentType::Profiles),
             53 => Ok(SegmentType::Tables),
             54 => Ok(SegmentType::ColorPalette),
+            56 => Ok(SegmentType::FileHeader),
             62 => Ok(SegmentType::Extension),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -192,19 +82,19 @@ impl TryFrom<u8> for SegmentType {
 // -----------------------------------------------------------------------------
 // File header (magic + flags + number of pages)
 // -----------------------------------------------------------------------------
+
+/// Represents the JBIG2 file header as per the specification (§D.4.1)
+#[derive(Debug)]
 pub struct FileHeader {
-    pub organisation_type: bool, // 1 bit
-    pub unknown_n_pages: bool,   // 1 bit
-    pub n_pages: u32,            // big-endian
+    pub organisation_type: bool, // 1 bit: 0 = sequential, 1 = random-access
+    pub unknown_n_pages: bool,   // 1 bit: 1 = number of pages unknown
+    pub n_pages: u32,            // Number of pages (big-endian), omitted if unknown_n_pages is true
 }
 
 impl FileHeader {
     pub fn to_bytes(&self) -> Vec<u8> {
-        // 8-byte JBIG2 identifier (ITU-T T.88, §D.4.1)
-        // 0x97 0x4A 0x42 0x32 0x0D 0x0A 0x1A 0x0A
         const MAGIC: &[u8] = b"\x97JB2\r\n\x1A\n";
-
-        let mut buf = Vec::with_capacity(8 + 1 + 4);
+        let mut buf = Vec::with_capacity(8 + 1 + if self.unknown_n_pages { 0 } else { 4 });
         buf.extend_from_slice(MAGIC);
 
         let mut flags = 0u8;
@@ -215,47 +105,33 @@ impl FileHeader {
             flags |= 0x02;
         }
         buf.push(flags);
-        buf.write_u32::<BigEndian>(self.n_pages).unwrap();
+
+        if !self.unknown_n_pages {
+            buf.write_u32::<BigEndian>(self.n_pages).unwrap();
+        }
         buf
     }
 }
 
 // -----------------------------------------------------------------------------
-// Page information segment payload
+// Page information segment payload (§7.4.8)
 // -----------------------------------------------------------------------------
-#[derive(Debug)]
-pub struct PageInfo {
-    pub width: u32,                 // big-endian
-    pub height: u32,                // big-endian
-    pub xres: u32,                  // big-endian
-    pub yres: u32,                  // big-endian
-    pub is_lossless: bool,          // bit0
-    pub contains_refinements: bool, // bit1
-    pub default_pixel: bool,        // bit2
-    pub default_operator: u8,       // bits3-4
-    pub aux_buffers: bool,          // bit5
-    pub operator_override: bool,    // bit6
-    pub reserved: bool,             // bit7 (must be zero)
-    pub segment_flags: u16,         // big-endian (often 0)
-}
 
-impl Default for PageInfo {
-    fn default() -> Self {
-        PageInfo {
-            width: 0,
-            height: 0,
-            xres: 300, // Default 300 DPI
-            yres: 300, // Default 300 DPI
-            is_lossless: false,
-            contains_refinements: false,
-            default_pixel: false,
-            default_operator: 0,
-            aux_buffers: false,
-            operator_override: false,
-            reserved: false,
-            segment_flags: 0,
-        }
-    }
+/// Represents the page information segment payload
+#[derive(Debug, Default)]
+pub struct PageInfo {
+    pub width: u32,                 // Page width in pixels
+    pub height: u32,                // Page height in pixels
+    pub xres: u32,                  // X resolution in pixels per inch
+    pub yres: u32,                  // Y resolution in pixels per inch
+    pub is_lossless: bool,          // Bit 0: 1 if lossless
+    pub contains_refinements: bool, // Bit 1: 1 if contains refinement regions
+    pub default_pixel: bool,        // Bit 2: Default pixel value (0 = black, 1 = white)
+    pub default_operator: u8,       // Bits 3-4: Default combination operator (0-3)
+    pub aux_buffers: bool,          // Bit 5: 1 if auxiliary buffers are used
+    pub operator_override: bool,    // Bit 6: 1 if combination operator can be overridden
+    pub reserved: bool,             // Bit 7: Must be 0
+    pub segment_flags: u16,         // Additional segment flags
 }
 
 impl PageInfo {
@@ -265,7 +141,7 @@ impl PageInfo {
         buf.write_u32::<BigEndian>(self.height).unwrap();
         buf.write_u32::<BigEndian>(self.xres).unwrap();
         buf.write_u32::<BigEndian>(self.yres).unwrap();
-        // pack 8 flags into one byte
+
         let mut b = 0u8;
         if self.is_lossless {
             b |= 0x01;
@@ -283,7 +159,7 @@ impl PageInfo {
         if self.operator_override {
             b |= 0x40;
         }
-        // bit7 reserved = 0
+        // Bit 7 (reserved) remains 0
         buf.push(b);
         buf.write_u16::<BigEndian>(self.segment_flags).unwrap();
         buf
@@ -291,40 +167,151 @@ impl PageInfo {
 }
 
 // -----------------------------------------------------------------------------
-// Symbol dictionary parameters (pruned)
+// Generic region parameters (§7.4.6)
 // -----------------------------------------------------------------------------
+
+/// Represents the parameters for a generic region segment as per the JBIG2 specification
+#[derive(Debug)]
+pub struct GenericRegionParams {
+    pub width: u32,         // Region width in pixels
+    pub height: u32,        // Region height in pixels
+    pub x: u32,             // X-coordinate of the top-left corner
+    pub y: u32,             // Y-coordinate of the top-left corner
+    pub comb_operator: u8,  // Combination operator (0-4: OR, AND, XOR, XNOR, REPLACE)
+    pub mmr: bool,          // 1 = MMR coding, 0 = arithmetic coding
+    pub template: u8,       // Generic region template (0-3)
+    pub tpgdon: bool,       // Typical prediction generic decoding on/off
+    pub at: [(i8, i8); 4], // Adaptive template coordinates (a1x, a1y, ..., a4x, a4y)
+}
+
+impl GenericRegionParams {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        use byteorder::{BigEndian, WriteBytesExt};
+        // 18 bytes (width, height, x, y, comb_op, flags) + AT bytes (8 if template == 0, 4 otherwise)
+        let mut buf = Vec::with_capacity(18 + if self.template == 0 { 8 } else { 4 });
+        
+        buf.write_u32::<BigEndian>(self.width).unwrap();
+        buf.write_u32::<BigEndian>(self.height).unwrap();
+        buf.write_u32::<BigEndian>(self.x).unwrap();
+        buf.write_u32::<BigEndian>(self.y).unwrap();
+        buf.push(self.comb_operator);
+
+        let mut flags = 0u8;
+        if self.mmr {
+            flags |= 0x01; // Bit 0: MMR (only for MMR coding)
+        }
+        flags |= (self.template & 0x03) << 1; // Bits 1-2: GBTEMPLATE
+        if self.tpgdon {
+            flags |= 0x08; // Bit 3: TPGDON
+        }
+        // Bits 4-7 are reserved and set to 0
+        buf.push(flags);
+
+        // Write AT coordinates: all 4 pairs if template == 0, first 2 pairs otherwise
+        let at_count = if self.template == 0 { 4 } else { 2 };
+        for i in 0..at_count {
+            buf.push(self.at[i].0 as u8); // Cast i8 to u8 preserves two's complement
+            buf.push(self.at[i].1 as u8);
+        }
+        buf
+    }
+}
+
+/// High-level configuration for generic region segments
+#[derive(Clone, Debug)]
+pub struct GenericRegionConfig {
+    // Segment header parameters
+    pub width: u32,
+    pub height: u32,
+    pub x: u32,
+    pub y: u32,
+    pub comb_operator: u8,  // Combination operator (0 = OR, 1 = AND, etc.)
+
+    // Arithmetic encoding parameters
+    pub template: u8,        // Template ID (0–3)
+    pub tpgdon: bool,        // Typical prediction generic decoding
+    pub mmr: bool,           // MMR coding (true) or arithmetic (false)
+    pub at_pixels: Vec<(i8, i8)>, // Adaptive template pixels (dx, dy)
+
+    // Metadata (optional, for page info alignment)
+    pub dpi: u32,            // Resolution in DPI
+}
+
+impl GenericRegionConfig {
+    /// Creates a new generic region config with defaults
+    pub fn new(width: u32, height: u32, dpi: u32) -> Self {
+        Self {
+            width,
+            height,
+            x: 0,
+            y: 0,
+            comb_operator: 0, // Default to OR
+            template: 0,      // Default to template 0
+            tpgdon: true,     // Enable typical prediction
+            at_pixels: vec![(3, -1), (-3, -1), (2, -2), (-2, -2)], // Standard AT pixels
+            mmr: false,         // Default to arithmetic coding
+            dpi,
+        }
+    }
+
+    /// Validation to ensure compliance with JBIG2 spec
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.template > 3 {
+            return Err("Template ID must be 0–3");
+        }
+        if self.at_pixels.len() > 4 {
+            return Err("Maximum 4 AT pixels allowed");
+        }
+        if self.comb_operator > 4 {
+            return Err("Invalid combination operator");
+        }
+        Ok(())
+    }
+}
+
+impl From<GenericRegionConfig> for GenericRegionParams {
+    fn from(cfg: GenericRegionConfig) -> Self {
+        let mut at = [(0i8, 0i8); 4];
+        for (i, &(dx, dy)) in cfg.at_pixels.iter().enumerate().take(4) {
+            at[i] = (dx, dy);
+        }
+        GenericRegionParams {
+            width: cfg.width,
+            height: cfg.height,
+            x: cfg.x,
+            y: cfg.y,
+            comb_operator: cfg.comb_operator,
+            mmr: cfg.mmr,      // MMR coding flag from config
+            template: cfg.template,
+            tpgdon: cfg.tpgdon,
+            at,
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Symbol dictionary parameters (§7.4.2)
+// -----------------------------------------------------------------------------
+
+/// Represents the parameters for a symbol dictionary segment
 #[derive(Debug)]
 pub struct SymbolDictParams {
-    // Only core flags for text-only; all other refinement flags omitted
-    pub sd_template: u8, // 0..3
-    // Adaptive template coords (usually zero for default)
-    pub a1x: i8,
-    pub a1y: i8,
-    pub a2x: i8,
-    pub a2y: i8,
-    pub a3x: i8,
-    pub a3y: i8,
-    pub a4x: i8,
-    pub a4y: i8,
-    pub exsyms: u32,  // big-endian
-    pub newsyms: u32, // big-endian
+    pub sd_template: u8, // Symbol dictionary template (0-3)
+    pub at: [(i8, i8); 4], // Adaptive template coordinates (a1x, a1y, ..., a4x, a4y)
+    pub exsyms: u32,     // Number of exported symbols
+    pub newsyms: u32,    // Number of new symbols
 }
 
 impl SymbolDictParams {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(2 + 8 + 4 + 4);
-        // pack sd_template (2 bits) into low bits of a byte; rest reserved
-        let b = self.sd_template & 0x03;
+        let b = self.sd_template & 0x03; // SDTEMPLATE in low 2 bits
         buf.push(b);
-        buf.push(0); // reserved flags
-        buf.push(self.a1x as u8);
-        buf.push(self.a1y as u8);
-        buf.push(self.a2x as u8);
-        buf.push(self.a2y as u8);
-        buf.push(self.a3x as u8);
-        buf.push(self.a3y as u8);
-        buf.push(self.a4x as u8);
-        buf.push(self.a4y as u8);
+        buf.push(0); // Reserved flags
+        for &(x, y) in &self.at {
+            buf.push(x as u8);
+            buf.push(y as u8);
+        }
         buf.write_u32::<BigEndian>(self.exsyms).unwrap();
         buf.write_u32::<BigEndian>(self.newsyms).unwrap();
         buf
@@ -332,73 +319,52 @@ impl SymbolDictParams {
 }
 
 // -----------------------------------------------------------------------------
-// Text region parameters (pruned for immediate text regions)
+// Text region parameters (§7.4.3)
 // -----------------------------------------------------------------------------
+
+/// Represents the parameters for a text region segment
 #[derive(Debug)]
 pub struct TextRegionParams {
-    pub width: u32,          // big-endian
-    pub height: u32,         // big-endian
-    pub x: u32,              // big-endian
-    pub y: u32,              // big-endian
-    pub ds_offset: u8,       // SBDSOFFSET (signed 5 bits, effectively 0-31 for positive offset)
-    pub refine: bool,        // SBREFINE flag (bit 1)
-    pub log_strips: u8,      // LOGSBSTRIPS (bits 2-3)
-    pub ref_corner: u8,      // REFCORNER (bits 4-5)
-    pub transposed: bool,    // TRANSPOSED flag (bit 6)
-    pub comb_op: u8,         // SBCOMBOP (bits 7-8)
-    pub refine_template: u8, // SBRTEMPLATE (bit 15) and GRTEMPLATE value (0 or 1)
+    pub width: u32,          // Region width in pixels
+    pub height: u32,         // Region height in pixels
+    pub x: u32,              // X-coordinate of the top-left corner
+    pub y: u32,              // Y-coordinate of the top-left corner
+    pub ds_offset: u8,       // Signed 5-bit offset (SBDSOFFSET)
+    pub refine: bool,        // SBREFINE flag
+    pub log_strips: u8,      // LOGSBSTRIPS (0-3)
+    pub ref_corner: u8,      // REFCORNER (0-3)
+    pub transposed: bool,    // TRANSPOSED flag
+    pub comb_op: u8,         // SBCOMBOP (0-4)
+    pub refine_template: u8, // SBRTEMPLATE (0 or 1)
 }
 
 impl TextRegionParams {
     pub fn to_bytes(&self) -> Vec<u8> {
-        // Capacity: 16 (W,H,X,Y) + 2 (sbrflags) + 1 (optional GRTEMPLATE byte)
         let mut buf = Vec::with_capacity(16 + 2 + if self.refine { 1 } else { 0 });
         buf.write_u32::<BigEndian>(self.width).unwrap();
         buf.write_u32::<BigEndian>(self.height).unwrap();
         buf.write_u32::<BigEndian>(self.x).unwrap();
         buf.write_u32::<BigEndian>(self.y).unwrap();
 
-        // Assemble the 16-bit SBRFLAGS field (Figure 36 from ISO/IEC 14492:2001)
-        let _sbhuff_flag: u16 = 0; // Bit 0: SBHUFF (0 for arithmetic coding)
-        let _sbdefpixel_flag: u16 = 0; // Bit 9: SBDEFPIXEL (0 for default pixel value)
-
         let mut sbrflags: u16 = 0;
-        // sbhuff_flag is 0 (Bit 0: SBHUFF = 0 for arithmetic coding)
-        // sbdefpixel_flag is 0 (Bit 9: SBDEFPIXEL = 0 for default pixel value)
-
-        // Bits 2-3: LOGSBSTRIPS
-        sbrflags |= (self.log_strips as u16 & 0x03) << 2;
-        // Bits 4-5: REFCORNER
-        sbrflags |= (self.ref_corner as u16 & 0x03) << 4;
-        // Bit 6: TRANSPOSED
-        sbrflags |= (self.transposed as u16) << 6;
-        // Bits 7-8: SBCOMBOP
-        sbrflags |= (self.comb_op as u16 & 0x03) << 7;
-        // Bits 10-14: SBDSOFFSET
-        sbrflags |= (self.ds_offset as u16 & 0x1F) << 10;
-
-        let mut sbrtemplate_bit_value: u16 = 0; // Default: SBRTEMPLATE=0 (GRTEMPLATE byte not present, template 0 implied)
-
+        // SBHUFF is 0 for arithmetic coding
         if self.refine {
-            sbrflags |= 1u16 << 1; // Bit 1: SBREFINE = 1
-
-            // SBRTEMPLATE (Bit 15) is 1 if GRTEMPLATE byte is present (i.e., self.refine_template == 1).
-            // Otherwise, SBRTEMPLATE is 0 (GRTEMPLATE byte not present, template 0 used implicitly).
-            if self.refine_template == 1 {
-                sbrtemplate_bit_value = 1;
-            }
-            sbrflags |= sbrtemplate_bit_value << 15; // Set SBRTEMPLATE bit
+            sbrflags |= 1 << 1; // SBREFINE
         }
-        // If not self.refine, SBREFINE (bit 1) is 0, and SBRTEMPLATE (bit 15) is 0 via sbrtemplate_bit_value default.
-
+        sbrflags |= ((self.log_strips as u16) & 0x03) << 2; // LOGSBSTRIPS
+        sbrflags |= ((self.ref_corner as u16) & 0x03) << 4; // REFCORNER
+        if self.transposed {
+            sbrflags |= 1 << 6; // TRANSPOSED
+        }
+        sbrflags |= ((self.comb_op as u16) & 0x03) << 7; // SBCOMBOP
+        // SBDEFPIXEL is 0
+        sbrflags |= ((self.ds_offset as u16) & 0x1F) << 10; // SBDSOFFSET
+        if self.refine && self.refine_template == 1 {
+            sbrflags |= 1 << 15; // SBRTEMPLATE
+        }
         buf.write_u16::<BigEndian>(sbrflags).unwrap();
 
-        // Conditionally write the GRTEMPLATE byte.
-        // This byte is present if SBREFINE is 1 (self.refine == true)
-        // AND SBRTEMPLATE bit in SBRFLAGS is 1 (sbrtemplate_bit_value == 1).
-        // (SBHUFF is 0 for arithmetic coding, which is a precondition for GRTEMPLATE byte).
-        if self.refine && sbrtemplate_bit_value == 1 {
-            // The value of the GRTEMPLATE byte is self.refine_template (which must be 1 here).
+        if self.refine && self.refine_template == 1 {
             buf.write_u8(self.refine_template).unwrap();
         }
         buf
@@ -406,22 +372,23 @@ impl TextRegionParams {
 }
 
 // -----------------------------------------------------------------------------
-// Segment header + payload writer (pruned)
+// Segment header + payload writer (§7.2)
 // -----------------------------------------------------------------------------
+
+/// Represents a JBIG2 segment, including header and payload
 #[derive(Default)]
 pub struct Segment {
-    pub number: u32,
-    pub seg_type: SegmentType,
-    pub deferred_non_retain: bool, // Bit 7 of Flags1: 0 = retain, 1 = non-retain (if deferred)
-    pub retain_flags: u8, // Bits 2-4 of Flags2: Referred-to segment retention flags (3 bits)
-    pub page_association_type: u8, // Bits 0-1 of Flags2: 00=explicit, 01=deferred, 10=all pages
-    pub referred_to: Vec<u32>, // List of referred-to segment numbers
-    pub page: Option<u32>, // Page number if page_association_type is explicit (00) or deferred (01)
-    pub payload: Vec<u8>, // Segment data
+    pub number: u32,               // Segment number
+    pub seg_type: SegmentType,     // Segment type
+    pub deferred_non_retain: bool, // Bit 7 of Flags1: 0 = retain, 1 = non-retain
+    pub retain_flags: u8,          // Up to 5 bits for retention flags
+    pub page_association_type: u8, // Bits 0-1 of Flags2: 0=explicit, 1=deferred, 2=all pages
+    pub referred_to: Vec<u32>,     // List of referred-to segment numbers
+    pub page: Option<u32>,         // Page number if applicable
+    pub payload: Vec<u8>,          // Segment data
 }
 
 fn encode_varint(mut v: u32, buf: &mut Vec<u8>) {
-    // 7-bit little-endian continuation format
     while v >= 0x80 {
         buf.push((v as u8) | 0x80);
         v >>= 7;
@@ -430,46 +397,35 @@ fn encode_varint(mut v: u32, buf: &mut Vec<u8>) {
 }
 
 impl Segment {
-    pub fn write_into<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
-        // Segment number (DWORD - 4 bytes, big-endian)
+    pub fn write_into<W: Write>(&self, w: &mut W) -> io::Result<()> {
         w.write_u32::<BigEndian>(self.number)?;
 
-        // --- Segment header flags (2 bytes) ---
-        // Flags Byte 1 (Flags1)
-        let page_num_val = self.page.unwrap_or(0); // Use 0 if page is None, though it might not be written
-        let page_size_is_4_bytes_bit = if self.page_association_type <= 1 && page_num_val > 0xFF {
-            1
-        } else {
-            0
-        }; // 1 if 4-byte page #, 0 if 1-byte. Only relevant if PA type is explicit or deferred.
-
-        let flags1 = (self.seg_type as u8 & 0x3F) // Bits 0-5: Segment type
-                   | (page_size_is_4_bytes_bit << 6)    // Bit 6: Page association size (0 for 1-byte, 1 for 4-byte page #)
-                   | ((self.deferred_non_retain as u8) << 7); // Bit 7: Deferred non-retain
+        let page_num_val = self.page.unwrap_or(0);
+        let page_size_is_4_bytes = self.page_association_type <= 1 && page_num_val > 0xFF;
+        let flags1 = (self.seg_type as u8 & 0x3F)
+            | ((page_size_is_4_bytes as u8) << 6)
+            | ((self.deferred_non_retain as u8) << 7);
         w.write_u8(flags1)?;
 
-        // Flags Byte 2 (Flags2)
         let referred_to_count = self.referred_to.len();
         let mut referred_to_count_is_extended = false;
-        let flags2 = if referred_to_count > 4 {
-            referred_to_count_is_extended = true;
-            (self.page_association_type & 0x03) | ((self.retain_flags & 0x07) << 2) | (0b111 << 5)
+        let segment_count = if referred_to_count <= 7 {
+            referred_to_count as u8
         } else {
-            (self.page_association_type & 0x03)
-                | ((self.retain_flags & 0x07) << 2)
-                | ((referred_to_count as u8) << 5)
+            referred_to_count_is_extended = true;
+            7
         };
+        let flags2 = (self.page_association_type & 0x03)
+            | ((self.retain_flags & 0x1F) << 2) // 5 bits for retain_flags
+            | (segment_count << 5);
         w.write_u8(flags2)?;
 
-        // Referred-to segment count (if extended)
         if referred_to_count_is_extended {
             let mut varint_buf = Vec::new();
-            encode_varint(referred_to_count as u32, &mut varint_buf); // encode_varint should match spec 7.3.4
+            encode_varint(referred_to_count as u32, &mut varint_buf);
             w.write_all(&varint_buf)?;
         }
 
-        // Referred-to segment numbers
-        // Size depends on current segment's number (self.number) - Spec 7.3.5
         let ref_num_size = if self.number <= 0xFF {
             1
         } else if self.number <= 0xFFFF {
@@ -477,7 +433,6 @@ impl Segment {
         } else {
             4
         };
-
         for &r_num in &self.referred_to {
             match ref_num_size {
                 1 => w.write_u8(r_num as u8)?,
@@ -486,32 +441,28 @@ impl Segment {
             }
         }
 
-        // Page number (if page_association_type is explicit or deferred)
         if self.page_association_type <= 1 {
-            // 00 (explicit) or 01 (deferred)
             if let Some(p_num) = self.page {
-                if page_size_is_4_bytes_bit == 1 {
-                    // 4-byte page number
+                if page_size_is_4_bytes {
                     w.write_u32::<BigEndian>(p_num)?;
                 } else {
-                    // 1-byte page number
                     w.write_u8(p_num as u8)?;
                 }
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Page number required for explicit or deferred association",
+                ));
             }
-            // Else: page is None but type is explicit/deferred. This is an invalid state.
-            // Consider adding error handling or assertion if self.page is None here.
         }
 
-        // Segment data length (DWORD - 4 bytes, big-endian)
         let payload_len = self.payload.len() as u32;
         debug!("Segment {} payload length: {}", self.number, payload_len);
         w.write_u32::<BigEndian>(payload_len)?;
-
-        // Segment data
         w.write_all(&self.payload)?;
 
         debug!(
-            "Segment::write_into: Wrote segment {}: Type={:?}, Page={:?}, PA Type={}, Data Length={}", 
+            "Segment::write_into: Wrote segment {}: Type={:?}, Page={:?}, PA Type={}, Data Length={}",
             self.number, self.seg_type, self.page, self.page_association_type, payload_len
         );
         Ok(())

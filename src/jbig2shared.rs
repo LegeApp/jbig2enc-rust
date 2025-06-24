@@ -1,9 +1,8 @@
 //! Utility functions for the JBIG2 encoder
 
-use crate::jbig2sym::BitImage;
 use anyhow::Result;
+use crate::jbig2sym::BitImage;
 use lopdf::{self, Dictionary, Object, ObjectId, Stream};
-use serde_json;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -210,7 +209,7 @@ pub fn create_info_dict(
 }
 
 pub mod jbig2wrapper {
-    use super::{u32_to_usize, usize_to_u32};
+    use super::u32_to_usize;
 
     pub fn push_file_header(out: &mut Vec<u8>) {
         out.extend_from_slice(&[0x97, 0x4A, 0x42, 0x32, 0x0D, 0x0A, 0x1A, 0x0A]);

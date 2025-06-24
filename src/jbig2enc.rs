@@ -4,33 +4,39 @@ use crate::jbig2comparator::Comparator;
 use crate::jbig2lutz::SymbolExtractionConfig;
 use crate::jbig2lutz::{extract_symbols, find_connected_components};
 use crate::jbig2structs::{
-    FileHeader, PageInfo, Segment, SegmentType, SymbolDictParams, TextRegionParams,
+    FileHeader, GenericRegionParams, GenericRegionConfig, PageInfo, Segment, SegmentType, SymbolDictParams,
+    TextRegionParams,
 };
-use crate::jbig2shared::jbig2wrapper;
+
 use crate::jbig2sym::{BitImage, Rect, Symbol};
-use anyhow::anyhow;
+use anyhow::{anyhow, Result};
 
-use anyhow::Result;
-use byteorder::{BigEndian, WriteBytesExt};
-#[cfg(feature = "trace_encoder")]
-use tracing::{debug, info, trace};
-
-#[cfg(not(feature = "trace_encoder"))]
-#[macro_use]
-mod trace_stubs {
-    macro_rules! debug {
-        ($($arg:tt)*) => { std::convert::identity(format_args!($($arg)*)) };
-    }
-    macro_rules! info {
-        ($($arg:tt)*) => { std::convert::identity(format_args!($($arg)*)) };
-    }
-    macro_rules! trace {
-        ($($arg:tt)*) => { std::convert::identity(format_args!($($arg)*)) };
-    }
+// Define debug and trace macros at the crate root
+#[macro_export]
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "trace_encoder")]
+        log::debug!($($arg)*);
+        
+        #[cfg(not(feature = "trace_encoder"))]
+        let _ = format_args!($($arg)*);
+    };
 }
 
-#[cfg(not(feature = "trace_encoder"))]
-use trace_stubs::*;
+#[macro_export]
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "trace_encoder")]
+        log::trace!($($arg)*);
+        
+        #[cfg(not(feature = "trace_encoder"))]
+        let _ = format_args!($($arg)*);
+    };
+}
+
+// Import the macros for use in this module
+#[allow(unused_imports)]
+use crate::{debug, trace};
 
 use ndarray::Array2;
 use std::collections::{HashMap, HashSet};
@@ -66,9 +72,13 @@ pub struct SymbolCandidate {
 ///
 /// This function finds connected components in the input image and returns
 /// them as symbol candidates. Each candidate has a bitmap and a bounding box.
-pub fn segment_symbols(image: &BitImage) -> Result<Vec<SymbolCandidate>> {
-    // Find connected components with a minimum size of 10 pixels
-    let components = find_connected_components(image, 10);
+/// 
+/// # Arguments
+/// * `image` - The input binary image to segment
+/// * `min_component_size` - Minimum number of pixels a connected component must have to be considered a symbol
+pub fn segment_symbols(image: &BitImage, min_component_size: usize) -> Result<Vec<SymbolCandidate>> {
+    // Find connected components with the specified minimum size
+    let components = find_connected_components(image, min_component_size);
 
     let mut candidates = Vec::with_capacity(components.len());
 
@@ -100,6 +110,11 @@ pub struct Jbig2EncConfig {
     pub hash: bool,
     pub dpi: u32,
     pub want_full_headers: bool,
+    pub mmr: bool,
+    pub tpgdon: bool,
+    pub comb_operator: u8,
+    pub is_lossless: bool,
+    pub default_pixel: bool,
 }
 
 impl Default for Jbig2EncConfig {
@@ -113,6 +128,11 @@ impl Default for Jbig2EncConfig {
             hash: true,
             dpi: 300,
             want_full_headers: true,
+            mmr: false,
+            tpgdon: true,
+            comb_operator: 0, // Default to OR
+            is_lossless: true,
+            default_pixel: false,
         }
     }
 }
@@ -204,7 +224,8 @@ impl<'a> Jbig2Encoder<'a> {
     pub fn add_page(&mut self, image: &Array2<u8>) -> Result<()> {
         let bitimage = crate::jbig2sym::array_to_bitimage(image);
         let candidates = if self.state.segment {
-            segment_symbols(&bitimage)?
+            // Use a minimum component size of 1 to include small symbols
+            segment_symbols(&bitimage, 1)?
         } else {
             Vec::new()
         };
@@ -337,31 +358,26 @@ impl<'a> Jbig2Encoder<'a> {
         }
 
         for (page_num, page) in self.pages.iter().enumerate() {
-            let page_info = PageInfo {
-                width: page.image.width as u32,
+            // 2. Page-information segment (segment #0)                           
+            let page_info_payload = PageInfo {
+                width:  page.image.width  as u32,
                 height: page.image.height as u32,
+                default_pixel: true,          // white background
                 xres: self.config.dpi,
                 yres: self.config.dpi,
-                is_lossless: self.config.refine || !self.config.symbol_mode,
-                contains_refinements: self.config.refine,
-                default_pixel: false,
-                default_operator: 0,
-                aux_buffers: false,
-                operator_override: false,
-                reserved: false,
-                segment_flags: 0,
-            };
-            let page_info_segment = Segment {
+                ..Default::default()
+            }.to_bytes();
+
+            Segment {
                 number: current_segment_number,
-                seg_type: SegmentType::PageInformation,
+                seg_type: SegmentType::PageInformation, // 0x30
                 deferred_non_retain: false,
                 retain_flags: 0,
-                page_association_type: 0, // Explicit page association
-                referred_to: Vec::new(),
+                page_association_type: 0,               // explicit
+                referred_to: vec![],
                 page: Some(page_num as u32 + 1),
-                payload: page_info.to_bytes(),
-            };
-            page_info_segment.write_into(&mut output)?;
+                payload: page_info_payload,
+            }.write_into(&mut output)?;
             current_segment_number += 1;
 
             if self.config.symbol_mode {
@@ -426,61 +442,20 @@ impl<'a> Jbig2Encoder<'a> {
                 text_region_segment.write_into(&mut output)?;
                 current_segment_number += 1;
             } else {
-                // NON-SYMBOL MODE: GenericRegion will be written
+                // NON-SYMBOL MODE: GenericRegion will be written using unified config
 
-                // Default adaptive template pixels for template 0
-                // (see ITU T.88, Table 6.6)
-                let default_gbat: [(i8, i8); 4] = [
-                    (3, -1),
-                    (-3, -1),
-                    (2, -2),
-                    (-2, -2),
-                ];
+                // Build generic region config for non-symbol mode
+                let mut gr_cfg = GenericRegionConfig::new(page.image.width as u32, page.image.height as u32, self.config.dpi);
+                gr_cfg.comb_operator = self.config.comb_operator;
+                gr_cfg.mmr = self.config.mmr;
+                gr_cfg.tpgdon = self.config.tpgdon;
+                gr_cfg.validate().map_err(|e| anyhow!(e))?;
 
-                let coder_data =
-                    Jbig2ArithCoder::encode_generic_payload(&page.image, 0, &default_gbat)?;
+                let coder_data = Jbig2ArithCoder::encode_generic_payload_cfg(&page.image, &gr_cfg)?;
 
-                // Header is 26 bytes for template 0 (includes 8-byte GBAT)
-                let mut generic_region_payload = Vec::with_capacity(26 + coder_data.len());
+                let params: GenericRegionParams = gr_cfg.clone().into();
 
-                // For generic regions (template=0), use empty AT-pixels array
-                let default_gbats: &[(i8, i8)] = &[(3, -1), (-3, -1), (2, -2), (-2, -2)];
-                // Define the AT pixels that will be used for both the header and the payload.
-                // These are the nominal locations for GBTEMPLATE=0 from Table 5 of the spec.
-                let at_pixels_template0: &[(i8, i8)] = &[(3, -1), (-3, -1), (2, -2), (-2, -2)];
-
-                // Pass the AT pixels to the payload encoder.
-                let coder_data = Jbig2ArithCoder::encode_generic_payload(
-                    &page.image,
-                    0, // template 0
-                    at_pixels_template0,
-                )?;
-
-                // Header is 18 bytes for generic region header + 8 bytes for GBAT = 26 bytes
-                let mut generic_region_payload =
-                    Vec::with_capacity(18 + at_pixels_template0.len() * 2 + coder_data.len());
-
-                generic_region_payload.write_u32::<BigEndian>(page.image.width as u32)?;
-                generic_region_payload.write_u32::<BigEndian>(page.image.height as u32)?;
-                generic_region_payload.write_u32::<BigEndian>(0)?; // X location
-                generic_region_payload.write_u32::<BigEndian>(0)?; // Y location
-                generic_region_payload.write_u8(0)?; // Combination operator: OR
-
-                let flags: u8 = 0x00; // MMR=0, GBTEMPLATE=0, TPGDON=0
-                generic_region_payload.push(flags);
-
-                // Write the same adaptive template pixels used for encoding
-                for &(dx, dy) in &default_gbat {
-                    generic_region_payload.push(dx as i8 as u8);
-                    generic_region_payload.push(dy as i8 as u8);
-
-                // Write the AT pixel coordinates to the header.
-                for &(x, y) in at_pixels_template0 {
-                    generic_region_payload.push(x as u8);
-                    generic_region_payload.push(y as u8);
-
-                }
-
+                let mut generic_region_payload = params.to_bytes();
                 generic_region_payload.extend_from_slice(&coder_data);
 
                 let generic_region_segment = Segment {
@@ -509,6 +484,19 @@ impl<'a> Jbig2Encoder<'a> {
             };
             end_page_segment.write_into(&mut output)?;
         }
+
+        // 4. End-of-file segment                                        
+        Segment {
+            number: current_segment_number,
+            seg_type: SegmentType::EndOfFile,       // 51 / 0x33
+            deferred_non_retain: false,
+            retain_flags: 0,
+            page_association_type: 2,               // “all pages”
+            referred_to: vec![],
+            page: None,
+            payload: vec![],
+        }.write_into(&mut output)?;
+        current_segment_number += 1;
 
         self.next_segment_number = current_segment_number;
         Ok(output)
@@ -628,8 +616,8 @@ impl<'a> Jbig2Encoder<'a> {
         let mut output = Vec::new();
         let header = FileHeader {
             organisation_type: true,
-            unknown_n_pages: true,
-            n_pages: 0,
+            unknown_n_pages: false,
+            n_pages: 1,
         };
         output.extend(header.to_bytes());
         output.extend(dict_data);
@@ -644,12 +632,23 @@ pub fn encode_generic_region(
     img: &BitImage,
     cfg: &Jbig2EncConfig,
 ) -> Result<Vec<u8>> {
-    // A. Produce the generic-region segment payload
-    let generic_region_payload = Jbig2ArithCoder::encode_generic_payload(
+    // Build generic region config from high-level parameters
+    let mut gr_cfg = GenericRegionConfig::new(img.width as u32, img.height as u32, cfg.dpi);
+    gr_cfg.comb_operator = cfg.comb_operator;
+    gr_cfg.mmr = cfg.mmr;
+    gr_cfg.tpgdon = cfg.tpgdon;
+    gr_cfg.validate().map_err(|e| anyhow!(e))?;
+
+    let coder_data = Jbig2ArithCoder::encode_generic_payload(
         img,
-        0, // template 0 as per the prompt's implied generic region
-        &[], // no at_pixels for template 0 generic region
+        gr_cfg.template,
+        &gr_cfg.at_pixels,
     )?;
+
+    let params: GenericRegionParams = gr_cfg.clone().into();
+
+    let mut generic_region_payload = params.to_bytes();
+    generic_region_payload.extend_from_slice(&coder_data);
 
     // Create the generic region segment (segment number 1)
     let generic_region_segment = Segment {
@@ -674,20 +673,47 @@ pub fn encode_generic_region(
     let mut out = Vec::with_capacity(generic_region_payload.len() + 64);
 
     // File header
-    jbig2wrapper::push_file_header(&mut out);
+    out.extend_from_slice(&FileHeader {
+        organisation_type: true,
+        unknown_n_pages: false,
+        n_pages: 1,
+    }.to_bytes());
 
     // Page Information segment (segment number 0)
-    jbig2wrapper::push_page_info(
-        &mut out,
-        img.width as u32,
-        img.height as u32,
-    );
+    Segment {
+        number: 0,
+        seg_type: SegmentType::PageInformation,
+        deferred_non_retain: false,
+        retain_flags: 0,
+        page_association_type: 0,
+        referred_to: vec![],
+        page: Some(1),
+        payload: PageInfo {
+            width: img.width as u32,
+            height: img.height as u32,
+            xres: cfg.dpi,
+            yres: cfg.dpi,
+            is_lossless: cfg.is_lossless,
+            default_pixel: cfg.default_pixel,
+            default_operator: cfg.comb_operator,
+            ..Default::default()
+        }.to_bytes(),
+    }.write_into(&mut out)?;
 
     // Generic region segment (segment number 1)
     generic_region_segment.write_into(&mut out)?;
 
     // EOF segment (segment number 2)
-    jbig2wrapper::push_eof(&mut out, 2);
+    Segment {
+        number: 2,
+        seg_type: SegmentType::EndOfFile,
+        deferred_non_retain: false,
+        retain_flags: 0,
+        page_association_type: 2,
+        referred_to: vec![],
+        page: None,
+        payload: vec![],
+    }.write_into(&mut out)?;
 
     Ok(out)
 }
@@ -731,14 +757,7 @@ pub fn encode_symbol_dict(
     let mut params = SymbolDictParams {
         // Made params mutable
         sd_template: 0, // Use standard template 0
-        a1x: 0,
-        a1y: 0,
-        a2x: 0,
-        a2y: 0,
-        a3x: 0,
-        a3y: 0,
-        a4x: 0,
-        a4y: 0,                        // Default AT pixels
+        at: [(0, 0), (0, 0), (0, 0), (0, 0)], // Default AT pixels
         exsyms: num_imported_symbols,  // Number of exported symbols
         newsyms: symbols.len() as u32, // Number of new symbols
     };
@@ -759,10 +778,10 @@ pub fn encode_symbol_dict(
     let k = (32 - num_export_syms.leading_zeros()).max(1) as u8;
 
     // Run of exported symbols from the imported dictionary (length is 0)
-    coder.encode_int_with_ctx(0, k as i32, IntProc::Iaex);
+    let _ = coder.encode_int_with_ctx(0, k as i32, IntProc::Iaex);
 
     // Run of exported symbols from the new symbols in this dict (length is all of them)
-    coder.encode_int_with_ctx(num_export_syms as i32, k as i32, IntProc::Iaex);
+    let _ = coder.encode_int_with_ctx(num_export_syms as i32, k as i32, IntProc::Iaex);
 
     // No terminating IAID(0) as per JBIG2 specification §7.4.3.1.7
 
@@ -778,7 +797,7 @@ pub fn encode_symbol_dict(
         let h = symbols_in_class[0].height; // All symbols in class have same height
                                             // A. Encode Delta Height
         let delta_h = h as i32 - last_height as i32;
-        coder.encode_integer(crate::jbig2arith::IntProc::Iadh, delta_h);
+        let _ = coder.encode_integer(crate::jbig2arith::IntProc::Iadh, delta_h);
         last_height = h;
 
         let mut last_width = 0;
@@ -787,7 +806,7 @@ pub fn encode_symbol_dict(
         for symbol in symbols_in_class {
             // I. Encode Delta Width
             let delta_w = symbol.width as i32 - last_width;
-            coder.encode_integer(crate::jbig2arith::IntProc::Iadw, delta_w); // Assuming IntProc is in jbig2arith
+            let _ = coder.encode_integer(crate::jbig2arith::IntProc::Iadw, delta_w); // Assuming IntProc is in jbig2arith
             last_width += delta_w; // last_width becomes current width
 
             // II. Encode Symbol Bitmap using Generic Region Procedure
@@ -897,13 +916,13 @@ pub fn encode_refine(
         ref_corner: 0,
         transposed: false,
         comb_op: 0,
-        refine_template: 0, // use template 0
+        refine_template: 0,
     };
     data.extend(params.to_bytes());
 
     // 3. Encode number of instances
     let num_inst = instances.len() as u32;
-    coder.encode_int_with_ctx(num_inst as i32, 16, IntProc::Iaai);
+    let _ = coder.encode_int_with_ctx(num_inst as i32, 16, IntProc::Iaai);
 
     // 4. Initialize an empty region buffer to track already emitted pixels
     let mut region_buf = BitImage::new(width, height).expect("region bitmap too large");
@@ -912,11 +931,11 @@ pub fn encode_refine(
     for inst in instances {
         // IAID symbol ID
         let sym_id = inst.symbol_id;
-        coder.encode_int_with_ctx(sym_id as i32, 16, IntProc::Iads);
+        let _ = coder.encode_int_with_ctx(sym_id as i32, 16, IntProc::Iads);
 
         // Refinement deltas
-        coder.encode_integer(IntProc::Iardx, inst.dx);
-        coder.encode_integer(IntProc::Iardy, inst.dy);
+        let _ = coder.encode_integer(IntProc::Iardx, inst.dx);
+        let _ = coder.encode_integer(IntProc::Iardy, inst.dy);
 
         // If this is a refinement instance, encode pixel-by-pixel
         if inst.is_refinement {
@@ -1095,7 +1114,7 @@ pub fn encode_text_region(
 
     // Encode the number of instances using IAID
     let num_instances = instances.len() as u32;
-    coder.encode_int_with_ctx(num_instances as i32, 16, IntProc::Iaai); // Using 16 bits for instance count
+    let _ = coder.encode_int_with_ctx(num_instances as i32, 16, IntProc::Iaai); // Using 16 bits for instance count
 
     // Initialize variables for text region encoding as per JBIG2 spec (single strip model)
     let mut current_t_strip = 0; // T-coordinate of the current strip, initialized to 0 (spec 6.4.5.1)
@@ -1145,30 +1164,30 @@ pub fn encode_text_region(
         // Assuming a single strip for now as per plan.
         if is_first_instance_in_strip {
             let delta_t = instance_abs_pos.y as i32 - current_t_strip; // Initial current_t_strip is 0
-            coder.encode_integer(IntProc::Iadt, delta_t);
+            let _ = coder.encode_integer(IntProc::Iadt, delta_t);
             current_t_strip += delta_t; // current_t_strip is now the T-coordinate of this strip (TCUR)
         }
 
         // Encode T-offset (CURT) for this instance relative to the strip's T-coordinate (IAIT)
         let t_offset = instance_abs_pos.y as i32 - current_t_strip;
-        coder.encode_integer(IntProc::Iait, t_offset);
+        let _ = coder.encode_integer(IntProc::Iait, t_offset);
 
         // Encode S-coordinate
         if is_first_instance_in_strip {
             // First S coordinate in the strip is encoded with IAFS (absolute value)
-            coder.encode_integer(IntProc::Iafs, instance_abs_pos.x as i32);
+            let _ = coder.encode_integer(IntProc::Iafs, instance_abs_pos.x as i32);
             is_first_instance_in_strip = false; // Subsequent instances in this strip will use IADS
         } else {
             // Subsequent S coordinates are delta-encoded with IADS
             let delta_s = instance_abs_pos.x as i32 - last_s_coord;
-            coder.encode_integer(IntProc::Iads, delta_s);
+            let _ = coder.encode_integer(IntProc::Iads, delta_s);
         }
 
         // Always update last_s_coord for the next delta calculation
         last_s_coord = instance_abs_pos.x as i32;
 
         // Encode the Symbol ID itself (IAID)
-        coder.encode_int_with_ctx(
+        let _ = coder.encode_int_with_ctx(
             symbol_id_to_encode as i32,
             symbol_id_bits as i32,
             IntProc::Iads,

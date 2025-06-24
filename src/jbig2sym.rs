@@ -195,7 +195,7 @@ impl BitImage {
                     for bit in 0..32 {
                         let x = xw * 32 + bit;
                         if x < self.width && self.get(usize_to_u32(x), usize_to_u32(y)) {
-                            word |= 1u32 << (31 - bit);
+                            word |= 1u32 << bit;
                         }
                     }
                     out[y * wpr + xw] = word;
