@@ -1,16 +1,12 @@
-//! Integration tests using PBM images
-
-const TEST_IMAGE_PBM: &str = "tests/fixtures/test_image.pbm";
-const TEST_IMAGE1_PBM: &str = "tests/fixtures/test_image1.pbm";
-
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+//! Common utility functions for integration tests
 
 use jbig2enc_rust as jbig2;
-use jbig2enc_rust::jbig2enc::{encode_page_with_symbol_dictionary, encode_symbol_dict};
-use jbig2enc_rust::jbig2structs::Jbig2Config;
-use jbig2enc_rust::jbig2sym;
-use jbig2enc_rust::jbig2sym::{array_to_bitimage, BitImage};
-use ndarray::Array2;
+use jbig2enc_rust::jbig2sym::BitImage;
+use std::io::{BufRead, BufReader, Read, Seek};
+
+// Define the PBM file constants
+pub const TEST_IMAGE_PBM: &str = "tests/fixtures/test_image.pbm";
+pub const TEST_IMAGE1_PBM: &str = "tests/fixtures/test_image1.pbm";
 
 /// Load a PBM file and convert to BitImage
 pub fn load_pbm(path: &str) -> BitImage {
@@ -66,7 +62,8 @@ pub fn load_pbm(path: &str) -> BitImage {
     img
 }
 
-fn load_test_pbm() -> BitImage {
+/// Create a test pattern BitImage of 8x8 pixels
+pub fn load_test_pbm() -> BitImage {
     let mut img = BitImage::new(8, 8).unwrap();
     for x in (0..8).step_by(2) {
         img.set(x, 0, true); // 0xAA
@@ -75,4 +72,17 @@ fn load_test_pbm() -> BitImage {
         img.set(x, 1, true); // 0x55
     }
     img
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pbm_packing_row_major_msb_first() {
+        let img = load_test_pbm();
+        let packed = img.to_packed_words();
+        assert_eq!(packed[0], 0xAA000000);
+        assert_eq!(packed[1], 0x55000000);
+    }
 }

@@ -1,56 +1,62 @@
 [package]
-name = "jbig2"
+name = "jbig2enc-rust"
 version = "0.2.0"
 edition = "2021"
+description = "JBIG2 encoder implementation in Rust with PDF fragment support"
+license = "MIT OR Apache-2.0"
 
 [lib]
-name = "jbig2"
-path = "src/jbig2.rs"
+name = "jbig2enc_rust"
+path = "src/lib.rs"
 
 [dependencies]
 tracing = { version = "0.1", features = ["std"], optional = true }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "registry", "std"], optional = true }
-clap = { version = "4.5.40", features = ["derive"] }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "registry", "std"], optional = true }
+clap = { version = "4.5.41", features = ["derive"] }
 ndarray = "0.16.1"
-bytemuck = { version = "1.0", features = ["derive"] }
-anyhow = "1.0.57"
+bytemuck = { version = "1.23", features = ["derive"] }
+anyhow = "1.0.98"
+thiserror = "1.0"
 log = "0.4"
 env_logger = "0.10"
 aksr = "0.0.3"
-byteorder = "1.4"
+byteorder = "1.5"
 lopdf = "0.36"
 serde_json = "1.0"
 glob = "0.3"
 bitvec = "1.0"
 lutz = "1.4.1"
-xxhash-rust = { version = "0.8.10", features = ["xxh3"] }
-
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+smallvec = "1.15"
+tinyvec = "1.9"
+bitfrob = "1.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_derive = "1.0"
 chrono = "0.4"
 fnv = "1.0"
 derive_builder = "0.20.2"
-lazy_static = "1.4.0"
-once_cell = "1.19"
+lazy_static = "1.5.0"
+once_cell = "1.21"
 
 [build-dependencies]
-vergen = { version = "9.0.0", default-features = false, features = ["build"] }
+vergen = { version = "9.0.6", default-features = false, features = ["build"] }
 
 [[bin]]
 name = "jbig2-tester"
 path = "src/bin/tester.rs"
 
 [features]
-default = []
-trace_arith = ["dep:tracing", "dep:tracing-subscriber"]
+default = ["tracing"]
+tracing = ["dep:tracing", "dep:tracing-subscriber"]
 trace_encoder = ["dep:tracing", "dep:tracing-subscriber"]
+line_verify = []
 
 [dev-dependencies]
 tracing = { version = "0.1", features = ["std"] }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "registry", "std"] }
-which = "4.0"
-tempfile = "3.2"
-hex-literal = "0.3"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "registry", "std"] }
+which = "8.0.0"
+tempfile = "3.20"
+hex-literal = "1.0.0"
 
 [profile.test]
 # Profile-specific settings go here

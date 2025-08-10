@@ -1,6 +1,7 @@
 // Integration tests for Comparator in JBIG2 encoder
-use jbig2::jbig2comparator::Comparator;
-use jbig2::jbig2sym::BitImage;
+use jbig2enc_rust as jbig2;
+use jbig2enc_rust::jbig2comparator::Comparator;
+use jbig2enc_rust::jbig2sym::BitImage;
 
 use bitvec::prelude::*;
 fn make_bitimage_from_bits(width: usize, height: usize, bits: &[u8]) -> BitImage {
