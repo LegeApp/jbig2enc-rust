@@ -70,11 +70,18 @@ pub struct SymbolExtractionConfig {
 }
 
 impl SymbolExtractionConfig {
-    /// Creates a new `SymbolExtractionConfig` from a `Jbig2EncConfig`
-    pub fn from_jbig2_config(_config: &crate::jbig2enc::Jbig2EncConfig) -> Self {
-        // For now, we'll use default values, but we could map relevant fields from Jbig2EncConfig
-        // in the future if needed
-        Self::default()
+    /// Creates a new `SymbolExtractionConfig` from a `Jbig2Config`
+    pub fn from_jbig2_config(config: &crate::jbig2structs::Jbig2Config) -> Self {
+        let mut cfg = Self::default();
+
+        // Balanced filtering - remove noise but preserve punctuation
+        cfg.min_component_size = if config.auto_thresh { 12 } else { 10 };
+        
+        // More restrictive dot detection to avoid fragmenting characters
+        cfg.max_dot_area_ratio = 0.05; // Reduced from 0.1
+        cfg.max_dot_height_ratio = 0.3; // Reduced from 0.5
+
+        cfg
     }
 }
 
@@ -85,7 +92,7 @@ impl Default for SymbolExtractionConfig {
             max_dot_height_ratio: 0.5,
             dot_aspect_ratio_range: (0.5, 2.0),
             dot_merge_distance_ratio: 0.5,
-            min_component_size: 5,
+            min_component_size: 10, // Balanced to preserve punctuation but filter noise
             split_config: SplitConfig::default(),
         }
     }
@@ -481,5 +488,54 @@ pub fn extract_symbols(image: &BitImage, config: SymbolExtractionConfig) -> Vec<
         }
     }
 
-    symbols
+    // Consolidate similar symbols to reduce dictionary size
+    consolidate_symbols(symbols)
+}
+
+/// Consolidates similar symbols to reduce dictionary size
+/// This is crucial for preventing 300+ symbol dictionaries
+fn consolidate_symbols(mut symbols: Vec<(Rect, Symbol)>) -> Vec<(Rect, Symbol)> {
+    if symbols.len() <= 50 {
+        return symbols; // Already reasonable size
+    }
+    
+    // Cap at 200 symbols to prevent performance issues
+    if symbols.len() > 200 {
+        symbols.truncate(200);
+        eprintln!("Warning: Too many symbols ({}), truncated to 200 to prevent performance issues", symbols.len());
+    }
+    
+    use crate::jbig2comparator::Comparator;
+    let mut comparator = Comparator::default();
+    let mut consolidated = Vec::new();
+    let mut used = vec![false; symbols.len()];
+    
+    for i in 0..symbols.len() {
+        if used[i] {
+            continue;
+        }
+        
+        let (rect_i, ref symbol_i) = symbols[i];
+        consolidated.push((rect_i, symbol_i.clone()));
+        used[i] = true;
+        
+        // Find similar symbols to merge with this one
+        for j in (i + 1)..symbols.len() {
+            if used[j] {
+                continue;
+            }
+            
+            let (_, ref symbol_j) = symbols[j];
+            
+            // Allow up to 3% pixel difference for consolidation (more conservative)
+            let max_err = ((symbol_i.image.width * symbol_i.image.height) / 33).max(1) as u32;
+            
+            if comparator.distance(&symbol_i.image, &symbol_j.image, max_err).is_some() {
+                used[j] = true; // Mark as consolidated
+            }
+        }
+    }
+    
+    eprintln!("Symbol consolidation: {} -> {} symbols", symbols.len(), consolidated.len());
+    consolidated
 }

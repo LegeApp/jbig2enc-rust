@@ -1,11 +1,10 @@
 //! This module contains the main JBIG2 encoder logic.
 use crate::jbig2arith::{IntProc, Jbig2ArithCoder};
 use crate::jbig2comparator::Comparator;
-use crate::jbig2lutz::SymbolExtractionConfig;
-use crate::jbig2lutz::{extract_symbols, find_connected_components};
+use crate::jbig2lutz::{extract_symbols, find_connected_components, SymbolExtractionConfig};
 use crate::jbig2structs::{
-    FileHeader, GenericRegionParams, GenericRegionConfig, PageInfo, Segment, SegmentType, SymbolDictParams,
-    TextRegionParams,
+    FileHeader, GenericRegionConfig, GenericRegionParams, Jbig2Config, PageInfo, Segment,
+    SegmentType, SymbolDictParams, TextRegionParams,
 };
 
 use crate::jbig2sym::{BitImage, Rect, Symbol};
@@ -17,7 +16,7 @@ macro_rules! debug {
     ($($arg:tt)*) => {
         #[cfg(feature = "trace_encoder")]
         log::debug!($($arg)*);
-        
+
         #[cfg(not(feature = "trace_encoder"))]
         let _ = format_args!($($arg)*);
     };
@@ -28,7 +27,7 @@ macro_rules! trace {
     ($($arg:tt)*) => {
         #[cfg(feature = "trace_encoder")]
         log::trace!($($arg)*);
-        
+
         #[cfg(not(feature = "trace_encoder"))]
         let _ = format_args!($($arg)*);
     };
@@ -72,11 +71,14 @@ pub struct SymbolCandidate {
 ///
 /// This function finds connected components in the input image and returns
 /// them as symbol candidates. Each candidate has a bitmap and a bounding box.
-/// 
+///
 /// # Arguments
 /// * `image` - The input binary image to segment
 /// * `min_component_size` - Minimum number of pixels a connected component must have to be considered a symbol
-pub fn segment_symbols(image: &BitImage, min_component_size: usize) -> Result<Vec<SymbolCandidate>> {
+pub fn segment_symbols(
+    image: &BitImage,
+    min_component_size: usize,
+) -> Result<Vec<SymbolCandidate>> {
     // Find connected components with the specified minimum size
     let components = find_connected_components(image, min_component_size);
 
@@ -100,42 +102,7 @@ pub fn segment_symbols(image: &BitImage, min_component_size: usize) -> Result<Ve
     Ok(candidates)
 }
 
-#[derive(Debug, Clone)]
-pub struct Jbig2EncConfig {
-    pub symbol_mode: bool,
-    pub refine: bool,
-    pub refine_template: u8,
-    pub duplicate_line_removal: bool,
-    pub auto_thresh: bool,
-    pub hash: bool,
-    pub dpi: u32,
-    pub want_full_headers: bool,
-    pub mmr: bool,
-    pub tpgdon: bool,
-    pub comb_operator: u8,
-    pub is_lossless: bool,
-    pub default_pixel: bool,
-}
-
-impl Default for Jbig2EncConfig {
-    fn default() -> Self {
-        Self {
-            symbol_mode: true,
-            refine: false,
-            refine_template: 0,
-            duplicate_line_removal: true,
-            auto_thresh: true,
-            hash: true,
-            dpi: 300,
-            want_full_headers: true,
-            mmr: false,
-            tpgdon: true,
-            comb_operator: 0, // Default to OR
-            is_lossless: true,
-            default_pixel: false,
-        }
-    }
-}
+// Jbig2EncConfig has been removed. Use jbig2structs::Jbig2Config directly.
 
 #[derive(Clone)]
 pub struct SymbolInstance {
@@ -174,28 +141,54 @@ struct EncoderState {
     use_delta_encoding: bool,
 }
 
+/// Main JBIG2 encoder that handles document encoding
+///
+/// This struct manages the encoding state and configuration for JBIG2 documents.
+/// It supports both symbol-based and generic region encoding strategies.
 pub struct Jbig2Encoder<'a> {
-    config: &'a Jbig2EncConfig, // read-only
-    state: EncoderState,        // our private knobs & counters
+    /// Configuration for the encoder
+    config: &'a Jbig2Config,
+
+    /// Internal encoder state
+    state: EncoderState,
+
+    /// Global symbols (shared across pages)
     global_symbols: Vec<BitImage>,
+
+    /// Usage count for each global symbol
     symbol_usage: Vec<usize>,
+
+    /// Set of page indices where each symbol appears
     symbol_pages: Vec<HashSet<usize>>,
+
+    /// Hash map for quick symbol lookup
     hash_map: HashMap<HashKey, Vec<usize>>,
+
+    /// Page data for each page in the document
     pages: Vec<PageData>,
+
+    /// Next available segment number
     next_segment_number: u32,
+
+    /// Segment number of the global dictionary (if any)
     global_dict_segment_number: Option<u32>,
 }
 
 impl<'a> Jbig2Encoder<'a> {
-    pub fn new(cfg: &'a Jbig2EncConfig) -> Self {
-        if cfg.refine && !cfg.symbol_mode {
+    /// Creates a new JBIG2 encoder with the specified configuration
+    ///
+    /// # Arguments
+    /// * `config` - Configuration for the encoder
+    pub fn new(config: &'a Jbig2Config) -> Self {
+        if config.refine && !config.symbol_mode {
             panic!("Refinement requires symbol mode to be enabled.");
         }
+
         Self {
-            config: cfg,
+            config,
             state: EncoderState {
                 pdf_mode: false, // start in raw mode
-                full_headers_remaining: cfg.want_full_headers,
+                full_headers_remaining: config.want_full_headers,
                 segment: true,            // Default to using segments
                 use_refinement: false,    // Default to no refinement
                 use_delta_encoding: true, // Default to using delta encoding
@@ -223,52 +216,66 @@ impl<'a> Jbig2Encoder<'a> {
 
     pub fn add_page(&mut self, image: &Array2<u8>) -> Result<()> {
         let bitimage = crate::jbig2sym::array_to_bitimage(image);
-        let candidates = if self.state.segment {
-            // Use a minimum component size of 1 to include small symbols
-            segment_symbols(&bitimage, 1)?
-        } else {
-            Vec::new()
-        };
         let page_num = self.pages.len();
         let mut symbol_instances = Vec::new();
         let mut comparator = Comparator::default();
 
-        if self.config.symbol_mode {
-            for candidate in candidates {
-                let (_, trimmed) = candidate.bitmap.trim();
-                let key = hash_key(&trimmed);
-                let mut matched = false;
+        // Extract symbols if symbol mode is enabled
+        if self.config.symbol_mode && self.state.segment {
+            let cfg = SymbolExtractionConfig::from_jbig2_config(self.config);
+            let extracted = extract_symbols(&bitimage, cfg);
 
-                if let Some(bucket) = self.hash_map.get(&key) {
-                    for &idx in bucket {
-                        if comparator
-                            .distance(&trimmed, &self.global_symbols[idx], 0)
-                            .is_some()
-                        {
-                            self.symbol_usage[idx] += 1;
-                            self.symbol_pages[idx].insert(page_num);
-                            symbol_instances.push(SymbolInstance {
-                                symbol_index: idx,
-                                position: candidate.bbox,
-                                instance_bitmap: candidate.bitmap.clone(),
-                            });
-                            matched = true;
-                            break;
+            // Check if symbol extraction makes sense for this image
+            // If we only get one symbol that covers the entire image,
+            // it's better to use generic region encoding
+            let should_use_symbols = if extracted.len() == 1 {
+                let (rect, _) = &extracted[0];
+                // Check if the single symbol is essentially the entire image
+                !(rect.x == 0
+                    && rect.y == 0
+                    && rect.width as usize >= bitimage.width - 2
+                    && rect.height as usize >= bitimage.height - 2)
+            } else {
+                extracted.len() > 0
+            };
+
+            if should_use_symbols {
+                for (rect, symbol) in extracted {
+                    let (_, trimmed) = symbol.image.trim();
+                    let key = hash_key(&trimmed);
+                    let mut matched = false;
+                    if let Some(bucket) = self.hash_map.get(&key) {
+                        for &idx in bucket {
+            // Allow very small differences between symbols (up to 2% of pixels)
+                            let max_err = ((trimmed.width * trimmed.height) / 50).max(1) as u32;
+                            if comparator
+                                .distance(&trimmed, &self.global_symbols[idx], max_err)
+                                .is_some()
+                            {
+                                self.symbol_usage[idx] += 1;
+                                self.symbol_pages[idx].insert(page_num);
+                                symbol_instances.push(SymbolInstance {
+                                    symbol_index: idx,
+                                    position: rect,
+                                    instance_bitmap: symbol.image.clone(),
+                                });
+                                matched = true;
+                                break;
+                            }
                         }
                     }
-                }
-
-                if !matched {
-                    let idx = self.global_symbols.len();
-                    self.global_symbols.push(trimmed.clone());
-                    self.symbol_usage.push(1);
-                    self.symbol_pages.push([page_num].into_iter().collect());
-                    self.hash_map.entry(key).or_default().push(idx);
-                    symbol_instances.push(SymbolInstance {
-                        symbol_index: idx,
-                        position: candidate.bbox,
-                        instance_bitmap: candidate.bitmap.clone(),
-                    });
+                    if !matched {
+                        let idx = self.global_symbols.len();
+                        self.global_symbols.push(trimmed.clone());
+                        self.symbol_usage.push(1);
+                        self.symbol_pages.push([page_num].into_iter().collect());
+                        self.hash_map.entry(key).or_default().push(idx);
+                        symbol_instances.push(SymbolInstance {
+                            symbol_index: idx,
+                            position: rect,
+                            instance_bitmap: symbol.image.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -307,8 +314,8 @@ impl<'a> Jbig2Encoder<'a> {
         }
 
         let mut output = Vec::new();
-		
-		if self.state.full_headers_remaining {
+
+        if self.state.full_headers_remaining {
             let header = FileHeader {
                 organisation_type: true,
                 unknown_n_pages: false,
@@ -360,38 +367,38 @@ impl<'a> Jbig2Encoder<'a> {
                 page: None, // Global dictionary
                 payload: global_dict_payload,
             };
-            if cfg!(debug_assertions) {
-                println!("[DEBUG] Writing Global Symbol Dictionary Segment: Number={}, Type={:?}, Payload Length={}", global_dict_segment.number, global_dict_segment.seg_type, global_dict_segment.payload.len());
-            }
+
             global_dict_segment.write_into(&mut output)?;
             self.global_dict_segment_number = Some(global_dict_segment.number);
             current_segment_number += 1;
         }
 
         for (page_num, page) in self.pages.iter().enumerate() {
-            // 2. Page-information segment (segment #0)                           
+            // 2. Page-information segment (segment #0)
             let page_info_payload = PageInfo {
-                width:  page.image.width  as u32,
+                width: page.image.width as u32,
                 height: page.image.height as u32,
-                default_pixel: true,          // white background
-                xres: self.config.dpi,
-                yres: self.config.dpi,
+                default_pixel: false, // white background (safer default)
+                xres: self.config.generic.dpi,
+                yres: self.config.generic.dpi,
                 ..Default::default()
-            }.to_bytes();
+            }
+            .to_bytes();
 
             Segment {
                 number: current_segment_number,
                 seg_type: SegmentType::PageInformation, // 0x30
                 deferred_non_retain: false,
                 retain_flags: 0,
-                page_association_type: 0,               // explicit
+                page_association_type: 0, // explicit
                 referred_to: vec![],
                 page: Some(page_num as u32 + 1),
                 payload: page_info_payload,
-            }.write_into(&mut output)?;
+            }
+            .write_into(&mut output)?;
             current_segment_number += 1;
 
-            if self.config.symbol_mode {
+            if self.config.symbol_mode && !page.symbol_instances.is_empty() {
                 // SYMBOL MODE: Encode Local Symbol Dictionary and Text Region
                 let local_symbols = &page_local_symbols[page_num];
                 let mut referred_to_for_text_region = Vec::new();
@@ -405,7 +412,7 @@ impl<'a> Jbig2Encoder<'a> {
                             .iter()
                             .map(|&i| &self.global_symbols[i])
                             .collect();
-                        let num_global_symbols_for_local_dict = refs.len() as u32;
+                        let num_global_symbols_for_local_dict = global_symbol_indices.len() as u32;
                         encode_symbol_dict(&refs, &self.config, num_global_symbols_for_local_dict)?
                     };
                     let local_dict_segment = Segment {
@@ -414,13 +421,11 @@ impl<'a> Jbig2Encoder<'a> {
                         deferred_non_retain: false,
                         retain_flags: 0,
                         page_association_type: 0, // Explicit page association
-                        referred_to: Vec::new(), // Per spec, symbol dicts don't refer to others this way for inheritance; text regions do.
+                        referred_to: Vec::new(),
                         page: Some(page_num as u32 + 1),
                         payload: local_dict_payload,
                     };
-                    if cfg!(debug_assertions) {
-                        println!("[DEBUG] Writing Local Symbol Dictionary Segment: Number={}, Type={:?}, Page={:?}, Payload Length={}", local_dict_segment.number, local_dict_segment.seg_type, local_dict_segment.page, local_dict_segment.payload.len());
-                    }
+
                     local_dict_segment.write_into(&mut output)?;
                     current_segment_number += 1;
                     referred_to_for_text_region.push(local_dict_segment.number);
@@ -453,14 +458,17 @@ impl<'a> Jbig2Encoder<'a> {
                 text_region_segment.write_into(&mut output)?;
                 current_segment_number += 1;
             } else {
-                // NON-SYMBOL MODE: GenericRegion will be written using unified config
-
-                // Build generic region config for non-symbol mode
-                let mut gr_cfg = GenericRegionConfig::new(page.image.width as u32, page.image.height as u32, self.config.dpi);
-                gr_cfg.comb_operator = self.config.comb_operator;
-                gr_cfg.mmr = self.config.mmr;
-                gr_cfg.tpgdon = self.config.tpgdon;
-                gr_cfg.validate().map_err(|e| anyhow!(e))?;
+                // NON-SYMBOL MODE or NO SYMBOLS FOUND: Use generic region encoding
+                // Build generic region config
+                let mut gr_cfg = GenericRegionConfig::new(
+                    page.image.width as u32,
+                    page.image.height as u32,
+                    self.config.generic.dpi,
+                );
+                gr_cfg.comb_operator = self.config.generic.comb_operator;
+                gr_cfg.mmr = self.config.generic.mmr;
+                gr_cfg.tpgdon = self.config.generic.tpgdon;
+                gr_cfg.validate().map_err(|e: &'static str| anyhow!(e))?;
 
                 let coder_data = Jbig2ArithCoder::encode_generic_payload_cfg(&page.image, &gr_cfg)?;
 
@@ -496,17 +504,18 @@ impl<'a> Jbig2Encoder<'a> {
             end_page_segment.write_into(&mut output)?;
         }
 
-        // 4. End-of-file segment                                        
+        // 4. End-of-file segment
         Segment {
             number: current_segment_number,
-            seg_type: SegmentType::EndOfFile,       // 51 / 0x33
+            seg_type: SegmentType::EndOfFile, // 51 / 0x33
             deferred_non_retain: false,
             retain_flags: 0,
-            page_association_type: 2,               // “all pages”
+            page_association_type: 2, // “all pages”
             referred_to: vec![],
             page: None,
             payload: vec![],
-        }.write_into(&mut output)?;
+        }
+        .write_into(&mut output)?;
         current_segment_number += 1;
 
         self.next_segment_number = current_segment_number;
@@ -639,24 +648,18 @@ impl<'a> Jbig2Encoder<'a> {
 
 /// Encodes a generic region, optionally wrapping it in a complete JBIG2 file.
 /// This function is intended to be the top-level entry point for encoding a single generic region.
-pub fn encode_generic_region(
-    img: &BitImage,
-    cfg: &Jbig2EncConfig,
-) -> Result<Vec<u8>> {
+pub fn encode_generic_region(img: &BitImage, cfg: &Jbig2Config) -> Result<Vec<u8>> {
     // Build generic region config from high-level parameters
-    let mut gr_cfg = GenericRegionConfig::new(img.width as u32, img.height as u32, cfg.dpi);
-    gr_cfg.comb_operator = cfg.comb_operator;
-    gr_cfg.mmr = cfg.mmr;
-    gr_cfg.tpgdon = cfg.tpgdon;
-    gr_cfg.validate().map_err(|e| anyhow!(e))?;
+    let mut gr_cfg = GenericRegionParams::new(img.width as u32, img.height as u32, cfg.generic.dpi);
+    gr_cfg.comb_operator = cfg.generic.comb_operator;
+    gr_cfg.mmr = cfg.generic.mmr;
+    gr_cfg.tpgdon = cfg.generic.tpgdon;
+    gr_cfg.validate().map_err(|e: &'static str| anyhow!(e))?;
 
-    let coder_data = Jbig2ArithCoder::encode_generic_payload(
-        img,
-        gr_cfg.template,
-        &gr_cfg.at_pixels,
-    )?;
+    let coder_data =
+        Jbig2ArithCoder::encode_generic_payload(img, gr_cfg.template, &gr_cfg.at_pixels)?;
 
-    let params: GenericRegionParams = gr_cfg.clone().into();
+    let params: GenericRegionParams = gr_cfg.clone();
 
     let mut generic_region_payload = params.to_bytes();
     generic_region_payload.extend_from_slice(&coder_data);
@@ -669,7 +672,7 @@ pub fn encode_generic_region(
         retain_flags: 0,
         page_association_type: 0, // Explicit page association
         referred_to: Vec::new(),
-        page: Some(1), // Page 1
+        page: Some(1),                           // Page 1
         payload: generic_region_payload.clone(), // Clone to avoid move
     };
 
@@ -684,11 +687,14 @@ pub fn encode_generic_region(
     let mut out = Vec::with_capacity(generic_region_payload.len() + 64);
 
     // File header
-    out.extend_from_slice(&FileHeader {
-        organisation_type: true,
-        unknown_n_pages: false,
-        n_pages: 1,
-    }.to_bytes());
+    out.extend_from_slice(
+        &FileHeader {
+            organisation_type: true,
+            unknown_n_pages: false,
+            n_pages: 1,
+        }
+        .to_bytes(),
+    );
 
     // Page Information segment (segment number 0)
     Segment {
@@ -702,14 +708,16 @@ pub fn encode_generic_region(
         payload: PageInfo {
             width: img.width as u32,
             height: img.height as u32,
-            xres: cfg.dpi,
-            yres: cfg.dpi,
+            xres: cfg.generic.dpi,
+            yres: cfg.generic.dpi,
             is_lossless: cfg.is_lossless,
             default_pixel: cfg.default_pixel,
-            default_operator: cfg.comb_operator,
+            default_operator: cfg.generic.comb_operator,
             ..Default::default()
-        }.to_bytes(),
-    }.write_into(&mut out)?;
+        }
+        .to_bytes(),
+    }
+    .write_into(&mut out)?;
 
     // Generic region segment (segment number 1)
     generic_region_segment.write_into(&mut out)?;
@@ -724,14 +732,15 @@ pub fn encode_generic_region(
         referred_to: vec![],
         page: None,
         payload: vec![],
-    }.write_into(&mut out)?;
+    }
+    .write_into(&mut out)?;
 
     Ok(out)
 }
 
 pub fn encode_symbol_dict(
     symbols: &[&BitImage],
-    _config: &Jbig2EncConfig,
+    _config: &Jbig2Config,
     num_imported_symbols: u32,
 ) -> Result<Vec<u8>> {
     // Validate input symbols
@@ -767,10 +776,10 @@ pub fn encode_symbol_dict(
     // Create symbol dictionary parameters
     let mut params = SymbolDictParams {
         // Made params mutable
-        sd_template: 0, // Use standard template 0
+        sd_template: 0,                       // Use standard template 0
         at: [(0, 0), (0, 0), (0, 0), (0, 0)], // Default AT pixels
-        exsyms: num_imported_symbols,  // Number of exported symbols
-        newsyms: symbols.len() as u32, // Number of new symbols
+        exsyms: num_imported_symbols,         // Number of exported symbols
+        newsyms: symbols.len() as u32,        // Number of new symbols
     };
 
     // Set number of exported symbols to match number of new symbols (export all)
@@ -822,6 +831,23 @@ pub fn encode_symbol_dict(
 
             // II. Encode Symbol Bitmap using Generic Region Procedure
             let packed = symbol.to_packed_words();
+
+            // Verify bit-order correctness: first black pixel should match between symbol and packed data
+            if let Some(expected_first_pixel) = first_black_pixel(symbol) {
+                let actual_first_pixel = crate::jbig2sym::first_black_pixel_in_packed(
+                    &packed,
+                    symbol.width,
+                    symbol.height,
+                );
+                assert_eq!(
+                    actual_first_pixel,
+                    Some(expected_first_pixel),
+                    "bit-order / row-order mismatch in symbol dict packer! Expected first black pixel at {:?}, got {:?}",
+                    expected_first_pixel,
+                    actual_first_pixel
+                );
+            }
+
             coder.encode_generic_region(
                 bytemuck::cast_slice(&packed),
                 symbol.width,
@@ -1004,7 +1030,7 @@ pub fn encode_refine(
 /// and IADW/IADH delta encoding for more efficient compression.
 pub fn encode_text_region(
     instances: &[SymbolInstance],
-    _config: &Jbig2EncConfig,
+    _config: &Jbig2Config,
     all_known_symbols: &[&BitImage],
     global_dict_indices: &[usize],
     local_dict_indices: &[usize],
@@ -1230,7 +1256,16 @@ fn log2up(v: u32) -> u32 {
     r + if is_pow_of_2 { 0 } else { 1 }
 }
 
-pub fn encode_document(images: &[Array2<u8>], config: &Jbig2EncConfig) -> Result<Vec<u8>> {
+/// Encodes a sequence of images as a JBIG2 document.
+///
+/// # Arguments
+/// * `images` - A slice of 2D arrays containing the input images
+/// * `config` - Configuration for the encoder
+///
+/// # Returns
+/// A `Result` containing the encoded JBIG2 document as a byte vector if successful,
+/// or an error if encoding fails.
+pub fn encode_document(images: &[Array2<u8>], config: &Jbig2Config) -> Result<Vec<u8>> {
     let mut encoder = Jbig2Encoder::new(config);
     for image in images {
         encoder.add_page(image)?;
@@ -1330,13 +1365,13 @@ pub fn build_dictionary_and_get_instances(
 /// This is a high-level function that demonstrates the new encoding pipeline.
 pub fn encode_page_with_symbol_dictionary(
     image: &BitImage,
-    config: &Jbig2EncConfig,
+    config: &Jbig2Config,
     next_segment_num: u32,
 ) -> Result<(Vec<u8>, u32)> {
     // 1. Extract symbols from the page image
     let symbol_config = SymbolExtractionConfig::from_jbig2_config(config);
     let extracted_symbols = extract_symbols(image, symbol_config);
-    println!("[DEBUG] Extracted {} symbols", extracted_symbols.len());
+
     if extracted_symbols.is_empty() {
         return Ok((Vec::new(), next_segment_num));
     }
@@ -1368,9 +1403,7 @@ pub fn encode_page_with_symbol_dictionary(
         payload: dict_payload,
         ..Default::default()
     };
-    if cfg!(debug_assertions) {
-        println!("[DEBUG]   encode_page_with_symbol_dictionary: Writing SymbolDictionary Segment: Number={}, Type={:?}, Page={}, Payload Length={}, ReferredToCount={}", dict_segment.number, dict_segment.seg_type, dict_segment.page.unwrap_or(0), dict_segment.payload.len(), dict_segment.referred_to.len());
-    }
+
     // You might want to log dict_params here too if they are accessible
     dict_segment.write_into(&mut output)?;
     let dictionary_segment_number = current_segment_number;
@@ -1440,9 +1473,7 @@ pub fn encode_page_with_symbol_dictionary(
         payload: region_payload,
         ..Default::default()
     };
-    if cfg!(debug_assertions) {
-        println!("[DEBUG]   encode_page_with_symbol_dictionary: Writing TextRegion Segment: Number={}, Type={:?}, Page={}, Payload Length={}, ReferredToCount={}, FirstReferredSeg={}", region_segment.number, region_segment.seg_type, region_segment.page.unwrap_or(0), region_segment.payload.len(), region_segment.referred_to.len(), region_segment.referred_to.get(0).unwrap_or(&0));
-    }
+
     // You might want to log text_region_params here too if they are accessible
     region_segment.write_into(&mut output)?;
     current_segment_number += 1;
@@ -1458,4 +1489,17 @@ pub fn hash_key(img: &BitImage) -> HashKey {
     // Use xxh3 for fast hashing of the bitmap data
     let hash = xxh3_64(img.as_bytes());
     HashKey(hash)
+}
+
+/// Helper function to find the first black pixel in the BitImage
+/// Returns (x, y) coordinates of the first black pixel, or None if no black pixels
+pub fn first_black_pixel(image: &BitImage) -> Option<(usize, usize)> {
+    for y in 0..image.height {
+        for x in 0..image.width {
+            if image.get_usize(x, y) {
+                return Some((x, y));
+            }
+        }
+    }
+    None
 }

@@ -1,7 +1,7 @@
 //! Utility functions for the JBIG2 encoder
 
-use anyhow::Result;
 use crate::jbig2sym::BitImage;
+use anyhow::Result;
 use lopdf::{self, Dictionary, Object, ObjectId, Stream};
 use std::fs::{self, File};
 use std::io::Write;

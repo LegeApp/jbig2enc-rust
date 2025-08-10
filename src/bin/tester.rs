@@ -1,10 +1,13 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use jbig2::jbig2enc::{Jbig2EncConfig, Jbig2Encoder, encode_generic_region};
-use jbig2::jbig2sym::array_to_bitimage;
-use log::info;
 use env_logger::Builder;
 use env_logger::Env;
+use jbig2enc_rust::jbig2enc::{encode_generic_region, Jbig2Encoder};
+use jbig2enc_rust::jbig2pdf;
+use jbig2enc_rust::jbig2pdf::{Jbig2Input, Jbig2Roi};
+use jbig2enc_rust::jbig2structs::Jbig2Config;
+use jbig2enc_rust::jbig2sym::array_to_bitimage;
+use log::info;
 use log::LevelFilter;
 use ndarray::Array2;
 use std::fs::File;
@@ -51,7 +54,7 @@ fn init_logging(args: &Args) -> Result<()> {
         // In release builds, default to info level
         "info"
     };
-    
+
     let mut builder = Builder::from_env(Env::new().default_filter_or(default_log_level));
 
     // Set appropriate log levels for our crates
@@ -93,13 +96,12 @@ fn init_logging(args: &Args) -> Result<()> {
     }
 
     builder.init();
-    info!("Logging initialized with console={}, log_dir={:?}, log_file={:?}",
-          args.console, args.log_dir, args.log_file);
+    info!(
+        "Logging initialized with console={}, log_dir={:?}, log_file={:?}",
+        args.console, args.log_dir, args.log_file
+    );
     Ok(())
 }
-
-use jbig2::jbig2pdf;
-use jbig2::jbig2pdf::{Jbig2Input, Jbig2Roi};
 
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -153,17 +155,17 @@ fn main() -> Result<()> {
     info!("Converted PBM to ndarray::Array2<u8>.");
 
     // 3. Configure the encoder
-    let config = Jbig2EncConfig {
+    let config = Jbig2Config {
+        dpi: 300,
         symbol_mode: args.symbol_mode,
-        want_full_headers: true,
-        mmr: false, // Force arithmetic coding
-        tpgdon: false, // Override tpgdon: false in the encoder config for testing (match C behavior)
-        ..Jbig2EncConfig::default()
+        ..Jbig2Config::default()
     };
-    println!("[DEBUG] Jbig2EncConfig.mmr = {}", config.mmr);
-    
-    info!("Using encoder config: symbol_mode={}, want_full_headers={}",
-          config.symbol_mode, config.want_full_headers);
+    println!("[DEBUG] Jbig2Config.mmr = {}", config.generic.mmr);
+
+    info!(
+        "Using encoder config: symbol_mode={}, want_full_headers={}",
+        config.symbol_mode, config.want_full_headers
+    );
 
     // 4. Initialize and use the Jbig2Encoder
     let encoded_data = if args.pdf_mode {

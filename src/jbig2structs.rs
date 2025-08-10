@@ -14,6 +14,90 @@ pub const JB2_MAGIC: &[u8; 10] = b"\x97JBIG2\r\n\x1A\n";
 /// JBIG2 file format version
 pub const JB2_VERSION: u8 = 0x02;
 
+/// Top-level configuration for JBIG2 encoding
+#[derive(Debug, Clone)]
+pub struct Jbig2Config {
+    // Generic region settings
+    pub generic: GenericRegionConfig,
+
+    // Symbol dictionary settings
+    pub sd_template: u8,      // Symbol dictionary template (0-3)
+    pub sd_at: [(i8, i8); 4], // Symbol dictionary AT pixels
+
+    // Text region settings
+    pub text_ds_offset: u8,       // SBDSOFFSET
+    pub text_refine: bool,        // SBREFINE
+    pub text_log_strips: u8,      // LOGSBSTRIPS (0-3)
+    pub text_ref_corner: u8,      // REFCORNER (0-3)
+    pub text_transposed: bool,    // TRANSPOSED
+    pub text_comb_op: u8,         // SBCOMBOP (0-4)
+    pub text_refine_template: u8, // SBRTEMPLATE (0 or 1)
+
+    // Global settings
+    pub dpi: u32,
+    pub symbol_mode: bool,
+    pub refine: bool,
+    pub refine_template: u8,
+    pub duplicate_line_removal: bool,
+    pub auto_thresh: bool,
+    pub hash: bool,
+    pub want_full_headers: bool,
+    pub is_lossless: bool,
+    pub default_pixel: bool,
+}
+
+impl Default for Jbig2Config {
+    fn default() -> Self {
+        Self {
+            generic: GenericRegionConfig::default(),
+            sd_template: 0,
+            sd_at: [(0, 0), (0, 0), (0, 0), (0, 0)],
+            text_ds_offset: 0,
+            text_refine: false,
+            text_log_strips: 0,
+            text_ref_corner: 0,
+            text_transposed: false,
+            text_comb_op: 0,
+            text_refine_template: 0,
+            dpi: 300,
+            symbol_mode: true,
+            refine: false,
+            refine_template: 0,
+            duplicate_line_removal: true,
+            auto_thresh: true,
+            hash: true,
+            want_full_headers: true,
+            is_lossless: false,
+            default_pixel: false,
+        }
+    }
+}
+
+impl Jbig2Config {
+    /// Creates a new configuration with default values
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a configuration optimized for text documents
+    pub fn text() -> Self {
+        let mut cfg = Self::default();
+        cfg.symbol_mode = true;
+        cfg.auto_thresh = true;
+        cfg.duplicate_line_removal = true;
+        cfg
+    }
+
+    /// Creates a configuration for lossless image encoding
+    pub fn lossless() -> Self {
+        let mut cfg = Self::default();
+        cfg.symbol_mode = false;
+        cfg.is_lossless = true;
+        cfg.duplicate_line_removal = false;
+        cfg
+    }
+}
+
 /// JBIG2 segment types as defined in the specification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SegmentType {
@@ -171,31 +255,66 @@ impl PageInfo {
 // -----------------------------------------------------------------------------
 
 /// Represents the parameters for a generic region segment as per the JBIG2 specification
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GenericRegionParams {
-    pub width: u32,         // Region width in pixels
-    pub height: u32,        // Region height in pixels
-    pub x: u32,             // X-coordinate of the top-left corner
-    pub y: u32,             // Y-coordinate of the top-left corner
-    pub comb_operator: u8,  // Combination operator (0-4: OR, AND, XOR, XNOR, REPLACE)
-    pub mmr: bool,          // 1 = MMR coding, 0 = arithmetic coding
-    pub template: u8,       // Generic region template (0-3)
-    pub tpgdon: bool,       // Typical prediction generic decoding on/off
-    pub at: [(i8, i8); 4], // Adaptive template coordinates (a1x, a1y, ..., a4x, a4y)
+    pub width: u32,               // Region width in pixels
+    pub height: u32,              // Region height in pixels
+    pub x: u32,                   // X-coordinate of the top-left corner
+    pub y: u32,                   // Y-coordinate of the top-left corner
+    pub comb_operator: u8,        // Combination operator (0-4: OR, AND, XOR, XNOR, REPLACE)
+    pub mmr: bool,                // 1 = MMR coding, 0 = arithmetic coding
+    pub template: u8,             // Generic region template (0-3)
+    pub tpgdon: bool,             // Typical prediction generic decoding on/off
+    pub at: [(i8, i8); 4],        // Adaptive template coordinates (a1x, a1y, ..., a4x, a4y)
+    pub at_pixels: Vec<(i8, i8)>, // Adaptive template pixels (for compatibility)
 }
 
 impl GenericRegionParams {
+    pub fn new(width: u32, height: u32, dpi: u32) -> Self {
+        let at_pixels = vec![(3, -1), (-3, -1), (2, -2), (-2, -2)];
+        Self {
+            width,
+            height,
+            x: 0,
+            y: 0,
+            comb_operator: 4, // REPLACE (safer for single image pages)
+            mmr: false,
+            template: 0,
+            tpgdon: true,
+            at: [(3, -1), (-3, -1), (2, -2), (-2, -2)],
+            at_pixels,
+        }
+    }
+
+    /// Validation to ensure compliance with JBIG2 spec
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.template > 3 {
+            return Err("Template ID must be 0–3");
+        }
+        if self.at_pixels.len() > 4 {
+            return Err("Maximum 4 AT pixels allowed");
+        }
+        if self.comb_operator > 4 {
+            return Err("Invalid combination operator");
+        }
+        Ok(())
+    }
     pub fn to_bytes(&self) -> Vec<u8> {
         use byteorder::{BigEndian, WriteBytesExt};
-        // 18 bytes (width, height, x, y, comb_op, flags) + AT bytes (8 if template == 0, 4 otherwise)
-        let mut buf = Vec::with_capacity(18 + if self.template == 0 { 8 } else { 4 });
-        
+        // 18 bytes (width, height, x, y, comb_op, flags) + AT bytes
+        let at_count = match self.template {
+            0 => 4, // Template 0 writes 4 AT pixels to match C behavior
+            1 => 1, // Template 1 uses 1 AT pixel
+            _ => 0, // Templates 2-3 use 0
+        };
+        let mut buf = Vec::with_capacity(18 + at_count * 2);
+
         buf.write_u32::<BigEndian>(self.width).unwrap();
         buf.write_u32::<BigEndian>(self.height).unwrap();
         buf.write_u32::<BigEndian>(self.x).unwrap();
         buf.write_u32::<BigEndian>(self.y).unwrap();
         buf.push(self.comb_operator);
-        
+
         let mut flags = 0u8;
         if self.mmr {
             flags |= 0x01; // Bit 0: MMR (only for MMR coding)
@@ -207,12 +326,19 @@ impl GenericRegionParams {
         // Bits 4-7 are reserved and set to 0
         buf.push(flags);
 
-        // Write AT coordinates: all 4 pairs if template == 0, first 2 pairs otherwise
+        // Write AT coordinates to match C implementation behavior:
+        // Template 0: 4 AT pixels (despite JBIG2 spec saying 0)
+        // Template 1: 1 AT pixel
+        // Template 2: 0 AT pixels
+        // Template 3: 0 AT pixels
         let at_count = match self.template {
-            0 => 4,   // Header requires 4 but context uses 0
-            1 => 1,   // Template 1 uses 1 AT pixel
-            _ => 0,   // Templates 2-3 use 0
+            0 => 4, // Template 0 writes 4 AT pixels to match C behavior
+            1 => 1, // Template 1 uses 1 AT pixel
+            _ => 0, // Templates 2-3 use 0
         };
+        for i in 0..at_count {
+            buf.push(self.at[i].0 as u8);
+            buf.push(self.at[i].1 as u8);
         }
         buf
     }
@@ -226,16 +352,16 @@ pub struct GenericRegionConfig {
     pub height: u32,
     pub x: u32,
     pub y: u32,
-    pub comb_operator: u8,  // Combination operator (0 = OR, 1 = AND, etc.)
+    pub comb_operator: u8, // Combination operator (0 = OR, 1 = AND, etc.)
 
     // Arithmetic encoding parameters
-    pub template: u8,        // Template ID (0–3)
-    pub tpgdon: bool,        // Typical prediction generic decoding
-    pub mmr: bool,           // MMR coding (true) or arithmetic (false)
+    pub template: u8,             // Template ID (0–3)
+    pub tpgdon: bool,             // Typical prediction generic decoding
+    pub mmr: bool,                // MMR coding (true) or arithmetic (false)
     pub at_pixels: Vec<(i8, i8)>, // Adaptive template pixels (dx, dy)
 
     // Metadata (optional, for page info alignment)
-    pub dpi: u32,            // Resolution in DPI
+    pub dpi: u32, // Resolution in DPI
 }
 
 impl GenericRegionConfig {
@@ -248,9 +374,10 @@ impl GenericRegionConfig {
             y: 0,
             comb_operator: 0, // Default to OR
             template: 0,      // Default to template 0
-            tpgdon: true,     // Enable typical prediction
-            at_pixels: vec![(3, -1), (-3, -1), (2, -2), (-2, -2)], // Standard AT pixels
-            mmr: false,         // Default to arithmetic coding
+            tpgdon: false,    // Disable typical prediction for testing
+            // Template 0 default AT pixels to match C encoder (even though spec says none needed)
+            at_pixels: vec![(3, -1), (-3, -1), (2, -2), (-2, -2)],
+            mmr: false, // Default to arithmetic coding
             dpi,
         }
     }
@@ -270,6 +397,12 @@ impl GenericRegionConfig {
     }
 }
 
+impl Default for GenericRegionConfig {
+    fn default() -> Self {
+        Self::new(0, 0, 300)
+    }
+}
+
 impl From<GenericRegionConfig> for GenericRegionParams {
     fn from(cfg: GenericRegionConfig) -> Self {
         let mut at = [(0i8, 0i8); 4];
@@ -282,10 +415,11 @@ impl From<GenericRegionConfig> for GenericRegionParams {
             x: cfg.x,
             y: cfg.y,
             comb_operator: cfg.comb_operator,
-            mmr: cfg.mmr,      // MMR coding flag from config
+            mmr: cfg.mmr, // MMR coding flag from config
             template: cfg.template,
             tpgdon: cfg.tpgdon,
             at,
+            at_pixels: cfg.at_pixels.clone(),
         }
     }
 }
@@ -297,10 +431,10 @@ impl From<GenericRegionConfig> for GenericRegionParams {
 /// Represents the parameters for a symbol dictionary segment
 #[derive(Debug)]
 pub struct SymbolDictParams {
-    pub sd_template: u8, // Symbol dictionary template (0-3)
+    pub sd_template: u8,   // Symbol dictionary template (0-3)
     pub at: [(i8, i8); 4], // Adaptive template coordinates (a1x, a1y, ..., a4x, a4y)
-    pub exsyms: u32,     // Number of exported symbols
-    pub newsyms: u32,    // Number of new symbols
+    pub exsyms: u32,       // Number of exported symbols
+    pub newsyms: u32,      // Number of new symbols
 }
 
 impl SymbolDictParams {
@@ -358,7 +492,7 @@ impl TextRegionParams {
             sbrflags |= 1 << 6; // TRANSPOSED
         }
         sbrflags |= ((self.comb_op as u16) & 0x03) << 7; // SBCOMBOP
-        // SBDEFPIXEL is 0
+                                                         // SBDEFPIXEL is 0
         sbrflags |= ((self.ds_offset as u16) & 0x1F) << 10; // SBDSOFFSET
         if self.refine && self.refine_template == 1 {
             sbrflags |= 1 << 15; // SBRTEMPLATE
