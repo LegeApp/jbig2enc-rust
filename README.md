@@ -1,0 +1,1 @@
+Working JBIG2enc Rust port. Not sure if faster or slower than original, but it's 100% Rust. Symbol mode not working, but it could with a few tweaks...and it didn't work in the original either. Only arithmetic mode but it's better than MMR and it's all it needs. Supports standalone and PDF fragment mode.
