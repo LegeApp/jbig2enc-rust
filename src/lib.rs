@@ -4,7 +4,7 @@
 //! It supports both standalone JBIG2 files and PDF-embedded fragments with proper
 //! global dictionary handling.
 
-#![warn(missing_docs)]
+#![allow(missing_docs)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]
@@ -163,7 +163,6 @@ impl Jbig2Context {
     pub fn get_symbol_mode(&self) -> bool {
         self.config.symbol_mode
     }
-
 
     /// Get the DPI setting
     pub fn get_dpi(&self) -> u32 {

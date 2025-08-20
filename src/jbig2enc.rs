@@ -38,7 +38,7 @@ macro_rules! trace {
 use crate::{debug, trace};
 
 use ndarray::Array2;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::hash::{Hash, Hasher};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -159,10 +159,10 @@ pub struct Jbig2Encoder<'a> {
     symbol_usage: Vec<usize>,
 
     /// Set of page indices where each symbol appears
-    symbol_pages: Vec<HashSet<usize>>,
+    symbol_pages: Vec<FxHashSet<usize>>,
 
     /// Hash map for quick symbol lookup
-    hash_map: HashMap<HashKey, Vec<usize>>,
+    hash_map: FxHashMap<HashKey, Vec<usize>>,
 
     /// Page data for each page in the document
     pages: Vec<PageData>,
@@ -196,7 +196,7 @@ impl<'a> Jbig2Encoder<'a> {
             global_symbols: Vec::new(),
             symbol_usage: Vec::new(),
             symbol_pages: Vec::new(),
-            hash_map: HashMap::new(),
+            hash_map: FxHashMap::default(),
             pages: Vec::new(),
             next_segment_number: 0,
             global_dict_segment_number: None,
@@ -246,7 +246,7 @@ impl<'a> Jbig2Encoder<'a> {
                     let mut matched = false;
                     if let Some(bucket) = self.hash_map.get(&key) {
                         for &idx in bucket {
-            // Allow very small differences between symbols (up to 2% of pixels)
+                            // Allow very small differences between symbols (up to 2% of pixels)
                             let max_err = ((trimmed.width * trimmed.height) / 50).max(1) as u32;
                             if comparator
                                 .distance(&trimmed, &self.global_symbols[idx], max_err)
@@ -543,7 +543,7 @@ impl<'a> Jbig2Encoder<'a> {
     }
 
     fn auto_threshold_using_hash(&mut self) -> Result<()> {
-        let mut hashed_templates: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut hashed_templates: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
         for (i, symbol) in self.global_symbols.iter().enumerate() {
             let hash = compute_symbol_hash(symbol);
             hashed_templates.entry(hash).or_default().push(i);
@@ -749,7 +749,7 @@ pub fn encode_symbol_dict(
     }
 
     // Deduplicate symbols by content hash
-    let mut seen_hashes = std::collections::HashSet::new();
+    let mut seen_hashes = FxHashSet::default();
     let mut unique_symbols_list: Vec<&BitImage> = Vec::with_capacity(symbols.len());
     for sym in symbols {
         if seen_hashes.insert(hash_key(sym)) {
@@ -1485,6 +1485,7 @@ pub fn get_version() -> &'static str {
     "0.2.0"
 }
 
+#[inline]
 pub fn hash_key(img: &BitImage) -> HashKey {
     // Use xxh3 for fast hashing of the bitmap data
     let hash = xxh3_64(img.as_bytes());

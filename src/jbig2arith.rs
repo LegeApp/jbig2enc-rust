@@ -8,6 +8,7 @@
 
 use anyhow::anyhow;
 use anyhow::Result;
+use rustc_hash::FxHashMap;
 use lazy_static::lazy_static;
 
 #[cfg(not(feature = "trace_arith"))]
@@ -402,6 +403,7 @@ impl Jbig2ArithCoder {
     }
 
     /// Writes one (or two) bytes to the output buffer according to Annex E.9.
+    #[inline]
     fn byte_out(&mut self) {
         if self.b == 0xFF {
             if self.bp >= 0 {
@@ -468,6 +470,7 @@ impl Jbig2ArithCoder {
     }
 
     /// Encodes a single bit `d` in the given context `ctx`.
+    #[inline(always)]
     pub fn encode_bit(&mut self, ctx: usize, d: bool) {
         let state_idx = self.context[ctx];
         let state = FULL[state_idx];
@@ -516,6 +519,7 @@ impl Jbig2ArithCoder {
     }
 
     /// Encodes an integer `v` of `bits` width using a specific context `ctx`.
+    #[inline]
     pub fn encode_int_with_ctx(&mut self, v: i32, bits: i32, ctx: IntProc) -> anyhow::Result<()> {
         let mut prev = 1usize;
         for i in (0..bits).rev() {
@@ -752,7 +756,7 @@ impl Jbig2ArithCoder {
             Self::sample(packed, width, height, x, y) as u8
         };
 
-        let mut context_distribution = std::collections::HashMap::new();
+    let mut context_distribution: FxHashMap<usize, usize> = FxHashMap::default();
         let progress_interval = (height as f32 * 0.1).ceil() as i32;
         let mut last_reported_progress = -1;
 
@@ -827,6 +831,7 @@ impl Jbig2ArithCoder {
     ///
     /// Reads from packed data in row-major order with MSb-first bit orientation,
     /// matching the format produced by BitImage::to_packed_words().
+    #[inline(always)]
     fn sample(packed: &[u32], width: usize, height: usize, x: i32, y: i32) -> u32 {
         let result = if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
             #[cfg(debug_assertions)]

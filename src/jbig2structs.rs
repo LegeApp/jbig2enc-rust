@@ -33,6 +33,9 @@ pub struct Jbig2Config {
     pub text_comb_op: u8,         // SBCOMBOP (0-4)
     pub text_refine_template: u8, // SBRTEMPLATE (0 or 1)
 
+    // Halftone region settings
+    pub halftone: HalftoneConfig,
+
     // Global settings
     pub dpi: u32,
     pub symbol_mode: bool,
@@ -44,6 +47,34 @@ pub struct Jbig2Config {
     pub want_full_headers: bool,
     pub is_lossless: bool,
     pub default_pixel: bool,
+}
+
+/// Configuration for halftone encoding
+#[derive(Debug, Clone, Copy)]
+pub struct HalftoneConfig {
+    /// The grid size (M x M) for decimation and pattern generation.
+    pub grid_size_m: u32,
+    /// The number of quantization levels (N).
+    pub quant_levels_n: u32,
+    /// Sharpening control parameter (L), typically between 0.0 and 2.0.
+    pub sharpening_l: f32,
+    /// The template to use for encoding grayscale bitplanes (usually 0).
+    pub template: u8,
+    /// Whether to use lossless encoding (true) or lossy encoding (false).
+    /// Lossless guarantees bit-perfect reconstruction but produces larger files.
+    pub lossless: bool,
+}
+
+impl Default for HalftoneConfig {
+    fn default() -> Self {
+        Self {
+            grid_size_m: 4, // 4x4 grid is a common default
+            quant_levels_n: 16, // 16 gray levels
+            sharpening_l: 0.5, // A moderate amount of sharpening
+            template: 0,
+            lossless: false, // Default to lossy encoding for better compression
+        }
+    }
 }
 
 impl Default for Jbig2Config {
@@ -59,6 +90,7 @@ impl Default for Jbig2Config {
             text_transposed: false,
             text_comb_op: 0,
             text_refine_template: 0,
+            halftone: HalftoneConfig::default(),
             dpi: 300,
             symbol_mode: true,
             refine: false,
@@ -502,6 +534,51 @@ impl TextRegionParams {
         if self.refine && self.refine_template == 1 {
             buf.write_u8(self.refine_template).unwrap();
         }
+        buf
+    }
+}
+
+/// Parameters for a JBIG2 halftone region segment
+#[derive(Debug, Clone, Default)]
+pub struct HalftoneParams {
+    pub width: u32,
+    pub height: u32,
+    pub x: u32,
+    pub y: u32,
+    pub grid_width: u32,  // HGRIDW
+    pub grid_height: u32, // HGRIDH
+    pub grid_x: u16,      // HGRIDX
+    pub grid_y: u16,      // HGRIDY
+    pub grid_vector_x: u16, // HVECX
+    pub grid_vector_y: u16, // HVECY
+    pub pattern_width: u8,  // HPW
+    pub pattern_height: u8, // HPH
+    pub template: u8,       // HTEMPLATE (0-3)
+}
+
+impl HalftoneParams {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(26);
+        buf.write_u32::<BigEndian>(self.width).unwrap();
+        buf.write_u32::<BigEndian>(self.height).unwrap();
+        buf.write_u32::<BigEndian>(self.x).unwrap();
+        buf.write_u32::<BigEndian>(self.y).unwrap();
+        
+        let mut flags = 0u8;
+        // HMMR is 0 for arithmetic coding
+        flags |= (self.template & 0x03) << 1; // HTEMPLATE bits 1-2
+        
+        buf.write_u8(flags).unwrap();
+        
+        buf.write_u32::<BigEndian>(self.grid_width).unwrap();
+        buf.write_u32::<BigEndian>(self.grid_height).unwrap();
+        buf.write_u16::<BigEndian>(self.grid_x).unwrap();
+        buf.write_u16::<BigEndian>(self.grid_y).unwrap();
+        buf.write_u16::<BigEndian>(self.grid_vector_x).unwrap();
+        buf.write_u16::<BigEndian>(self.grid_vector_y).unwrap();
+        buf.write_u8(self.pattern_width).unwrap();
+        buf.write_u8(self.pattern_height).unwrap();
+        
         buf
     }
 }

@@ -6,7 +6,7 @@
 use crate::jbig2shared::{save_debug_pbm, usize_to_u32};
 use crate::jbig2sym::{compute_glyph_hash, BitImage, Rect, Symbol};
 // Image import removed as it's not used
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 /// A connected component with bounding box and pixel information
 #[derive(Debug, Clone, PartialEq)]
@@ -76,7 +76,7 @@ impl SymbolExtractionConfig {
 
         // Balanced filtering - remove noise but preserve punctuation
         cfg.min_component_size = if config.auto_thresh { 12 } else { 10 };
-        
+
         // More restrictive dot detection to avoid fragmenting characters
         cfg.max_dot_area_ratio = 0.05; // Reduced from 0.1
         cfg.max_dot_height_ratio = 0.3; // Reduced from 0.5
@@ -224,7 +224,7 @@ fn merge_dots(
 ) -> Vec<(usize, usize)> {
     const MAX_HORIZONTAL_TOLERANCE: u32 = 1;
     let max_vertical_distance = calculate_vertical_merge_distance(components, 10);
-    let mut skip_indices = HashSet::new();
+    let mut skip_indices = FxHashSet::default();
     let mut merges = Vec::new();
 
     for &dot_idx in dot_indices {
@@ -414,7 +414,7 @@ pub fn extract_symbols(image: &BitImage, config: SymbolExtractionConfig) -> Vec<
     apply_merges(&mut components, &merges);
 
     let mut symbols = Vec::new();
-    let mut processed: HashSet<u64> = HashSet::new();
+    let mut processed: FxHashSet<u64> = FxHashSet::default();
 
     for (i, component) in components.iter().enumerate() {
         let rect = component.bounds;
@@ -498,44 +498,54 @@ fn consolidate_symbols(mut symbols: Vec<(Rect, Symbol)>) -> Vec<(Rect, Symbol)> 
     if symbols.len() <= 50 {
         return symbols; // Already reasonable size
     }
-    
+
     // Cap at 200 symbols to prevent performance issues
     if symbols.len() > 200 {
         symbols.truncate(200);
-        eprintln!("Warning: Too many symbols ({}), truncated to 200 to prevent performance issues", symbols.len());
+        eprintln!(
+            "Warning: Too many symbols ({}), truncated to 200 to prevent performance issues",
+            symbols.len()
+        );
     }
-    
+
     use crate::jbig2comparator::Comparator;
     let mut comparator = Comparator::default();
     let mut consolidated = Vec::new();
     let mut used = vec![false; symbols.len()];
-    
+
     for i in 0..symbols.len() {
         if used[i] {
             continue;
         }
-        
+
         let (rect_i, ref symbol_i) = symbols[i];
         consolidated.push((rect_i, symbol_i.clone()));
         used[i] = true;
-        
+
         // Find similar symbols to merge with this one
         for j in (i + 1)..symbols.len() {
             if used[j] {
                 continue;
             }
-            
+
             let (_, ref symbol_j) = symbols[j];
-            
+
             // Allow up to 3% pixel difference for consolidation (more conservative)
             let max_err = ((symbol_i.image.width * symbol_i.image.height) / 33).max(1) as u32;
-            
-            if comparator.distance(&symbol_i.image, &symbol_j.image, max_err).is_some() {
+
+            if comparator
+                .distance(&symbol_i.image, &symbol_j.image, max_err)
+                .is_some()
+            {
                 used[j] = true; // Mark as consolidated
             }
         }
     }
-    
-    eprintln!("Symbol consolidation: {} -> {} symbols", symbols.len(), consolidated.len());
+
+    eprintln!(
+        "Symbol consolidation: {} -> {} symbols",
+        symbols.len(),
+        consolidated.len()
+    );
     consolidated
 }
