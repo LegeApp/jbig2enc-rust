@@ -1,3 +1,5 @@
 8/20/25 - Standard decoder compatible halftone area encoding support added! Jbig2enc doesnt have that 
 
 Working JBIG2enc Rust port. Not sure if faster or slower than original, but it's 100% Rust. Symbol mode not working, but it could with a few tweaks...and it didn't work in the original either. Only arithmetic mode but it's better than MMR and it's all it needs. Supports standalone and PDF fragment mode.
+
+License - considered a derivative work of JBIG2Enc which is Apache license, so all you have to do is display the original license in your program somewhere if you use this port in your code.
