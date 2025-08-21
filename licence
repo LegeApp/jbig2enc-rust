@@ -1,4 +1,4 @@
-This is a Rust port of JBIG2enc, about 30% of the code is original, but the rest is nearly direct port of the original C++, using the original standard PDF as reference for correctness. Lutz crate is used in place of the Leptonica usage for symbol dictionary encoding.
+This is a Rust port of JBIG2enc, about 30% of the code is original, the rest is nearly direct port of the original C++, using the original standard PDF as reference for correctness. Lutz crate is used in place of the Leptonica usage for symbol dictionary encoding.
 
 Copyright 2006 Google Inc. All Rights Reserved.
 Author: agl@imperialviolet.org (Adam Langley)
