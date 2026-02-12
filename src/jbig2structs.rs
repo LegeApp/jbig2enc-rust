@@ -68,9 +68,9 @@ pub struct HalftoneConfig {
 impl Default for HalftoneConfig {
     fn default() -> Self {
         Self {
-            grid_size_m: 4, // 4x4 grid is a common default
+            grid_size_m: 4,     // 4x4 grid is a common default
             quant_levels_n: 16, // 16 gray levels
-            sharpening_l: 0.5, // A moderate amount of sharpening
+            sharpening_l: 0.5,  // A moderate amount of sharpening
             template: 0,
             lossless: false, // Default to lossy encoding for better compression
         }
@@ -93,7 +93,7 @@ impl Default for Jbig2Config {
             halftone: HalftoneConfig::default(),
             dpi: 300,
             symbol_mode: true,
-            refine: false,
+            refine: true, // Enable refinement by default for better compression (requires symbol_mode=true)
             refine_template: 0,
             duplicate_line_removal: true,
             auto_thresh: true,
@@ -124,6 +124,7 @@ impl Jbig2Config {
     pub fn lossless() -> Self {
         let mut cfg = Self::default();
         cfg.symbol_mode = false;
+        cfg.refine = false; // Disable refinement when symbol mode is disabled
         cfg.is_lossless = true;
         cfg.duplicate_line_removal = false;
         cfg
@@ -545,10 +546,10 @@ pub struct HalftoneParams {
     pub height: u32,
     pub x: u32,
     pub y: u32,
-    pub grid_width: u32,  // HGRIDW
-    pub grid_height: u32, // HGRIDH
-    pub grid_x: u16,      // HGRIDX
-    pub grid_y: u16,      // HGRIDY
+    pub grid_width: u32,    // HGRIDW
+    pub grid_height: u32,   // HGRIDH
+    pub grid_x: u16,        // HGRIDX
+    pub grid_y: u16,        // HGRIDY
     pub grid_vector_x: u16, // HVECX
     pub grid_vector_y: u16, // HVECY
     pub pattern_width: u8,  // HPW
@@ -563,13 +564,13 @@ impl HalftoneParams {
         buf.write_u32::<BigEndian>(self.height).unwrap();
         buf.write_u32::<BigEndian>(self.x).unwrap();
         buf.write_u32::<BigEndian>(self.y).unwrap();
-        
+
         let mut flags = 0u8;
         // HMMR is 0 for arithmetic coding
         flags |= (self.template & 0x03) << 1; // HTEMPLATE bits 1-2
-        
+
         buf.write_u8(flags).unwrap();
-        
+
         buf.write_u32::<BigEndian>(self.grid_width).unwrap();
         buf.write_u32::<BigEndian>(self.grid_height).unwrap();
         buf.write_u16::<BigEndian>(self.grid_x).unwrap();
@@ -578,7 +579,7 @@ impl HalftoneParams {
         buf.write_u16::<BigEndian>(self.grid_vector_y).unwrap();
         buf.write_u8(self.pattern_width).unwrap();
         buf.write_u8(self.pattern_height).unwrap();
-        
+
         buf
     }
 }
@@ -612,61 +613,43 @@ impl Segment {
     pub fn write_into<W: Write>(&self, w: &mut W) -> io::Result<()> {
         w.write_u32::<BigEndian>(self.number)?;
 
-        let page_num_val = self.page.unwrap_or(0);
-        let page_size_is_4_bytes = self.page_association_type <= 1 && page_num_val > 0xFF;
+        // First flags byte: bits 0-5 = segment type, bit 6 = page association size (0=1 byte, 1=4 bytes), bit 7 = deferred non-retain
+        // Always use 4-byte page association for compatibility and simplicity
+        let page_size_is_4_bytes = true;
         let flags1 = (self.seg_type as u8 & 0x3F)
             | ((page_size_is_4_bytes as u8) << 6)
             | ((self.deferred_non_retain as u8) << 7);
         w.write_u8(flags1)?;
 
+        // Referred-to segment count and retention flags field
         let referred_to_count = self.referred_to.len();
-        let mut referred_to_count_is_extended = false;
-        let segment_count = if referred_to_count <= 7 {
-            referred_to_count as u8
+        if referred_to_count <= 4 {
+            // Short form: one byte with high 3 bits = count, low 5 bits = (count+1) retention flags (we write zeros)
+            let byte = ((referred_to_count as u8) << 5) | 0x00;
+            w.write_u8(byte)?;
         } else {
-            referred_to_count_is_extended = true;
-            7
-        };
-        let flags2 = (self.page_association_type & 0x03)
-            | ((self.retain_flags & 0x1F) << 2) // 5 bits for retain_flags
-            | (segment_count << 5);
-        w.write_u8(flags2)?;
-
-        if referred_to_count_is_extended {
+            // Long form: write 0b111xxxxx then varint count then (count+1) retention bits padded to byte boundary
+            w.write_u8(0xE0)?; // 1110 0000
             let mut varint_buf = Vec::new();
             encode_varint(referred_to_count as u32, &mut varint_buf);
             w.write_all(&varint_buf)?;
+            // Write (n+1) zero bits padded to bytes
+            let retain_bits = referred_to_count + 1;
+            let retain_bytes = (retain_bits + 7) / 8;
+            for _ in 0..retain_bytes {
+                w.write_u8(0x00)?;
+            }
         }
 
-        let ref_num_size = if self.number <= 0xFF {
-            1
-        } else if self.number <= 0xFFFF {
-            2
-        } else {
-            4
-        };
+        // Referred-to segment numbers: use 4 bytes per spec-friendly encoding (matches our 4-byte segment numbers)
         for &r_num in &self.referred_to {
-            match ref_num_size {
-                1 => w.write_u8(r_num as u8)?,
-                2 => w.write_u16::<BigEndian>(r_num as u16)?,
-                _ => w.write_u32::<BigEndian>(r_num)?,
-            }
+            w.write_u32::<BigEndian>(r_num)?;
         }
 
-        if self.page_association_type <= 1 {
-            if let Some(p_num) = self.page {
-                if page_size_is_4_bytes {
-                    w.write_u32::<BigEndian>(p_num)?;
-                } else {
-                    w.write_u8(p_num as u8)?;
-                }
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Page number required for explicit or deferred association",
-                ));
-            }
-        }
+        // Page association field (always present in this writer):
+        // Use 0 to indicate global/all-pages when self.page is None
+        let p_num = self.page.unwrap_or(0);
+        w.write_u32::<BigEndian>(p_num)?;
 
         let payload_len = self.payload.len() as u32;
         debug!("Segment {} payload length: {}", self.number, payload_len);
