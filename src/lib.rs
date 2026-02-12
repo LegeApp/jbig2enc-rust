@@ -12,13 +12,10 @@
 // Re-export commonly used types
 pub use ndarray::Array2;
 
-use thiserror::Error;
-
 /// Errors that can occur during JBIG2 encoding
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum Jbig2Error {
     /// Input buffer size mismatch
-    #[error("Input buffer size mismatch: expected {expected}, got {actual} for {width}x{height} image (ratio: {ratio:.3})")]
     BufferSizeMismatch {
         expected: usize,
         actual: usize,
@@ -28,46 +25,85 @@ pub enum Jbig2Error {
     },
 
     /// Buffer too small for operation
-    #[error("Buffer too small: expected {expected}, got {actual}")]
     BufferTooSmall { expected: usize, actual: usize },
 
     /// Array shape error during conversion
-    #[error("Array shape error")]
     ArrayShapeError {
-        #[from]
         source: ndarray::ShapeError,
     },
 
     /// Encoding failed
-    #[error("Encoding failed: {message}")]
     EncodingFailed { message: String },
 
     /// Dictionary creation failed  
-    #[error("Dictionary creation failed: {message}")]
     DictionaryFailed { message: String },
 
     /// Packed binary data detected when unpacked expected
-    #[error("Input appears to be packed binary data (1 bit per pixel), but JBIG2 encoder expects unpacked data (1 byte per pixel)")]
     PackedDataDetected,
 
     /// Stream count mismatch
-    #[error("Expected {expected} stream(s) for single image encoding, got {actual}")]
     StreamCountMismatch { expected: usize, actual: usize },
 
     /// Segment writing failed
-    #[error("Failed to write {segment_type} segment: {message}")]
     SegmentWriteFailed {
         segment_type: String,
         message: String,
     },
 }
 
+impl std::fmt::Display for Jbig2Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Jbig2Error::BufferSizeMismatch { expected, actual, width, height, ratio } => {
+                write!(f, "Input buffer size mismatch: expected {}, got {} for {}x{} image (ratio: {:.3})",
+                       expected, actual, width, height, ratio)
+            }
+            Jbig2Error::BufferTooSmall { expected, actual } => {
+                write!(f, "Buffer too small: expected {}, got {}", expected, actual)
+            }
+            Jbig2Error::ArrayShapeError { source } => {
+                write!(f, "Array shape error: {}", source)
+            }
+            Jbig2Error::EncodingFailed { message } => {
+                write!(f, "Encoding failed: {}", message)
+            }
+            Jbig2Error::DictionaryFailed { message } => {
+                write!(f, "Dictionary creation failed: {}", message)
+            }
+            Jbig2Error::PackedDataDetected => {
+                write!(f, "Input appears to be packed binary data (1 bit per pixel), but JBIG2 encoder expects unpacked data (1 byte per pixel)")
+            }
+            Jbig2Error::StreamCountMismatch { expected, actual } => {
+                write!(f, "Expected {} stream(s) for single image encoding, got {}", expected, actual)
+            }
+            Jbig2Error::SegmentWriteFailed { segment_type, message } => {
+                write!(f, "Failed to write {} segment: {}", segment_type, message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for Jbig2Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Jbig2Error::ArrayShapeError { source } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<ndarray::ShapeError> for Jbig2Error {
+    fn from(source: ndarray::ShapeError) -> Self {
+        Jbig2Error::ArrayShapeError { source }
+    }
+}
+
 // Module declarations
 pub mod jbig2arith;
 pub mod jbig2comparator;
 pub mod jbig2enc;
-pub mod jbig2lutz;
-pub mod jbig2pdf;
+#[cfg(feature = "cc-analysis")]
+pub mod jbig2cc;
 pub mod jbig2shared;
 pub mod jbig2structs;
 pub mod jbig2sym;
@@ -76,10 +112,12 @@ pub mod jbig2sym;
 pub use crate::jbig2arith::Jbig2ArithCoder;
 pub use jbig2enc::encode_document;
 pub use jbig2structs::Jbig2Config;
+#[cfg(feature = "cc-analysis")]
+pub use jbig2cc::{analyze_page, extract_symbols_for_jbig2, BBox, CCImage, CC, Run};
 
 use jbig2enc::Jbig2Encoder;
 use log::info;
-use std::{env, io::Write};
+use std::env;
 
 // Constants for default thresholds (symbol classification only)
 const JBIG2_THRESHOLD_DEF: f32 = 0.92;
@@ -133,21 +171,21 @@ impl Jbig2Context {
         }
     }
 
-    /// Create a new context with lossless configuration (no symbol dictionaries)
-    /// This is useful for PDF embedding when symbol dictionaries cause display issues
-    pub fn with_lossless_config(pdf_mode: bool) -> Self {
+    /// Create a new context with custom configuration
+    pub fn with_config(config: Jbig2Config, pdf_mode: bool) -> Self {
         Self {
-            config: Jbig2Config::lossless(),
+            config,
             threshold: JBIG2_THRESHOLD_DEF,
             weight: JBIG2_WEIGHT_DEF,
             pdf_mode,
         }
     }
 
-    /// Create a new context with custom config
-    pub fn with_config(config: Jbig2Config, pdf_mode: bool) -> Self {
+    /// Create a new context with lossless configuration (no symbol dictionaries)
+    /// This is useful for PDF embedding when symbol dictionaries cause display issues
+    pub fn with_lossless_config(pdf_mode: bool) -> Self {
         Self {
-            config,
+            config: Jbig2Config::lossless(),
             threshold: JBIG2_THRESHOLD_DEF,
             weight: JBIG2_WEIGHT_DEF,
             pdf_mode,
@@ -316,12 +354,14 @@ pub fn encode_rois(
         ctx.get_pdf_mode()
     );
 
-    // Initialize encoder configuration
-    let mut enc_config = Jbig2Config::default();
-    enc_config.symbol_mode = ctx.get_symbol_mode();
-    enc_config.dpi = ctx.get_dpi();
+    // Initialize encoder configuration - use the context's config instead of default
+    let mut enc_config = ctx.config.clone();
     enc_config.want_full_headers = !ctx.get_pdf_mode(); // PDF mode shouldn't have file headers
     enc_config.auto_thresh = false; // Disable auto-threshold to avoid index errors
+                                    // IMPORTANT: Disable refinement to ensure text regions are encoded with payloads
+                                    // The current encoder's refine path is not wired in `flush()`, which can
+                                    // lead to empty ImmediateTextRegion payloads and invalid JBIG2 files.
+    enc_config.refine = false;
 
     // For PDF mode with symbol encoding, create global dictionary
     let global_dict = if ctx.get_symbol_mode() && ctx.get_pdf_mode() {

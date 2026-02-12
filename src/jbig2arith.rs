@@ -8,8 +8,8 @@
 
 use anyhow::anyhow;
 use anyhow::Result;
-use rustc_hash::FxHashMap;
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
 
 #[cfg(not(feature = "trace_arith"))]
 #[macro_use]
@@ -22,8 +22,6 @@ mod trace_stubs {
     }
 }
 
-#[cfg(not(feature = "trace_arith"))]
-use trace_stubs::*;
 
 const JBIG2_MAX_CTX: usize = 65536;
 const TPGD_CTX: u32 = 0x9B25;
@@ -246,34 +244,32 @@ pub const BASE: [State; 47] = [
 ];
 
 /// Build the 94-state table at start-up.
-lazy_static! {
-    pub(crate) static ref FULL: [State; 94] = {
-        let mut t = [BASE[0]; 94];
+pub(crate) static FULL: Lazy<[State; 94]> = Lazy::new(|| {
+    let mut t = [BASE[0]; 94];
 
-        for i in 0..47 {
-            let s = BASE[i];
+    for i in 0..47 {
+        let s = BASE[i];
 
-            // Lower half: MPS = 0
-            t[i] = State {
-                qe: s.qe,
-                nmps: s.nmps,           // stays in lower half
-                nlps: if s.switch { s.nlps + 47 } else { s.nlps },
-                switch: s.switch,
-            };
+        // Lower half: MPS = 0
+        t[i] = State {
+            qe: s.qe,
+            nmps: s.nmps,           // stays in lower half
+            nlps: if s.switch { s.nlps + 47 } else { s.nlps },
+            switch: s.switch,
+        };
 
-            // Upper half: MPS = 1
-            t[i + 47] = State {
-                qe: s.qe,
-                nmps: s.nmps + 47,      // stays in upper half
-                // If LPS flips the MPS we must leave the upper half
-                nlps: if s.switch { s.nlps } else { s.nlps + 47 },
-                switch: s.switch,
-            };
-        }
+        // Upper half: MPS = 1
+        t[i + 47] = State {
+            qe: s.qe,
+            nmps: s.nmps + 47,      // stays in upper half
+            // If LPS flips the MPS we must leave the upper half
+            nlps: if s.switch { s.nlps } else { s.nlps + 47 },
+            switch: s.switch,
+        };
+    }
 
-        t
-    };
-}
+    t
+});
 
 /// Context-adaptive arithmetic encoder for JBIG2.
 const NUM_REFINEMENT_CX_STATES: usize = 17; // For GRTEMPLATE=0, contexts 0-16
@@ -536,6 +532,44 @@ impl Jbig2ArithCoder {
         Ok(())
     }
 
+    /// Encodes a symbol ID using the IAID (Index Arithmetic Integer Decoding) procedure.
+    /// This is used for encoding symbol IDs in text region segments.
+    /// 
+    /// # Arguments
+    /// * `symbol_id` - The symbol ID to encode (0-indexed)
+    /// * `symbol_code_len` - The number of bits needed to represent all symbol IDs (SBSYMCODELEN)
+    /// 
+    /// According to JBIG2 spec Annex A.3:
+    /// 1. Set PREV = 1
+    /// 2. For each bit: context CX = IAID + PREV, then PREV = (PREV << 1) | bit
+    /// 3. After all bits decoded, PREV = PREV - 2^SBSYMCODELEN (clear leading 1)
+    /// 
+    /// The number of contexts required is 2^SBSYMCODELEN.
+    #[inline]
+    pub fn encode_iaid(&mut self, symbol_id: u32, symbol_code_len: u32) -> anyhow::Result<()> {
+        // Initialize PREV to 1 (leading 1 bit per spec)
+        let mut prev: usize = 1;
+        
+        // Encode each bit from most significant to least significant
+        for i in (0..symbol_code_len).rev() {
+            let bit = ((symbol_id >> i) & 1) != 0;
+            
+            // Context is PREV (which includes the leading 1 and all previously encoded bits)
+            // The rightmost (SBSYMCODELEN+1) bits of PREV are used
+            // Since we have at most symbol_code_len bits + leading 1, this is at most 2^(symbol_code_len+1)-1
+            // But the spec says we need 2^SBSYMCODELEN contexts, so we use the full PREV value
+            let ctx_idx = prev & ((1 << (symbol_code_len + 1)) - 1);
+            let ctx_idx = ctx_idx.min(511); // Limit to array bounds
+            let state_idx = self.iaid_ctx[ctx_idx];
+            self.encode_bit(state_idx, bit);
+            
+            // Update PREV: shift left and add new bit (keep the leading 1)
+            prev = (prev << 1) | (bit as usize);
+        }
+        
+        Ok(())
+    }
+
     /// Encodes an integer using the specified procedure.
     pub fn encode_integer(&mut self, proc: IntProc, value: i32) -> anyhow::Result<()> {
         if !(-2_000_000_000..=2_000_000_000).contains(&value) {
@@ -572,6 +606,51 @@ impl Jbig2ArithCoder {
                 (prev_ctx << 1) | bit as u32
             };
         }
+        Ok(())
+    }
+
+    /// Encodes an Out-of-Band (OOB) value for a given integer procedure.
+    /// The OOB signal is the bit pattern '1000' as per Table A.1 in the JBIG2 specification.
+    pub fn encode_oob(&mut self, proc: IntProc) -> anyhow::Result<()> {
+        let context_idx = proc as usize;
+        let mut prev_ctx = 0u32; // Initial PREV value for integer coding (start with 0, same as encode_integer)
+
+        // Encode the OOB bit pattern '1000'
+        // Bit 1 (first bit is '1')
+        let c_usize = (prev_ctx & 0xFF) as usize;
+        let state = &self.int_ctx[context_idx][c_usize];
+        self.encode_bit(*state, true);
+        prev_ctx = if prev_ctx & 0x100 != 0 {
+            ((prev_ctx << 1) | 1) & 0x1ff | 0x100
+        } else {
+            (prev_ctx << 1) | 1
+        };
+
+        // Bit 0 (second bit is '0')
+        let c_usize = (prev_ctx & 0xFF) as usize;
+        let state = &self.int_ctx[context_idx][c_usize];
+        self.encode_bit(*state, false);
+        prev_ctx = if prev_ctx & 0x100 != 0 {
+            ((prev_ctx << 1) | 0) & 0x1ff | 0x100
+        } else {
+            (prev_ctx << 1) | 0
+        };
+
+        // Bit 0 (third bit is '0')
+        let c_usize = (prev_ctx & 0xFF) as usize;
+        let state = &self.int_ctx[context_idx][c_usize];
+        self.encode_bit(*state, false);
+        prev_ctx = if prev_ctx & 0x100 != 0 {
+            ((prev_ctx << 1) | 0) & 0x1ff | 0x100
+        } else {
+            (prev_ctx << 1) | 0
+        };
+
+        // Bit 0 (fourth bit is '0')
+        let c_usize = (prev_ctx & 0xFF) as usize;
+        let state = &self.int_ctx[context_idx][c_usize];
+        self.encode_bit(*state, false);
+
         Ok(())
     }
 
@@ -756,7 +835,7 @@ impl Jbig2ArithCoder {
             Self::sample(packed, width, height, x, y) as u8
         };
 
-    let mut context_distribution: FxHashMap<usize, usize> = FxHashMap::default();
+        let mut context_distribution: HashMap<usize, usize> = HashMap::new();
         let progress_interval = (height as f32 * 0.1).ceil() as i32;
         let mut last_reported_progress = -1;
 

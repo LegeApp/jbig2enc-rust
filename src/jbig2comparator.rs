@@ -15,7 +15,7 @@
 use crate::jbig2sym::BitImage;
 
 /// Maximum absolute shift (in pixels) that we search in x/y.
-const SEARCH_RADIUS: i32 = 2;
+const SEARCH_RADIUS: i32 = 5;
 
 #[derive(Default)]
 /// Compares two BitImages and calculates the pixel distance between them.
