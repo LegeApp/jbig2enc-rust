@@ -173,6 +173,7 @@ impl BitImage {
 
     /// Returns a mutable view of the bitmap.
     pub fn as_mut_bits(&mut self) -> &mut BitSlice<u8, Msb0> {
+        let _ = self.packed_cache.take();
         &mut self.bits
     }
 
@@ -269,6 +270,7 @@ impl BitImage {
     pub fn set(&mut self, x: u32, y: u32, value: bool) {
         if x < usize_to_u32(self.width) && y < usize_to_u32(self.height) {
             let idx = u32_to_usize(y) * self.width + u32_to_usize(x);
+            let _ = self.packed_cache.take();
             self.bits.set(idx, value);
         }
     }
@@ -278,6 +280,7 @@ impl BitImage {
     pub fn set_usize(&mut self, x: usize, y: usize, value: bool) {
         if x < self.width && y < self.height {
             let idx = y * self.width + x;
+            let _ = self.packed_cache.take();
             self.bits.set(idx, value);
         }
     }

@@ -10,10 +10,20 @@
 //! Environment variables:
 //!   BENCH_PAGES   — comma-separated page counts (default: "10,20,50")
 //!                   example: BENCH_PAGES=1,5,10,20,50,100,all
-//!   BENCH_WRITE   — set to "1" to write JBIG2 fragments + decoded PBMs (default: memory only)
+//!   BENCH_SOURCE  — dataset folder under repo root (default: "confed")
+//!   BENCH_WRITE   — set to "0" to disable writing JBIG2 fragments + decoded PBMs (default: write)
+//!   BENCH_COLLAPSE_MIN_FAMILY
+//!   BENCH_COLLAPSE_MIN_USAGE
+//!   BENCH_COLLAPSE_MIN_TOTAL_USAGE
+//!   BENCH_COLLAPSE_MIN_PROTO_USAGE
+//!   BENCH_COLLAPSE_MIN_PAGE_SPAN
+//!   BENCH_COLLAPSE_MAX_ERR
+//!   BENCH_COLLAPSE_MAX_DX
+//!   BENCH_COLLAPSE_MAX_DY
+//!   BENCH_COLLAPSE_PROTO — `medoid`, `cleanup`, or `majority`
 
 use jbig2enc_rust::jbig2enc::{EncoderMetrics, Jbig2Encoder, PdfSplitOutput};
-use jbig2enc_rust::jbig2structs::Jbig2Config;
+use jbig2enc_rust::jbig2structs::{Jbig2Config, LossyCollapsePrototypeMode};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,6 +42,7 @@ struct EncodeResult {
     split: PdfSplitOutput,
     encode_secs: f64,
     metrics: EncoderMetrics,
+    decision_log: String,
 }
 
 struct BenchRow {
@@ -114,6 +125,7 @@ fn run_encode(cfg: &Jbig2Config, pages: &[PageInfo]) -> EncodeResult {
         split,
         encode_secs: t0.elapsed().as_secs_f64(),
         metrics: enc.metrics_snapshot(),
+        decision_log: enc.decision_debug_log(),
     }
 }
 
@@ -202,6 +214,11 @@ fn write_fragments_and_decode(
     Ok(())
 }
 
+fn write_decision_log(out_dir: &Path, prefix: &str, log: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(out_dir)?;
+    std::fs::write(out_dir.join(format!("{prefix}_decision_debug.log")), log)
+}
+
 // ── Config helpers ───────────────────────────────────────────────────
 
 fn parse_page_counts(total_pages: usize) -> Vec<usize> {
@@ -230,7 +247,32 @@ fn parse_page_counts(total_pages: usize) -> Vec<usize> {
 }
 
 fn should_write_pdfs() -> bool {
-    std::env::var("BENCH_WRITE").map_or(false, |v| v == "1")
+    std::env::var("BENCH_WRITE").map_or(true, |v| v != "0")
+}
+
+fn bench_source_dir() -> (String, PathBuf) {
+    let source = std::env::var("BENCH_SOURCE").unwrap_or_else(|_| "confed".to_string());
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&source);
+    (source, path)
+}
+
+fn env_parse_or<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<T>().ok())
+        .unwrap_or(default)
+}
+
+fn collapse_proto_mode() -> LossyCollapsePrototypeMode {
+    match std::env::var("BENCH_COLLAPSE_PROTO")
+        .unwrap_or_else(|_| "cleanup".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "medoid" => LossyCollapsePrototypeMode::Medoid,
+        "majority" => LossyCollapsePrototypeMode::MajorityVote,
+        _ => LossyCollapsePrototypeMode::MedoidThenCleanup,
+    }
 }
 
 fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig2Config)> {
@@ -240,6 +282,34 @@ fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig
     cfg_symbol.auto_thresh = false;
     cfg_symbol.want_full_headers = false;
     cfgs.push(("symbol", cfg_symbol));
+
+    let mut cfg_collapse = Jbig2Config::text_lossy_collapse();
+    cfg_collapse.auto_thresh = false;
+    cfg_collapse.want_full_headers = false;
+    cfg_collapse.lossy_collapse_min_family_size =
+        env_parse_or("BENCH_COLLAPSE_MIN_FAMILY", cfg_collapse.lossy_collapse_min_family_size);
+    cfg_collapse.lossy_collapse_min_usage =
+        env_parse_or("BENCH_COLLAPSE_MIN_USAGE", cfg_collapse.lossy_collapse_min_usage);
+    cfg_collapse.lossy_collapse_min_total_usage = env_parse_or(
+        "BENCH_COLLAPSE_MIN_TOTAL_USAGE",
+        cfg_collapse.lossy_collapse_min_total_usage,
+    );
+    cfg_collapse.lossy_collapse_min_prototype_usage = env_parse_or(
+        "BENCH_COLLAPSE_MIN_PROTO_USAGE",
+        cfg_collapse.lossy_collapse_min_prototype_usage,
+    );
+    cfg_collapse.lossy_collapse_min_page_span = env_parse_or(
+        "BENCH_COLLAPSE_MIN_PAGE_SPAN",
+        cfg_collapse.lossy_collapse_min_page_span,
+    );
+    cfg_collapse.lossy_collapse_max_err =
+        env_parse_or("BENCH_COLLAPSE_MAX_ERR", cfg_collapse.lossy_collapse_max_err);
+    cfg_collapse.lossy_collapse_max_dx =
+        env_parse_or("BENCH_COLLAPSE_MAX_DX", cfg_collapse.lossy_collapse_max_dx);
+    cfg_collapse.lossy_collapse_max_dy =
+        env_parse_or("BENCH_COLLAPSE_MAX_DY", cfg_collapse.lossy_collapse_max_dy);
+    cfg_collapse.lossy_collapse_prototype_mode = collapse_proto_mode();
+    cfgs.push(("sym_collapse", cfg_collapse));
 
     let _ = (count, total_pixels);
     #[cfg(feature = "refine")]
@@ -259,10 +329,10 @@ fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig
 
 #[test]
 fn multi_page_compression_benchmark() {
-    let confed_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("confed");
-    assert!(confed_dir.exists(), "confed/ directory not found");
+    let (source_name, source_dir) = bench_source_dir();
+    assert!(source_dir.exists(), "{source_name}/ directory not found");
 
-    let mut pbm_files: Vec<PathBuf> = std::fs::read_dir(&confed_dir)
+    let mut pbm_files: Vec<PathBuf> = std::fs::read_dir(&source_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -313,7 +383,9 @@ fn multi_page_compression_benchmark() {
         std::fs::create_dir_all(&out_dir).unwrap();
     }
 
-    println!("Source: confed/ ({total_pages} pages)  |  Write fragments: {write_outputs}");
+    println!(
+        "Source: {source_name}/ ({total_pages} pages)  |  Write fragments: {write_outputs}"
+    );
     println!("Page counts: {:?}\n", page_counts);
 
     // ── Warmup ───────────────────────────────────────────────────
@@ -369,6 +441,12 @@ fn multi_page_compression_benchmark() {
                 &format!("generic_{count}p"),
             )
             .expect("write/decode generic fragments failed");
+            write_decision_log(
+                &out_dir.join(format!("generic_{count}p")),
+                &format!("generic_{count}p"),
+                &gen_result.decision_log,
+            )
+            .expect("write generic decision log failed");
         }
 
         let gen_avg_page = gen_page_kb.iter().sum::<f64>() / gen_page_kb.len() as f64;
@@ -450,6 +528,12 @@ fn multi_page_compression_benchmark() {
                     &format!("{label}_{count}p"),
                 )
                 .unwrap_or_else(|e| panic!("write/decode {label} fragments failed: {e}"));
+                write_decision_log(
+                    &out_dir.join(format!("{label}_{count}p")),
+                    &format!("{label}_{count}p"),
+                    &result.decision_log,
+                )
+                .unwrap_or_else(|e| panic!("write {label} decision log failed: {e}"));
             }
 
             let savings_gen = (1.0 - raw_total as f64 / gen_raw as f64) * 100.0;

@@ -52,6 +52,16 @@ pub struct Jbig2Config {
     /// Lower = more aggressive matching (smaller files, lower quality).
     /// Typical range: 4 (aggressive) to 10 (conservative). Default: 7.
     pub match_tolerance: u32,
+    pub lossy_symbol_collapse: bool,
+    pub lossy_collapse_min_family_size: usize,
+    pub lossy_collapse_min_usage: usize,
+    pub lossy_collapse_min_total_usage: usize,
+    pub lossy_collapse_min_prototype_usage: usize,
+    pub lossy_collapse_min_page_span: usize,
+    pub lossy_collapse_max_err: u32,
+    pub lossy_collapse_max_dx: i32,
+    pub lossy_collapse_max_dy: i32,
+    pub lossy_collapse_prototype_mode: LossyCollapsePrototypeMode,
 }
 
 /// Configuration for halftone encoding
@@ -75,6 +85,13 @@ pub struct HalftoneConfig {
     /// MMR keeps the tiled halftone cells exact and avoids arithmetic drift in the
     /// collective pattern bitmap.
     pub dict_mmr: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossyCollapsePrototypeMode {
+    Medoid,
+    MajorityVote,
+    MedoidThenCleanup,
 }
 
 impl Default for HalftoneConfig {
@@ -116,6 +133,16 @@ impl Default for Jbig2Config {
             is_lossless: false,
             default_pixel: false,
             match_tolerance: 7,
+            lossy_symbol_collapse: false,
+            lossy_collapse_min_family_size: 2,
+            lossy_collapse_min_usage: 1,
+            lossy_collapse_min_total_usage: 0,
+            lossy_collapse_min_prototype_usage: 0,
+            lossy_collapse_min_page_span: 0,
+            lossy_collapse_max_err: 10,
+            lossy_collapse_max_dx: 1,
+            lossy_collapse_max_dy: 0,
+            lossy_collapse_prototype_mode: LossyCollapsePrototypeMode::MedoidThenCleanup,
         }
     }
 }
@@ -135,6 +162,14 @@ impl Jbig2Config {
         // Refinement remains opt-in on the preset because SBREFINE=1 adds
         // per-instance overhead. Enable it explicitly when clustering or
         // near-match preservation is expected to pay off.
+        cfg
+    }
+
+    pub fn text_lossy_collapse() -> Self {
+        let mut cfg = Self::text();
+        cfg.lossy_symbol_collapse = true;
+        cfg.refine = false;
+        cfg.text_refine = false;
         cfg
     }
 

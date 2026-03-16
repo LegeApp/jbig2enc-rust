@@ -1,12 +1,13 @@
 //! This module contains the main JBIG2 encoder logic.
 use crate::jbig2arith::{IntProc, Jbig2ArithCoder};
-use crate::jbig2comparator::{Comparator, MAX_DIMENSION_DELTA};
+use crate::jbig2comparator::{Comparator, CompareResult, CompareWeights, MAX_DIMENSION_DELTA};
 // Symbol extraction using CC analysis
 #[cfg(feature = "cc-analysis")]
 use crate::jbig2cc::analyze_page;
 use crate::jbig2structs::{
-    FileHeader, GenericRegionConfig, GenericRegionParams, Jbig2Config, PageInfo, Segment,
-    SegmentType, SymbolDictParams, TextRegionParams,
+    FileHeader, GenericRegionConfig, GenericRegionParams, Jbig2Config,
+    LossyCollapsePrototypeMode, PageInfo, Segment, SegmentType, SymbolDictParams,
+    TextRegionParams,
 };
 
 use crate::jbig2sym::{BitImage, Rect};
@@ -53,13 +54,16 @@ pub struct HashKey(u64);
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SymbolSignature {
-    black: u16,
+    black: u32,
+    area: u32,
     left_col: u16,
     right_col: u16,
     top_row: u16,
     bottom_row: u16,
     cx_times_256: u16,
     cy_times_256: u16,
+    left_mass: u16,
+    right_mass: u16,
 }
 
 #[derive(Debug)]
@@ -245,8 +249,10 @@ struct PlannedPageLayout {
     local_dict_segment_numbers: Vec<u32>,
     local_dict_layout: Option<SymbolDictLayout>,
     region_segment_number: u32,
+    residual_region_segment_number: Option<u32>,
     end_of_page_segment_number: u32,
     local_symbols: Vec<usize>,
+    residual_symbols: Vec<usize>,
     use_generic_region: bool,
 }
 
@@ -262,6 +268,7 @@ struct BuiltPage {
 struct SymbolDictLayout {
     export_input_indices: Vec<usize>,
     refinements: Vec<Option<RefinementPlan>>,
+    diagnostics: SymbolDictDiagnostics,
 }
 
 impl SymbolDictLayout {
@@ -272,6 +279,15 @@ impl SymbolDictLayout {
             1
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct SymbolDictDiagnostics {
+    family_count: usize,
+    singleton_family_count: usize,
+    refined_member_count: usize,
+    exported_member_count: usize,
+    sample_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -287,6 +303,24 @@ struct FamilyBucketKey {
     h_bin: u16,
     density_bin: u8,
     aspect_bin: u8,
+    centroid_y_bin: u8,
+    lr_balance_bin: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LossyFamilyMatch {
+    member_index: usize,
+    dx: i32,
+    dy: i32,
+    err: u32,
+}
+
+#[derive(Debug, Clone)]
+struct LossyFamily {
+    prototype_index: usize,
+    members: Vec<LossyFamilyMatch>,
+    total_usage: usize,
+    page_span: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -304,6 +338,8 @@ struct EncoderState {
     segment: bool,
     use_refinement: bool,
     use_delta_encoding: bool,
+    lossy_collapse_applied: bool,
+    decision_debug_lines: Vec<String>,
 }
 
 /// Main JBIG2 encoder that handles document encoding
@@ -372,6 +408,8 @@ impl<'a> Jbig2Encoder<'a> {
                 segment: true,                 // Default to using segments
                 use_refinement: config.refine, // Enable refinement based on config
                 use_delta_encoding: true,      // Default to using delta encoding
+                lossy_collapse_applied: false,
+                decision_debug_lines: Vec::new(),
             },
             global_symbols: Vec::new(),
             symbol_usage: Vec::new(),
@@ -403,6 +441,10 @@ impl<'a> Jbig2Encoder<'a> {
         self.metrics.clone()
     }
 
+    pub fn decision_debug_log(&self) -> String {
+        self.state.decision_debug_lines.join("\n")
+    }
+
     /// Returns debug information about symbol usage
     pub fn get_symbol_stats(&self) -> String {
         let total_symbols = self.global_symbols.len();
@@ -420,14 +462,16 @@ impl<'a> Jbig2Encoder<'a> {
     }
 
     fn compute_symbol_signature(img: &BitImage) -> SymbolSignature {
-        let mut black = 0usize;
+        let mut black = 0u32;
         let mut left_col = img.width;
         let mut right_col = 0usize;
         let mut top_row = img.height;
         let mut bottom_row = 0usize;
-        let mut sum_x = 0usize;
-        let mut sum_y = 0usize;
-
+        let mut sum_x = 0u32;
+        let mut sum_y = 0u32;
+        let mut left_mass = 0u32;
+        let mut right_mass = 0u32;
+        let mid_x = img.width / 2;
         for y in 0..img.height {
             for x in 0..img.width {
                 if img.get_usize(x, y) {
@@ -436,8 +480,13 @@ impl<'a> Jbig2Encoder<'a> {
                     right_col = right_col.max(x);
                     top_row = top_row.min(y);
                     bottom_row = bottom_row.max(y);
-                    sum_x += x;
-                    sum_y += y;
+                    sum_x += x as u32;
+                    sum_y += y as u32;
+                    if x < mid_x {
+                        left_mass += 1;
+                    } else {
+                        right_mass += 1;
+                    }
                 }
             }
         }
@@ -446,19 +495,22 @@ impl<'a> Jbig2Encoder<'a> {
             (0, 0)
         } else {
             (
-                ((sum_x * 256) / black).min(u16::MAX as usize) as u16,
-                ((sum_y * 256) / black).min(u16::MAX as usize) as u16,
+                ((sum_x * 256) / black).min(u16::MAX as u32) as u16,
+                ((sum_y * 256) / black).min(u16::MAX as u32) as u16,
             )
         };
 
         SymbolSignature {
-            black: black.min(u16::MAX as usize) as u16,
+            black,
+            area: img.width.saturating_mul(img.height).min(u32::MAX as usize) as u32,
             left_col: left_col.min(u16::MAX as usize) as u16,
             right_col: right_col.min(u16::MAX as usize) as u16,
             top_row: top_row.min(u16::MAX as usize) as u16,
             bottom_row: bottom_row.min(u16::MAX as usize) as u16,
             cx_times_256: cx,
             cy_times_256: cy,
+            left_mass: left_mass.min(u16::MAX as u32) as u16,
+            right_mass: right_mass.min(u16::MAX as u32) as u16,
         }
     }
 
@@ -700,6 +752,578 @@ impl<'a> Jbig2Encoder<'a> {
             let key = hash_key(symbol);
             self.hash_map.entry(key).or_default().push(idx);
         }
+    }
+
+    fn choose_lossy_family_prototype(&self, members: &[usize]) -> usize {
+        if members.len() == 1 {
+            return members[0];
+        }
+
+        let mut comparator = Comparator::default();
+        let mut best_idx = members[0];
+        let mut best_score = u64::MAX;
+        let mut best_support = 0u64;
+
+        for &candidate in members {
+            let mut score = 0u64;
+            for &other in members {
+                if candidate == other {
+                    continue;
+                }
+
+                let weight = self.symbol_usage[other].max(1) as u64;
+                match lossy_family_match_details(
+                    &mut comparator,
+                    &self.global_symbols[other],
+                    other,
+                    &self.global_symbols[candidate],
+                    candidate,
+                    &self.symbol_signatures,
+                    &self.symbol_pixel_counts,
+                    self.config.lossy_collapse_max_err,
+                    self.config.lossy_collapse_max_dx,
+                    self.config.lossy_collapse_max_dy,
+                ) {
+                    Some(result) => {
+                        score += CompareWeights::COLLAPSE.score(&result) as u64 * weight;
+                    }
+                    None => score += 1_000_000 * weight,
+                }
+            }
+
+            let candidate_support =
+                (self.symbol_page_count[candidate] as u64 * 8) + self.symbol_usage[candidate] as u64;
+            let score_close = if best_score == u64::MAX {
+                false
+            } else {
+                score <= best_score + best_score / 50
+            };
+
+            if score < best_score || (score_close && candidate_support > best_support) {
+                best_score = score;
+                best_idx = candidate;
+                best_support = candidate_support;
+            }
+        }
+
+        best_idx
+    }
+
+    fn cleanup_symbol_bitmap(symbol: &BitImage) -> BitImage {
+        let mut out = symbol.clone();
+        if symbol.width < 3 || symbol.height < 3 {
+            return out;
+        }
+
+        for y in 1..(symbol.height - 1) {
+            for x in 1..(symbol.width - 1) {
+                let on = symbol.get_usize(x, y);
+                let mut neighbors = 0usize;
+                for yy in (y - 1)..=(y + 1) {
+                    for xx in (x - 1)..=(x + 1) {
+                        if xx == x && yy == y {
+                            continue;
+                        }
+                        if symbol.get_usize(xx, yy) {
+                            neighbors += 1;
+                        }
+                    }
+                }
+
+                if on && neighbors <= 1 {
+                    out.set_usize(x, y, false);
+                } else if !on && neighbors >= 7 {
+                    out.set_usize(x, y, true);
+                }
+            }
+        }
+
+        out
+    }
+
+    fn majority_vote_prototype(
+        &self,
+        prototype_index: usize,
+        members: &[LossyFamilyMatch],
+    ) -> BitImage {
+        let prototype = &self.global_symbols[prototype_index];
+        let mut votes = vec![0u16; prototype.width * prototype.height];
+        let mut samples = 1u16;
+
+        for y in 0..prototype.height {
+            for x in 0..prototype.width {
+                if prototype.get_usize(x, y) {
+                    votes[y * prototype.width + x] += 1;
+                }
+            }
+        }
+
+        for member in members {
+            let image = &self.global_symbols[member.member_index];
+            for y in 0..prototype.height {
+                for x in 0..prototype.width {
+                    let sx = x as i32 - member.dx;
+                    let sy = y as i32 - member.dy;
+                    if sx < 0 || sy < 0 {
+                        continue;
+                    }
+                    let sx = sx as usize;
+                    let sy = sy as usize;
+                    if sx >= image.width || sy >= image.height {
+                        continue;
+                    }
+                    if image.get_usize(sx, sy) {
+                        votes[y * prototype.width + x] += 1;
+                    }
+                }
+            }
+            samples += 1;
+        }
+
+        let mut out = prototype.clone();
+        let threshold = ((samples as f32) * 0.60).ceil() as u16;
+        for y in 0..prototype.height {
+            for x in 0..prototype.width {
+                out.set_usize(x, y, votes[y * prototype.width + x] >= threshold);
+            }
+        }
+        out
+    }
+
+    fn build_lossy_symbol_families(&self) -> Vec<LossyFamily> {
+        if !self.config.lossy_symbol_collapse || self.global_symbols.len() <= 1 {
+            return Vec::new();
+        }
+
+        let all_indices: Vec<usize> = (0..self.global_symbols.len()).collect();
+        let mut bucket_map: HashMap<FamilyBucketKey, Vec<usize>> = HashMap::new();
+        for &symbol_index in &all_indices {
+            let key = family_bucket_key_for_symbol(
+                &self.global_symbols[symbol_index],
+                &self.symbol_signatures[symbol_index],
+            );
+            bucket_map.entry(key).or_default().push(symbol_index);
+        }
+
+        let mut comparator = Comparator::default();
+        let mut parent: Vec<usize> = (0..self.global_symbols.len()).collect();
+        let mut rank = vec![0u32; self.global_symbols.len()];
+
+        for &symbol_index in &all_indices {
+            let key = family_bucket_key_for_symbol(
+                &self.global_symbols[symbol_index],
+                &self.symbol_signatures[symbol_index],
+            );
+
+            for neighbor in family_bucket_neighbors(key) {
+                let Some(bucket) = bucket_map.get(&neighbor) else {
+                    continue;
+                };
+                for &other_index in bucket {
+                    if other_index >= symbol_index {
+                        continue;
+                    }
+                    if lossy_family_match_details(
+                        &mut comparator,
+                        &self.global_symbols[symbol_index],
+                        symbol_index,
+                        &self.global_symbols[other_index],
+                        other_index,
+                        &self.symbol_signatures,
+                        &self.symbol_pixel_counts,
+                        self.config.lossy_collapse_max_err,
+                        self.config.lossy_collapse_max_dx,
+                        self.config.lossy_collapse_max_dy,
+                    )
+                    .is_some()
+                    {
+                        uf_union(&mut parent, &mut rank, symbol_index, other_index);
+                    }
+                }
+            }
+        }
+
+        let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &symbol_index in &all_indices {
+            let root = uf_find(&mut parent, symbol_index);
+            groups.entry(root).or_default().push(symbol_index);
+        }
+
+        let mut families = Vec::new();
+        let mut skipped_low_value = 0usize;
+        let mut skipped_samples = Vec::new();
+        for mut members in groups.into_values() {
+            members.sort_unstable();
+            let eligible: Vec<usize> = members
+                .into_iter()
+                .filter(|&index| self.symbol_usage[index] >= self.config.lossy_collapse_min_usage)
+                .collect();
+            if eligible.len() < self.config.lossy_collapse_min_family_size {
+                continue;
+            }
+
+            let prototype_index = self.choose_lossy_family_prototype(&eligible);
+            let eligible_set: HashSet<usize> = eligible.iter().copied().collect();
+            let family_total_usage = eligible.iter().map(|&index| self.symbol_usage[index]).sum();
+            let family_page_span = self
+                .pages
+                .iter()
+                .filter(|page| {
+                    page.symbol_instances
+                        .iter()
+                        .any(|instance| eligible_set.contains(&instance.symbol_index))
+                })
+                .count();
+            let prototype_usage = self.symbol_usage[prototype_index];
+            let is_economically_useful = family_total_usage
+                >= self.config.lossy_collapse_min_total_usage
+                && (prototype_usage >= self.config.lossy_collapse_min_prototype_usage
+                    || family_page_span >= self.config.lossy_collapse_min_page_span);
+            if !is_economically_useful {
+                skipped_low_value += 1;
+                if skipped_samples.len() < 64 {
+                    skipped_samples.push(format!(
+                        "collapse skip low-value: prototype={} members={} total_usage={} prototype_usage={} page_span={}",
+                        prototype_index,
+                        eligible.len(),
+                        family_total_usage,
+                        prototype_usage,
+                        family_page_span
+                    ));
+                }
+                continue;
+            }
+            let mut family_members = Vec::new();
+            for &member_index in &eligible {
+                if member_index == prototype_index {
+                    continue;
+                }
+                if let Some(result) = lossy_family_match_details(
+                    &mut comparator,
+                    &self.global_symbols[member_index],
+                    member_index,
+                    &self.global_symbols[prototype_index],
+                    prototype_index,
+                    &self.symbol_signatures,
+                    &self.symbol_pixel_counts,
+                    self.config.lossy_collapse_max_err,
+                    self.config.lossy_collapse_max_dx,
+                    self.config.lossy_collapse_max_dy,
+                ) {
+                    family_members.push(LossyFamilyMatch {
+                        member_index,
+                        dx: result.dx,
+                        dy: result.dy,
+                        err: result.total_err,
+                    });
+                }
+            }
+
+            if family_members.len() + 1 >= self.config.lossy_collapse_min_family_size {
+                families.push(LossyFamily {
+                    prototype_index,
+                    members: family_members,
+                    total_usage: family_total_usage,
+                    page_span: family_page_span,
+                });
+            }
+        }
+
+        debug!(
+            "lossy collapse economic filter: kept {} families, skipped {}",
+            families.len(),
+            skipped_low_value
+        );
+        for line in skipped_samples {
+            trace!("{line}");
+        }
+
+        families
+    }
+
+    fn make_lossy_prototype(&self, family: &LossyFamily) -> BitImage {
+        match self.config.lossy_collapse_prototype_mode {
+            LossyCollapsePrototypeMode::Medoid => self.global_symbols[family.prototype_index].clone(),
+            LossyCollapsePrototypeMode::MajorityVote => {
+                self.majority_vote_prototype(family.prototype_index, &family.members)
+            }
+            LossyCollapsePrototypeMode::MedoidThenCleanup => {
+                Self::cleanup_symbol_bitmap(&self.global_symbols[family.prototype_index])
+            }
+        }
+    }
+
+    fn compact_symbol_table_after_remap(&mut self) {
+        let mut used = vec![false; self.global_symbols.len()];
+        for page in &self.pages {
+            for instance in &page.symbol_instances {
+                if instance.symbol_index < used.len() {
+                    used[instance.symbol_index] = true;
+                }
+            }
+        }
+
+        let old_symbols = self.global_symbols.clone();
+        let mut new_index = vec![usize::MAX; old_symbols.len()];
+        let mut new_symbols = Vec::new();
+
+        for (old_index, symbol) in old_symbols.into_iter().enumerate() {
+            if used[old_index] {
+                new_index[old_index] = new_symbols.len();
+                new_symbols.push(symbol);
+            }
+        }
+
+        for page in &mut self.pages {
+            for instance in &mut page.symbol_instances {
+                instance.symbol_index = new_index[instance.symbol_index];
+            }
+        }
+
+        self.global_symbols = new_symbols;
+        self.rebuild_symbol_metadata();
+        self.rebuild_hash_map();
+    }
+
+    fn alias_local_symbols_to_globals(&mut self) -> Result<()> {
+        if self.pages.len() <= 1 || self.global_symbols.is_empty() {
+            return Ok(());
+        }
+        let text_refine = self.config.text_refine;
+        let refine_enabled = self.config.refine;
+        let lossy_collapse = self.config.lossy_symbol_collapse;
+        let global_indices: Vec<usize> = self
+            .global_symbols
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.symbol_page_count[*i] > 1)
+            .map(|(i, _)| i)
+            .collect();
+        if global_indices.is_empty() {
+            return Ok(());
+        }
+
+        let mut global_bucket_map: HashMap<HashKey, Vec<usize>> = HashMap::new();
+        for &symbol_index in &global_indices {
+            global_bucket_map
+                .entry(hash_key(&self.global_symbols[symbol_index]))
+                .or_default()
+                .push(symbol_index);
+        }
+
+        let mut comparator = Comparator::default();
+        let mut changed = false;
+        let mut aliased_symbols = 0usize;
+        let mut aliased_instances = 0usize;
+        let mut alias_samples = Vec::new();
+        for page in &mut self.pages {
+            let mut page_local_symbols = HashSet::new();
+            for instance in &page.symbol_instances {
+                if self.symbol_page_count[instance.symbol_index] <= 1 {
+                    page_local_symbols.insert(instance.symbol_index);
+                }
+            }
+
+            for local_symbol_index in page_local_symbols {
+                let local_symbol = &self.global_symbols[local_symbol_index];
+                let local_sig = self.symbol_signatures[local_symbol_index];
+                let pixel_count = self.symbol_pixel_counts[local_symbol_index];
+                let area = (local_symbol.width * local_symbol.height) as u32;
+                let max_err = if self.config.text_refine {
+                    (area / self.config.match_tolerance.max(1)).max(3)
+                } else if self.config.lossy_symbol_collapse {
+                    self.config.lossy_collapse_max_err.max(2)
+                } else {
+                    ((area as f32 * 0.05) as u32).max(2)
+                };
+                let dim_range: u64 = if self.config.text_refine
+                    || self.config.refine
+                    || self.config.lossy_symbol_collapse
+                {
+                    2
+                } else {
+                    0
+                };
+
+                let mut best_match: Option<(usize, u32, i32, i32, bool)> = None;
+                let h = local_symbol.height as u64;
+                let w = local_symbol.width as u64;
+                'bucket_search: for dh_off in 0..=(dim_range * 2) {
+                    let dh = h.wrapping_add(dh_off).wrapping_sub(dim_range);
+                    if dh >= 10_000 {
+                        continue;
+                    }
+                    for dw_off in 0..=(dim_range * 2) {
+                        let dw = w.wrapping_add(dw_off).wrapping_sub(dim_range);
+                        if dw >= 10_000 {
+                            continue;
+                        }
+                        let bucket_key = HashKey(dh * 10_000 + dw);
+                        let Some(bucket) = global_bucket_map.get(&bucket_key) else {
+                            continue;
+                        };
+                        for &global_symbol_index in bucket {
+                            if self.symbol_pixel_counts[global_symbol_index].abs_diff(pixel_count)
+                                > max_err as usize + if self.config.text_refine { 8 } else { 6 }
+                            {
+                                continue;
+                            }
+                            let stored = self.symbol_signatures[global_symbol_index];
+                            let black_tol = if text_refine { 12 } else { 8 };
+                            let pos_tol = 2;
+                            let centroid_tol = if text_refine { 96 } else { 64 };
+                            if local_sig.black.abs_diff(stored.black) > black_tol
+                                || local_sig.left_col.abs_diff(stored.left_col) > pos_tol
+                                || local_sig.right_col.abs_diff(stored.right_col) > pos_tol
+                                || local_sig.top_row.abs_diff(stored.top_row) > pos_tol
+                                || local_sig.bottom_row.abs_diff(stored.bottom_row) > pos_tol
+                                || local_sig.cx_times_256.abs_diff(stored.cx_times_256)
+                                    > centroid_tol
+                                || local_sig.cy_times_256.abs_diff(stored.cy_times_256)
+                                    > centroid_tol
+                            {
+                                continue;
+                            }
+                            let Some((err, dx, dy)) = comparator.distance(
+                                local_symbol,
+                                &self.global_symbols[global_symbol_index],
+                                max_err,
+                            ) else {
+                                continue;
+                            };
+                            let exact_dims = local_symbol.width
+                                == self.global_symbols[global_symbol_index].width
+                                && local_symbol.height
+                                    == self.global_symbols[global_symbol_index].height;
+                            let (accept, needs_refinement) = if err == 0
+                                && dx == 0
+                                && dy == 0
+                                && exact_dims
+                            {
+                                (true, false)
+                            } else if text_refine {
+                                (
+                                    dx.abs() <= 1
+                                        && dy.abs() <= 1
+                                        && err <= (max_err / 2).max(2),
+                                    true,
+                                )
+                            } else if dx.abs() <= 1 && dy == 0 {
+                                (true, false)
+                            } else {
+                                (false, false)
+                            };
+                            if !accept {
+                                continue;
+                            }
+                            best_match = Some((
+                                global_symbol_index,
+                                err,
+                                dx,
+                                dy,
+                                needs_refinement && !lossy_collapse && (text_refine || refine_enabled),
+                            ));
+                            if err == 0 && dx == 0 && dy == 0 {
+                                break 'bucket_search;
+                            }
+                        }
+                    }
+                }
+
+                let Some((global_symbol_index, _err, dx, dy, needs_refinement)) = best_match else {
+                    continue;
+                };
+                aliased_symbols += 1;
+                for instance in &mut page.symbol_instances {
+                    if instance.symbol_index == local_symbol_index {
+                        instance.symbol_index = global_symbol_index;
+                        instance.needs_refinement = needs_refinement;
+                        instance.refinement_dx = if needs_refinement { dx } else { 0 };
+                        instance.refinement_dy = if needs_refinement { dy } else { 0 };
+                        changed = true;
+                        aliased_instances += 1;
+                    }
+                }
+                if alias_samples.len() < 64 {
+                    alias_samples.push(format!(
+                        "alias local->global: local={} global={} dx={} dy={} refine={}",
+                        local_symbol_index, global_symbol_index, dx, dy, needs_refinement
+                    ));
+                }
+            }
+        }
+
+        if changed {
+            self.state.decision_debug_lines.push(format!(
+                "alias pass: {} local symbols / {} instances remapped onto globals",
+                aliased_symbols, aliased_instances
+            ));
+            self.state.decision_debug_lines.extend(alias_samples);
+            self.compact_symbol_table_after_remap();
+        } else {
+            self.state
+                .decision_debug_lines
+                .push("alias pass: no local symbols remapped onto globals".to_string());
+        }
+
+        Ok(())
+    }
+
+    fn apply_lossy_symbol_collapse(&mut self) -> Result<()> {
+        if !self.config.lossy_symbol_collapse || self.state.lossy_collapse_applied {
+            return Ok(());
+        }
+
+        let families = self.build_lossy_symbol_families();
+        if families.is_empty() {
+            self.state
+                .decision_debug_lines
+                .push("collapse: no eligible families".to_string());
+            self.state.lossy_collapse_applied = true;
+            return Ok(());
+        }
+
+        self.state.decision_debug_lines.push(format!(
+            "collapse: {} families eligible across {} symbols",
+            families.len(),
+            self.global_symbols.len()
+        ));
+        for family in families.iter().take(64) {
+            self.state.decision_debug_lines.push(format!(
+                "collapse family: prototype={} members={} usage={} total_usage={} page_span={} mode={:?}",
+                family.prototype_index,
+                family.members.len() + 1,
+                self.symbol_usage[family.prototype_index],
+                family.total_usage,
+                family.page_span,
+                self.config.lossy_collapse_prototype_mode
+            ));
+        }
+
+        let mut remap: Vec<usize> = (0..self.global_symbols.len()).collect();
+        for family in &families {
+            let prototype = family.prototype_index;
+            for member in &family.members {
+                remap[member.member_index] = prototype;
+            }
+        }
+
+        for family in &families {
+            self.global_symbols[family.prototype_index] = self.make_lossy_prototype(family);
+        }
+
+        for page in &mut self.pages {
+            for instance in &mut page.symbol_instances {
+                instance.symbol_index = remap[instance.symbol_index];
+                instance.needs_refinement = false;
+                instance.refinement_dx = 0;
+                instance.refinement_dy = 0;
+            }
+        }
+
+        self.compact_symbol_table_after_remap();
+        self.state.lossy_collapse_applied = true;
+        Ok(())
     }
 
     pub fn add_page(&mut self, image: &Array2<u8>) -> Result<()> {
@@ -1015,6 +1639,10 @@ impl<'a> Jbig2Encoder<'a> {
 
     pub fn flush(&mut self) -> Result<Vec<u8>> {
         let include_header = self.state.full_headers_remaining;
+        self.state.decision_debug_lines.clear();
+        if self.config.lossy_symbol_collapse {
+            self.apply_lossy_symbol_collapse()?;
+        }
         let plan = self.plan_document(include_header)?;
         self.validate_plan(&plan)?;
         let output = self.serialize_full_document(&plan)?;
@@ -1025,6 +1653,10 @@ impl<'a> Jbig2Encoder<'a> {
 
     pub fn flush_pdf_split(&mut self) -> Result<PdfSplitOutput> {
         self.state.pdf_mode = true;
+        self.state.decision_debug_lines.clear();
+        if self.config.lossy_symbol_collapse {
+            self.apply_lossy_symbol_collapse()?;
+        }
         let plan = self.plan_document(false)?;
         self.validate_plan(&plan)?;
         let (global_segments, page_streams) = self.serialize_pdf_split(&plan)?;
@@ -1046,6 +1678,7 @@ impl<'a> Jbig2Encoder<'a> {
         }
 
         self.prune_symbols_if_needed();
+        self.alias_local_symbols_to_globals()?;
         self.validate_symbol_instance_indices()?;
 
         let global_symbol_indices: Vec<usize> = self
@@ -1067,10 +1700,27 @@ impl<'a> Jbig2Encoder<'a> {
                     .collect()
             })
             .collect();
+        let mut page_residual_symbols = vec![Vec::new(); self.pages.len()];
 
         let global_set: HashSet<usize> = global_symbol_indices.iter().copied().collect();
         let mut page_uses_generic_region = vec![false; self.pages.len()];
         for (page_num, page) in self.pages.iter().enumerate() {
+            if self.config.lossy_symbol_collapse || self.config.refine || self.config.text_refine {
+                let mut local_use_counts = HashMap::new();
+                for instance in &page.symbol_instances {
+                    *local_use_counts.entry(instance.symbol_index).or_insert(0usize) += 1;
+                }
+                let mut kept_local_symbols = Vec::with_capacity(page_local_symbols[page_num].len());
+                for &symbol_index in &page_local_symbols[page_num] {
+                    if local_use_counts.get(&symbol_index).copied().unwrap_or(0) <= 1 {
+                        page_residual_symbols[page_num].push(symbol_index);
+                    } else {
+                        kept_local_symbols.push(symbol_index);
+                    }
+                }
+                page_local_symbols[page_num] = kept_local_symbols;
+            }
+
             let local_symbols = &page_local_symbols[page_num];
             let page_local_gain: i64 = local_symbols
                 .iter()
@@ -1079,7 +1729,10 @@ impl<'a> Jbig2Encoder<'a> {
             let uses_only_locals = page
                 .symbol_instances
                 .iter()
-                .all(|inst| !global_set.contains(&inst.symbol_index));
+                .all(|inst| {
+                    !global_set.contains(&inst.symbol_index)
+                        && !page_residual_symbols[page_num].contains(&inst.symbol_index)
+                });
             if uses_only_locals
                 && local_symbols.len() <= 2
                 && page.symbol_instances.len() <= 2
@@ -1088,11 +1741,36 @@ impl<'a> Jbig2Encoder<'a> {
                 page_local_symbols[page_num].clear();
                 page_uses_generic_region[page_num] = true;
             }
+
+            let has_kept_symbol_instances = page.symbol_instances.iter().any(|inst| {
+                global_set.contains(&inst.symbol_index)
+                    || page_local_symbols[page_num].contains(&inst.symbol_index)
+            });
+            if !has_kept_symbol_instances {
+                page_uses_generic_region[page_num] = true;
+            }
+        }
+
+        let total_residual_symbols: usize = page_residual_symbols.iter().map(Vec::len).sum();
+        self.state.decision_debug_lines.push(format!(
+            "planning residuals: {} page-local one-off symbols moved to generic residuals",
+            total_residual_symbols
+        ));
+        for (page_num, residuals) in page_residual_symbols.iter().enumerate().take(32) {
+            if !residuals.is_empty() {
+                self.state.decision_debug_lines.push(format!(
+                    "page {} residual symbols: count={} sample={:?}",
+                    page_num + 1,
+                    residuals.len(),
+                    &residuals[..residuals.len().min(8)]
+                ));
+            }
         }
 
         self.validate_symbol_partition(
             &global_symbol_indices,
             &page_local_symbols,
+            &page_residual_symbols,
             &page_uses_generic_region,
         )?;
 
@@ -1107,7 +1785,22 @@ impl<'a> Jbig2Encoder<'a> {
                 .iter()
                 .map(|&i| &self.global_symbols[i])
                 .collect();
-            let dict_layout = plan_symbol_dictionary_layout(&refs, &self.config)?;
+            let dict_usage: Vec<usize> = global_symbol_indices
+                .iter()
+                .map(|&i| self.symbol_usage[i])
+                .collect();
+            let dict_layout =
+                plan_symbol_dictionary_layout(&refs, &self.config, Some(&dict_usage))?;
+            self.state.decision_debug_lines.push(format!(
+                "global dict layout: families={} singletons={} refined_members={} exported_members={}",
+                dict_layout.diagnostics.family_count,
+                dict_layout.diagnostics.singleton_family_count,
+                dict_layout.diagnostics.refined_member_count,
+                dict_layout.diagnostics.exported_member_count
+            ));
+            self.state
+                .decision_debug_lines
+                .extend(dict_layout.diagnostics.sample_lines.iter().take(64).cloned());
             let dict_start = Instant::now();
             encoded_global_dict =
                 encode_symbol_dictionary_segments(&refs, &self.config, &dict_layout)?;
@@ -1170,12 +1863,43 @@ impl<'a> Jbig2Encoder<'a> {
                     .iter()
                     .map(|&i| &self.global_symbols[i])
                     .collect();
-                Some(plan_symbol_dictionary_layout(&refs, &self.config)?)
+                let mut local_usage = vec![0usize; page_local_symbols[page_num].len()];
+                let local_index_by_symbol: HashMap<usize, usize> = page_local_symbols[page_num]
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &symbol_index)| (symbol_index, idx))
+                    .collect();
+                for instance in &page.symbol_instances {
+                    if let Some(&local_idx) = local_index_by_symbol.get(&instance.symbol_index) {
+                        local_usage[local_idx] += 1;
+                    }
+                }
+                Some(plan_symbol_dictionary_layout(
+                    &refs,
+                    &self.config,
+                    Some(&local_usage),
+                )?)
             } else {
                 None
             };
             let mut local_dict_segment_numbers = Vec::new();
             if let Some(local_dict_layout) = &local_dict_layout {
+                self.state.decision_debug_lines.push(format!(
+                    "page {} local dict layout: families={} singletons={} refined_members={} exported_members={}",
+                    page_num + 1,
+                    local_dict_layout.diagnostics.family_count,
+                    local_dict_layout.diagnostics.singleton_family_count,
+                    local_dict_layout.diagnostics.refined_member_count,
+                    local_dict_layout.diagnostics.exported_member_count
+                ));
+                self.state.decision_debug_lines.extend(
+                    local_dict_layout
+                        .diagnostics
+                        .sample_lines
+                        .iter()
+                        .take(16)
+                        .cloned(),
+                );
                 for _ in 0..local_dict_layout.segment_count() {
                     local_dict_segment_numbers.push(current_segment_number);
                     current_segment_number += 1;
@@ -1184,6 +1908,19 @@ impl<'a> Jbig2Encoder<'a> {
             }
             let region_segment_number = current_segment_number;
             current_segment_number += 1;
+            let has_residual_region = !page_residual_symbols[page_num].is_empty()
+                && !page_uses_generic_region[page_num]
+                && page.symbol_instances.iter().any(|inst| {
+                    global_set.contains(&inst.symbol_index)
+                        || page_local_symbols[page_num].contains(&inst.symbol_index)
+                });
+            let residual_region_segment_number = if has_residual_region {
+                let number = current_segment_number;
+                current_segment_number += 1;
+                Some(number)
+            } else {
+                None
+            };
             let end_of_page_segment_number = current_segment_number;
             current_segment_number += 1;
             let use_generic_region = page_uses_generic_region[page_num];
@@ -1195,8 +1932,10 @@ impl<'a> Jbig2Encoder<'a> {
                 local_dict_segment_numbers,
                 local_dict_layout,
                 region_segment_number,
+                residual_region_segment_number,
                 end_of_page_segment_number,
                 local_symbols: page_local_symbols[page_num].clone(),
+                residual_symbols: page_residual_symbols[page_num].clone(),
                 use_generic_region,
             });
         }
@@ -1331,6 +2070,7 @@ impl<'a> Jbig2Encoder<'a> {
             && !layout.use_generic_region
         {
             let mut referred_to_for_text_region = self.global_dict_segment_numbers.clone();
+            let residual_set: HashSet<usize> = layout.residual_symbols.iter().copied().collect();
 
             let mut local_sym_to_dict_pos = vec![u32::MAX; self.global_symbols.len()];
             let mut local_refinement_map = vec![None; self.global_symbols.len()];
@@ -1381,7 +2121,15 @@ impl<'a> Jbig2Encoder<'a> {
                 0
             };
 
-            let mut planned_instances = page.symbol_instances.clone();
+            let mut planned_instances = Vec::with_capacity(page.symbol_instances.len());
+            let mut residual_instances = Vec::new();
+            for instance in &page.symbol_instances {
+                if residual_set.contains(&instance.symbol_index) {
+                    residual_instances.push(instance.clone());
+                } else {
+                    planned_instances.push(instance.clone());
+                }
+            }
             let mut needs_family_refinement = false;
             for instance in &mut planned_instances {
                 if let Some(refinement) = local_refinement_map[instance.symbol_index] {
@@ -1399,57 +2147,69 @@ impl<'a> Jbig2Encoder<'a> {
                 }
             }
 
-            let text_start = Instant::now();
-            let region_payload = if self.config.text_refine || self.config.refine || needs_family_refinement {
-                encode_text_region_with_refinement(
-                    &planned_instances,
-                    self.config,
-                    &self.global_symbols,
-                    global_sym_to_dict_pos,
-                    num_global_dict_symbols,
-                    &local_sym_to_dict_pos,
-                    num_local_dict_symbols,
-                )?
-            } else {
-                encode_text_region_mapped(
-                    &planned_instances,
-                    self.config,
-                    &self.global_symbols,
-                    global_sym_to_dict_pos,
-                    num_global_dict_symbols,
-                    &local_sym_to_dict_pos,
-                    layout.page_index,
-                    num_local_dict_symbols,
-                )?
-            };
-            text_region_time += text_start.elapsed();
+            if !planned_instances.is_empty() {
+                let text_start = Instant::now();
+                let use_refinement_text_region = !self.config.lossy_symbol_collapse
+                    && (self.config.text_refine || self.config.refine || needs_family_refinement);
+                let region_payload = if use_refinement_text_region {
+                    encode_text_region_with_refinement(
+                        &planned_instances,
+                        self.config,
+                        &self.global_symbols,
+                        global_sym_to_dict_pos,
+                        num_global_dict_symbols,
+                        &local_sym_to_dict_pos,
+                        num_local_dict_symbols,
+                    )?
+                } else {
+                    encode_text_region_mapped(
+                        &planned_instances,
+                        self.config,
+                        &self.global_symbols,
+                        global_sym_to_dict_pos,
+                        num_global_dict_symbols,
+                        &local_sym_to_dict_pos,
+                        layout.page_index,
+                        num_local_dict_symbols,
+                    )?
+                };
+                text_region_time += text_start.elapsed();
 
-            page_segments.push(Segment {
-                number: layout.region_segment_number,
-                seg_type: SegmentType::ImmediateTextRegion,
-                deferred_non_retain: false,
-                retain_flags: 0,
-                page_association_type: 0,
-                referred_to: referred_to_for_text_region,
-                page: Some(layout.page_number),
-                payload: region_payload,
-            });
+                page_segments.push(Segment {
+                    number: layout.region_segment_number,
+                    seg_type: SegmentType::ImmediateTextRegion,
+                    deferred_non_retain: false,
+                    retain_flags: 0,
+                    page_association_type: 0,
+                    referred_to: referred_to_for_text_region,
+                    page: Some(layout.page_number),
+                    payload: region_payload,
+                });
+            }
+
+            if let Some((residual_bitmap, residual_x, residual_y)) =
+                self.build_instance_residual_bitmap(&residual_instances)?
+            {
+                let generic_start = Instant::now();
+                let residual_payload =
+                    self.encode_generic_region_payload_at(&residual_bitmap, residual_x, residual_y)?;
+                generic_region_time += generic_start.elapsed();
+                page_segments.push(Segment {
+                    number: layout
+                        .residual_region_segment_number
+                        .unwrap_or(layout.region_segment_number),
+                    seg_type: SegmentType::ImmediateGenericRegion,
+                    deferred_non_retain: false,
+                    retain_flags: 0,
+                    page_association_type: 0,
+                    referred_to: Vec::new(),
+                    page: Some(layout.page_number),
+                    payload: residual_payload,
+                });
+            }
         } else {
-            let mut gr_cfg = GenericRegionConfig::new(
-                page.image.width as u32,
-                page.image.height as u32,
-                self.config.generic.dpi,
-            );
-            gr_cfg.comb_operator = self.config.generic.comb_operator;
-            gr_cfg.mmr = self.config.generic.mmr;
-            gr_cfg.tpgdon = self.config.generic.tpgdon;
-            gr_cfg.validate().map_err(|e: &'static str| anyhow!(e))?;
-
             let generic_start = Instant::now();
-            let coder_data = Jbig2ArithCoder::encode_generic_payload_cfg(&page.image, &gr_cfg)?;
-            let params: GenericRegionParams = gr_cfg.clone().into();
-            let mut generic_region_payload = params.to_bytes();
-            generic_region_payload.extend_from_slice(&coder_data);
+            let generic_region_payload = self.encode_generic_region_payload_at(&page.image, 0, 0)?;
             generic_region_time += generic_start.elapsed();
 
             page_segments.push(Segment {
@@ -1826,6 +2586,7 @@ impl<'a> Jbig2Encoder<'a> {
         &self,
         global_symbol_indices: &[usize],
         page_local_symbols: &[Vec<usize>],
+        page_residual_symbols: &[Vec<usize>],
         page_uses_generic_region: &[bool],
     ) -> Result<()> {
         let global_set: HashSet<usize> = global_symbol_indices.iter().copied().collect();
@@ -1834,11 +2595,16 @@ impl<'a> Jbig2Encoder<'a> {
                 continue;
             }
             let local_set: HashSet<usize> = page_local_symbols[page_num].iter().copied().collect();
+            let residual_set: HashSet<usize> =
+                page_residual_symbols[page_num].iter().copied().collect();
             for inst in &page.symbol_instances {
                 let idx = inst.symbol_index;
-                if !global_set.contains(&idx) && !local_set.contains(&idx) {
+                if !global_set.contains(&idx)
+                    && !local_set.contains(&idx)
+                    && !residual_set.contains(&idx)
+                {
                     anyhow::bail!(
-                        "Page {} symbol {} was not resolved to global or local dictionary",
+                        "Page {} symbol {} was not resolved to global, local, or residual output",
                         page_num + 1,
                         idx
                     );
@@ -1980,6 +2746,79 @@ impl<'a> Jbig2Encoder<'a> {
 
         Ok(output)
     }
+
+    fn build_instance_residual_bitmap(
+        &self,
+        instances: &[SymbolInstance],
+    ) -> Result<Option<(BitImage, u32, u32)>> {
+        if instances.is_empty() {
+            return Ok(None);
+        }
+
+        let mut min_x = u32::MAX;
+        let mut min_y = u32::MAX;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        let mut has_pixels = false;
+
+        for instance in instances {
+            if instance.instance_bitmap.count_ones() == 0 {
+                continue;
+            }
+            has_pixels = true;
+            min_x = min_x.min(instance.position.x);
+            min_y = min_y.min(instance.position.y);
+            max_x = max_x.max(instance.position.x + instance.instance_bitmap.width as u32);
+            max_y = max_y.max(instance.position.y + instance.instance_bitmap.height as u32);
+        }
+
+        if !has_pixels || max_x <= min_x || max_y <= min_y {
+            return Ok(None);
+        }
+
+        let width = max_x - min_x;
+        let height = max_y - min_y;
+        let mut residual = BitImage::new(width, height).map_err(|e| anyhow!(e))?;
+        for instance in instances {
+            let offset_x = (instance.position.x - min_x) as usize;
+            let offset_y = (instance.position.y - min_y) as usize;
+            for y in 0..instance.instance_bitmap.height {
+                for x in 0..instance.instance_bitmap.width {
+                    if instance.instance_bitmap.get_usize(x, y) {
+                        residual.set_usize(offset_x + x, offset_y + y, true);
+                    }
+                }
+            }
+        }
+
+        if residual.count_ones() == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some((residual, min_x, min_y)))
+    }
+
+    fn encode_generic_region_payload_at(
+        &self,
+        image: &BitImage,
+        x: u32,
+        y: u32,
+    ) -> Result<Vec<u8>> {
+        let mut gr_cfg =
+            GenericRegionConfig::new(image.width as u32, image.height as u32, self.config.generic.dpi);
+        gr_cfg.x = x;
+        gr_cfg.y = y;
+        gr_cfg.comb_operator = self.config.generic.comb_operator;
+        gr_cfg.mmr = self.config.generic.mmr;
+        gr_cfg.tpgdon = self.config.generic.tpgdon;
+        gr_cfg.validate().map_err(|e: &'static str| anyhow!(e))?;
+
+        let coder_data = Jbig2ArithCoder::encode_generic_payload_cfg(image, &gr_cfg)?;
+        let params: GenericRegionParams = gr_cfg.clone().into();
+        let mut payload = params.to_bytes();
+        payload.extend_from_slice(&coder_data);
+        Ok(payload)
+    }
 }
 
 /// Encodes a generic region, optionally wrapping it in a complete JBIG2 file.
@@ -2112,6 +2951,7 @@ pub fn canonicalize_dict_symbols(symbols: &[&BitImage]) -> Vec<usize> {
 fn plan_symbol_dictionary_layout(
     symbols: &[&BitImage],
     config: &Jbig2Config,
+    usage_weights: Option<&[usize]>,
 ) -> Result<SymbolDictLayout> {
     let canonical_order = canonicalize_dict_symbols(symbols);
     if canonical_order.is_empty() {
@@ -2124,10 +2964,19 @@ fn plan_symbol_dictionary_layout(
         return Ok(SymbolDictLayout {
             export_input_indices: canonical_order,
             refinements: vec![None; symbols.len()],
+            diagnostics: SymbolDictDiagnostics {
+                singleton_family_count: symbols.len(),
+                exported_member_count: symbols.len(),
+                ..Default::default()
+            },
         });
     }
 
-    Ok(build_refinement_family_layout(symbols, &canonical_order, None))
+    Ok(build_refinement_family_layout(
+        symbols,
+        &canonical_order,
+        usage_weights,
+    ))
 }
 
 fn build_refinement_family_layout(
@@ -2149,7 +2998,7 @@ fn build_refinement_family_layout(
 
     let mut bucket_map: HashMap<FamilyBucketKey, Vec<usize>> = HashMap::new();
     for &input_index in canonical_order {
-        let key = family_bucket_key_for_symbol(symbols[input_index], black_counts[input_index]);
+        let key = family_bucket_key_for_symbol(symbols[input_index], &signatures[input_index]);
         bucket_map.entry(key).or_default().push(input_index);
     }
 
@@ -2158,7 +3007,7 @@ fn build_refinement_family_layout(
 
     for &input_index in canonical_order {
         let symbol = symbols[input_index];
-        let key = family_bucket_key_for_symbol(symbol, black_counts[input_index]);
+        let key = family_bucket_key_for_symbol(symbol, &signatures[input_index]);
 
         for neighbor in family_bucket_neighbors(key) {
             let Some(bucket) = bucket_map.get(&neighbor) else {
@@ -2193,13 +3042,17 @@ fn build_refinement_family_layout(
 
     let mut export_input_indices = Vec::new();
     let mut refinements = vec![None; symbols.len()];
+    let mut diagnostics = SymbolDictDiagnostics::default();
 
     let mut family_members: Vec<Vec<usize>> = families.into_values().collect();
     family_members.sort_by_key(|members| canonical_pos[members[0]]);
+    diagnostics.family_count = family_members.len();
 
     for mut members in family_members {
         members.sort_by_key(|&input_index| canonical_pos[input_index]);
         if members.len() == 1 {
+            diagnostics.singleton_family_count += 1;
+            diagnostics.exported_member_count += 1;
             export_input_indices.push(members[0]);
             continue;
         }
@@ -2212,7 +3065,18 @@ fn build_refinement_family_layout(
             &signatures,
             &black_counts,
         );
+        if diagnostics.sample_lines.len() < 128 {
+            diagnostics.sample_lines.push(format!(
+                "refine family: prototype={} members={} prototype_usage={}",
+                prototype_input_index,
+                members.len(),
+                usage_weights
+                    .and_then(|weights| weights.get(prototype_input_index).copied())
+                    .unwrap_or(1)
+            ));
+        }
         export_input_indices.push(prototype_input_index);
+        diagnostics.exported_member_count += 1;
 
         for &member_input_index in &members {
             if member_input_index == prototype_input_index {
@@ -2230,23 +3094,48 @@ fn build_refinement_family_layout(
             );
 
             match maybe_match {
-                Some((err, dx, dy))
-                    if family_refinement_gain(
+                Some(result)
+                    if family_should_refine(
                         symbols[member_input_index],
                         symbols[prototype_input_index],
-                        err,
-                        dx,
-                        dy,
-                    ) > 0 =>
+                        &result,
+                        usage_weights
+                            .and_then(|weights| weights.get(member_input_index).copied())
+                            .unwrap_or(1),
+                    ) =>
                 {
                     refinements[member_input_index] = Some(RefinementPlan {
                         prototype_input_index,
-                        refinement_dx: dx,
-                        refinement_dy: dy,
+                        refinement_dx: result.dx,
+                        refinement_dy: result.dy,
                     });
+                    diagnostics.refined_member_count += 1;
+                    if diagnostics.sample_lines.len() < 128 {
+                        diagnostics.sample_lines.push(format!(
+                            "  refine member={} -> prototype={} dx={} dy={} score={} usage={}",
+                            member_input_index,
+                            prototype_input_index,
+                            result.dx,
+                            result.dy,
+                            CompareWeights::REFINE.score(&result),
+                            usage_weights
+                                .and_then(|weights| weights.get(member_input_index).copied())
+                                .unwrap_or(1)
+                        ));
+                    }
                 }
                 _ => {
                     export_input_indices.push(member_input_index);
+                    diagnostics.exported_member_count += 1;
+                    if diagnostics.sample_lines.len() < 128 {
+                        diagnostics.sample_lines.push(format!(
+                            "  export member={} as standalone usage={}",
+                            member_input_index,
+                            usage_weights
+                                .and_then(|weights| weights.get(member_input_index).copied())
+                                .unwrap_or(1)
+                        ));
+                    }
                 }
             }
         }
@@ -2257,17 +3146,21 @@ fn build_refinement_family_layout(
     SymbolDictLayout {
         export_input_indices,
         refinements,
+        diagnostics,
     }
 }
 
 fn compute_symbol_signature_static(img: &BitImage) -> SymbolSignature {
-    let mut black = 0usize;
+    let mut black = 0u32;
     let mut left_col = img.width;
     let mut right_col = 0usize;
     let mut top_row = img.height;
     let mut bottom_row = 0usize;
-    let mut sum_x = 0usize;
-    let mut sum_y = 0usize;
+    let mut sum_x = 0u32;
+    let mut sum_y = 0u32;
+    let mut left_mass = 0u32;
+    let mut right_mass = 0u32;
+    let mid_x = img.width / 2;
 
     for y in 0..img.height {
         for x in 0..img.width {
@@ -2277,8 +3170,13 @@ fn compute_symbol_signature_static(img: &BitImage) -> SymbolSignature {
                 right_col = right_col.max(x);
                 top_row = top_row.min(y);
                 bottom_row = bottom_row.max(y);
-                sum_x += x;
-                sum_y += y;
+                sum_x += x as u32;
+                sum_y += y as u32;
+                if x < mid_x {
+                    left_mass += 1;
+                } else {
+                    right_mass += 1;
+                }
             }
         }
     }
@@ -2287,29 +3185,46 @@ fn compute_symbol_signature_static(img: &BitImage) -> SymbolSignature {
         (0, 0)
     } else {
         (
-            ((sum_x * 256) / black).min(u16::MAX as usize) as u16,
-            ((sum_y * 256) / black).min(u16::MAX as usize) as u16,
+            ((sum_x * 256) / black).min(u16::MAX as u32) as u16,
+            ((sum_y * 256) / black).min(u16::MAX as u32) as u16,
         )
     };
 
     SymbolSignature {
-        black: black.min(u16::MAX as usize) as u16,
+        black,
+        area: img.width.saturating_mul(img.height).min(u32::MAX as usize) as u32,
         left_col: left_col.min(u16::MAX as usize) as u16,
         right_col: right_col.min(u16::MAX as usize) as u16,
         top_row: top_row.min(u16::MAX as usize) as u16,
         bottom_row: bottom_row.min(u16::MAX as usize) as u16,
         cx_times_256: cx,
         cy_times_256: cy,
+        left_mass: left_mass.min(u16::MAX as u32) as u16,
+        right_mass: right_mass.min(u16::MAX as u32) as u16,
     }
 }
 
-fn family_bucket_key_for_symbol(symbol: &BitImage, black_pixels: usize) -> FamilyBucketKey {
-    let area = symbol.width.saturating_mul(symbol.height).max(1);
+#[inline]
+fn quantize_ratio_u8(num: u32, den: u32, bins: u32) -> u8 {
+    if den == 0 || bins == 0 {
+        return 0;
+    }
+    ((num.saturating_mul(bins)) / den)
+        .min(bins.saturating_sub(1)) as u8
+}
+
+fn family_bucket_key_for_symbol(symbol: &BitImage, sig: &SymbolSignature) -> FamilyBucketKey {
+    let w = symbol.width as u32;
+    let h = symbol.height as u32;
+    let area = sig.area.max(1);
+
     FamilyBucketKey {
-        w_bin: (symbol.width / 2).min(u16::MAX as usize) as u16,
-        h_bin: (symbol.height / 2).min(u16::MAX as usize) as u16,
-        density_bin: ((black_pixels * 16) / area).min(15) as u8,
-        aspect_bin: ((symbol.width * 16) / symbol.height.max(1)).min(31) as u8,
+        w_bin: ((w + 1) / 2).min(u16::MAX as u32) as u16,
+        h_bin: ((h + 1) / 2).min(u16::MAX as u32) as u16,
+        density_bin: quantize_ratio_u8(sig.black, area, 16),
+        aspect_bin: quantize_ratio_u8(w, h.max(1), 16),
+        centroid_y_bin: ((sig.cy_times_256 as u32 * 16) / (h.max(1) * 256)).min(15) as u8,
+        lr_balance_bin: quantize_ratio_u8(sig.left_mass as u32, sig.black.max(1), 8),
     }
 }
 
@@ -2323,6 +3238,8 @@ fn family_bucket_neighbors(key: FamilyBucketKey) -> Vec<FamilyBucketKey> {
                     h_bin: (key.h_bin as i32 + dh).max(0) as u16,
                     density_bin: (key.density_bin as i32 + dd).clamp(0, 15) as u8,
                     aspect_bin: key.aspect_bin,
+                    centroid_y_bin: key.centroid_y_bin,
+                    lr_balance_bin: key.lr_balance_bin,
                 });
             }
         }
@@ -2337,7 +3254,8 @@ fn family_signatures_are_compatible(
     rhs_black: usize,
 ) -> bool {
     let area_scale = lhs_black.max(rhs_black).max(4);
-    let black_tol = (area_scale / 10).clamp(4, 18) as u16;
+    let black_tol = (area_scale / 10).clamp(4, 10) as u32;
+    let mass_tol = (area_scale / 8).clamp(4, 12) as u16;
 
     lhs.black.abs_diff(rhs.black) <= black_tol
         && lhs.left_col.abs_diff(rhs.left_col) <= 2
@@ -2346,6 +3264,8 @@ fn family_signatures_are_compatible(
         && lhs.bottom_row.abs_diff(rhs.bottom_row) <= 1
         && lhs.cx_times_256.abs_diff(rhs.cx_times_256) <= 96
         && lhs.cy_times_256.abs_diff(rhs.cy_times_256) <= 96
+        && lhs.left_mass.abs_diff(rhs.left_mass) <= mass_tol
+        && lhs.right_mass.abs_diff(rhs.right_mass) <= mass_tol
 }
 
 fn family_match_details(
@@ -2356,7 +3276,7 @@ fn family_match_details(
     reference_index: usize,
     signatures: &[SymbolSignature],
     black_counts: &[usize],
-) -> Option<(u32, i32, i32)> {
+) -> Option<CompareResult> {
     if target.width.abs_diff(reference.width) > 2 || target.height.abs_diff(reference.height) > 2 {
         return None;
     }
@@ -2374,29 +3294,79 @@ fn family_match_details(
         .max(reference.width)
         .saturating_mul(target.height.max(reference.height));
     let max_err = ((area as f32 * 0.05).ceil() as u32).clamp(2, 16);
-    let (err, dx, dy) = comparator.distance(target, reference, max_err)?;
-    if dx.abs() > 2 || dy.abs() > 1 {
+    let result = comparator.compare_detailed(target, reference, max_err)?;
+    if result.dx.abs() > 2 || result.dy.abs() > 1 {
+        return None;
+    }
+    if CompareWeights::REFINE.score(&result) > 120 {
         return None;
     }
 
-    Some((err, dx, dy))
+    Some(result)
+}
+
+fn lossy_family_match_details(
+    comparator: &mut Comparator,
+    target: &BitImage,
+    target_index: usize,
+    reference: &BitImage,
+    reference_index: usize,
+    signatures: &[SymbolSignature],
+    black_counts: &[usize],
+    max_err: u32,
+    max_dx: i32,
+    max_dy: i32,
+) -> Option<CompareResult> {
+    if target.width.abs_diff(reference.width) > 1 || target.height.abs_diff(reference.height) > 1 {
+        return None;
+    }
+    if !family_signatures_are_compatible(
+        signatures[target_index],
+        signatures[reference_index],
+        black_counts[target_index],
+        black_counts[reference_index],
+    ) {
+        return None;
+    }
+
+    let result = comparator.compare_detailed(target, reference, max_err)?;
+    if result.dx.abs() > max_dx || result.dy.abs() > max_dy {
+        return None;
+    }
+    if CompareWeights::COLLAPSE.score(&result) > 140 {
+        return None;
+    }
+
+    Some(result)
 }
 
 fn family_refinement_gain(
     target: &BitImage,
     reference: &BitImage,
-    err: u32,
-    dx: i32,
-    dy: i32,
+    result: &CompareResult,
 ) -> i64 {
     let plain_cost = ((target.width.saturating_mul(target.height) + 7) / 8) as i64 + 14;
     let refine_cost = 10
-        + err as i64
-        + ((dx.abs() + dy.abs()) as i64 * 3)
+        + result.total_err as i64
+        + ((result.dx.abs() + result.dy.abs()) as i64 * 3)
+        + result.outside_ink_err as i64 * 2
         + (target.width.abs_diff(reference.width) + target.height.abs_diff(reference.height))
             as i64
             * 2;
     plain_cost - refine_cost
+}
+
+fn family_should_refine(
+    target: &BitImage,
+    reference: &BitImage,
+    result: &CompareResult,
+    usage_count: usize,
+) -> bool {
+    if usage_count > 1 {
+        return false;
+    }
+    let export_gain = family_refinement_gain(target, reference, result);
+    export_gain > 12
 }
 
 fn choose_family_prototype(
@@ -2414,6 +3384,7 @@ fn choose_family_prototype(
     let mut comparator = Comparator::default();
     let mut best_idx = members[0];
     let mut best_cost = u64::MAX;
+    let mut best_support = 0u64;
 
     for &candidate in members {
         let mut total_cost = 0u64;
@@ -2433,20 +3404,31 @@ fn choose_family_prototype(
                 signatures,
                 black_counts,
             ) {
-                Some((err, dx, dy)) => {
-                    total_cost +=
-                        (err as u64 + ((dx.abs() + dy.abs()) as u64 * 2) + 4) * weight;
+                Some(result) => {
+                    total_cost += (CompareWeights::REFINE.score(&result) as u64 + 4) * weight;
                 }
                 None => total_cost += 1_000_000 * weight,
             }
         }
 
+        let candidate_support = usage_weights
+            .and_then(|weights| weights.get(candidate).copied())
+            .unwrap_or(1) as u64;
+        let score_close = if best_cost == u64::MAX {
+            false
+        } else {
+            total_cost <= best_cost + best_cost / 50
+        };
+
         if total_cost < best_cost
+            || (score_close && candidate_support > best_support)
             || (total_cost == best_cost
+                && candidate_support == best_support
                 && canonical_pos[candidate] < canonical_pos[best_idx])
         {
             best_cost = total_cost;
             best_idx = candidate;
+            best_support = candidate_support;
         }
     }
 
@@ -3888,7 +4870,7 @@ pub fn encode_page_with_symbol_dictionary(
 
     // 3. Encode the symbol dictionary segment, getting the final symbol-ID mapping.
     let dict_refs: Vec<&BitImage> = dictionary_symbols.iter().collect();
-    let dict_layout = plan_symbol_dictionary_layout(&dict_refs, config)?;
+    let dict_layout = plan_symbol_dictionary_layout(&dict_refs, config, None)?;
     let encoded_dict = encode_symbol_dictionary_segments(&dict_refs, config, &dict_layout)?;
     let dict_segment_number = current_segment_number;
     current_segment_number += 1;
@@ -3936,7 +4918,8 @@ pub fn encode_page_with_symbol_dictionary(
         }
     }
 
-    let region_payload = if config.refine || symbol_instances.iter().any(|inst| inst.needs_refinement)
+    let region_payload = if !config.lossy_symbol_collapse
+        && (config.refine || symbol_instances.iter().any(|inst| inst.needs_refinement))
     {
         encode_text_region_with_refinement(
             &symbol_instances,
@@ -4033,7 +5016,7 @@ mod refine_tests {
         config.refine = true;
         config.text_refine = false;
 
-        let layout = plan_symbol_dictionary_layout(&symbols, &config).expect("layout");
+        let layout = plan_symbol_dictionary_layout(&symbols, &config, None).expect("layout");
         assert_eq!(layout.segment_count(), 1);
         assert_eq!(layout.export_input_indices.len(), 1);
         assert!(layout.refinements[1].is_some());
