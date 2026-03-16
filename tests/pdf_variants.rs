@@ -32,7 +32,10 @@ fn load_pbm(path: &str) -> BitImage {
         }
     }
 
-    let dims: Vec<usize> = line.split_whitespace().map(|s| s.parse().unwrap()).collect();
+    let dims: Vec<usize> = line
+        .split_whitespace()
+        .map(|s| s.parse().unwrap())
+        .collect();
     let (width, height) = (dims[0], dims[1]);
 
     let bytes_per_row = (width + 7) / 8;
@@ -55,7 +58,11 @@ fn load_pbm(path: &str) -> BitImage {
 /// Convert a BitImage to an ndarray Array2<u8> for the encoder.
 fn bitimage_to_array(img: &BitImage) -> ndarray::Array2<u8> {
     ndarray::Array2::from_shape_fn((img.height, img.width), |(y, x)| {
-        if img.get(x as u32, y as u32) { 1u8 } else { 0u8 }
+        if img.get(x as u32, y as u32) {
+            1u8
+        } else {
+            0u8
+        }
     })
 }
 
@@ -117,10 +124,7 @@ fn build_single_page_pdf(
     // Scale to points (assuming 300 DPI)
     let pt_w = ((width as f64 / 300.0) * 72.0) as f32;
     let pt_h = ((height as f64 / 300.0) * 72.0) as f32;
-    let content_str = format!(
-        "q {:.2} 0 0 {:.2} 0 0 cm /Im0 Do Q",
-        pt_w, pt_h
-    );
+    let content_str = format!("q {:.2} 0 0 {:.2} 0 0 cm /Im0 Do Q", pt_w, pt_h);
     let content_id = doc.add_object(Stream::new(
         lopdf::Dictionary::new(),
         content_str.into_bytes(),
@@ -205,10 +209,7 @@ fn build_multi_page_pdf(
             "XObject" => Object::Dictionary(xobject_dict),
         };
 
-        let content_str = format!(
-            "q {:.2} 0 0 {:.2} 0 0 cm /Im0 Do Q",
-            pt_w, pt_h
-        );
+        let content_str = format!("q {:.2} 0 0 {:.2} 0 0 cm /Im0 Do Q", pt_w, pt_h);
         let content_id = doc.add_object(Stream::new(
             lopdf::Dictionary::new(),
             content_str.into_bytes(),
@@ -264,7 +265,11 @@ fn output_dir() -> PathBuf {
 fn find_test_image() -> (BitImage, String) {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // Try test_image1.pbm first (larger, better for symbol mode)
-    for name in &["test_image1.pbm", "tests/fixtures/test_image1.pbm", "test_image2.pbm"] {
+    for name in &[
+        "test_image1.pbm",
+        "tests/fixtures/test_image1.pbm",
+        "test_image2.pbm",
+    ] {
         let path = base.join(name);
         if path.exists() {
             let img = load_pbm(path.to_str().unwrap());
@@ -273,7 +278,10 @@ fn find_test_image() -> (BitImage, String) {
     }
     // Fallback: small test image
     let path = base.join("tests/fixtures/test_image1.pbm");
-    (load_pbm(path.to_str().unwrap()), "tests/fixtures/test_image1.pbm".into())
+    (
+        load_pbm(path.to_str().unwrap()),
+        "tests/fixtures/test_image1.pbm".into(),
+    )
 }
 
 #[test]
@@ -301,7 +309,10 @@ fn generate_pdf_variants() {
         enc.add_page(&array).expect("A: add_page failed");
         let split = enc.flush_pdf_split().expect("A: flush_pdf_split failed");
 
-        assert!(split.global_segments.is_none(), "A: lossless should have no globals");
+        assert!(
+            split.global_segments.is_none(),
+            "A: lossless should have no globals"
+        );
         assert_eq!(split.page_streams.len(), 1, "A: expected 1 page stream");
 
         let mut pdf = build_single_page_pdf(

@@ -95,9 +95,15 @@ fn main() -> Result<()> {
         .to_luma8();
 
     let prepared = prepare_bilevel(&gray, &args.dither, args.threshold);
-    let bitimage = binary_pixels_to_bitimage(&prepared, gray.width() as usize, gray.height() as usize)
-        .map_err(|e| anyhow!(e))?;
-    write_pbm(&args.prepared_pbm, &prepared, gray.width() as usize, gray.height() as usize)?;
+    let bitimage =
+        binary_pixels_to_bitimage(&prepared, gray.width() as usize, gray.height() as usize)
+            .map_err(|e| anyhow!(e))?;
+    write_pbm(
+        &args.prepared_pbm,
+        &prepared,
+        gray.width() as usize,
+        gray.height() as usize,
+    )?;
 
     let mut config = Jbig2Config::default();
     config.want_full_headers = true;
@@ -120,8 +126,9 @@ fn main() -> Result<()> {
     fs::write(&args.output, &standalone)
         .with_context(|| format!("failed to write {}", args.output.display()))?;
 
-    let (globals, fragment) = encode_halftone_pdf_split_auto(&bitimage, &config, &region, 1, Some(1))
-        .context("failed to encode JBIG2 halftone PDF split stream")?;
+    let (globals, fragment) =
+        encode_halftone_pdf_split_auto(&bitimage, &config, &region, 1, Some(1))
+            .context("failed to encode JBIG2 halftone PDF split stream")?;
     create_pdf(
         &args.pdf_output,
         Some(&globals),
@@ -275,7 +282,10 @@ fn create_pdf(
         ));
     }
 
-    objects.push((image_id, make_stream_with_dict(image_dict.as_bytes(), jbig2_fragment)));
+    objects.push((
+        image_id,
+        make_stream_with_dict(image_dict.as_bytes(), jbig2_fragment),
+    ));
     objects.push((
         content_id,
         make_stream_with_dict(

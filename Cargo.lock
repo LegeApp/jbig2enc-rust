@@ -776,6 +776,7 @@ dependencies = [
  "lutz",
  "ndarray",
  "once_cell",
+ "rayon",
  "rustc-hash",
  "serde",
  "serde_derive",

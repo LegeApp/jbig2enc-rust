@@ -39,6 +39,7 @@ once_cell = "1.19"
 rustc-hash = "1.1"
 fax = { version = "0.2.6", default-features = false }
 image = { version = "0.24", default-features = false, features = ["png", "jpeg"], optional = true }
+rayon = { version = "1.10", optional = true }
 
 [build-dependencies]
 vergen = { version = "9.0.6", default-features = false, features = ["build"] }
@@ -52,6 +53,7 @@ line_verify = []
 cc-analysis = []
 symboldict = ["cc-analysis"]
 halftone_bin = ["dep:image"]
+parallel = ["dep:rayon"]
 
 [[bin]]
 name = "halftone_tester"

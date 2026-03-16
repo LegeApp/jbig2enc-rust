@@ -6,7 +6,7 @@ use bitvec::order::Msb0;
 use bitvec::prelude::*;
 use bitvec::slice::BitSlice;
 use ndarray::Array2;
-use once_cell::unsync::OnceCell;
+use once_cell::sync::OnceCell;
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
@@ -191,21 +191,23 @@ impl BitImage {
 
             for y in 0..self.height {
                 let row_offset = y * self.width;
-                for word_x in 0..words_per_row {
-                    let mut w = 0u32;
+                let row_bits = &self.bits[row_offset..row_offset + self.width];
+                let mut row_bytes = row_bits.chunks(8).map(|chunk| {
+                    let mut byte = chunk.load_be::<u8>();
+                    if chunk.len() < 8 {
+                        byte <<= 8 - chunk.len();
+                    }
+                    byte
+                });
 
-                    // pack up to 32 pixels, MSb-first in each u32 word
-                    for bit in 0..32 {
-                        let x = word_x * 32 + bit;
-                        if x < self.width {
-                            // Direct bitvec indexing — bypasses bounds-checked get_usize
-                            if self.bits[row_offset + x] {
-                                w |= 1u32 << (31 - bit);
-                            }
+                for _ in 0..words_per_row {
+                    let mut word = 0u32;
+                    for byte_idx in 0..4 {
+                        if let Some(byte) = row_bytes.next() {
+                            word |= (byte as u32) << (24 - byte_idx * 8);
                         }
                     }
-
-                    out.push(w);
+                    out.push(word);
                 }
             }
 
@@ -639,16 +641,8 @@ mod tests {
 
     #[test]
     fn binary_pixels_match_array_conversion() {
-        let pixels = vec![
-            0, 1, 0, 1, 1,
-            1, 0, 0, 0, 1,
-            0, 0, 1, 1, 0,
-        ];
-        let array = array![
-            [0u8, 1, 0, 1, 1],
-            [1u8, 0, 0, 0, 1],
-            [0u8, 0, 1, 1, 0],
-        ];
+        let pixels = vec![0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0];
+        let array = array![[0u8, 1, 0, 1, 1], [1u8, 0, 0, 0, 1], [0u8, 0, 1, 1, 0],];
 
         let from_pixels = binary_pixels_to_bitimage(&pixels, 5, 3).unwrap();
         let from_array = array_to_bitimage(&array);

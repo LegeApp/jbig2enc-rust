@@ -27,137 +27,134 @@ pub struct Comparator {
 }
 
 impl Comparator {
-    /// Helper to safely get a 32-bit word from a slice, returning 0 if the index is out of bounds.
-    fn get_word(row: &[u32], idx: isize) -> u32 {
-        // Safe version: fall back to 0 when idx is out‑of‑bounds.
-        if idx < 0 {
-            0
-        } else {
-            row.get(idx as usize).copied().unwrap_or(0)
-        }
-    }
-
     /// Calculates the minimum pixel distance between two BitImages, considering shifts within a search radius.
     ///
     /// The distance is defined as the number of differing pixels between the two images.
     /// It returns the minimum error, and the dx, dy shifts that result in that minimum error.
     /// If the minimum error found exceeds `max_err`, it returns `None`.
     pub fn distance(
-    &mut self,
-    a: &BitImage,
-    b: &BitImage,
-    max_err: u32,
-) -> Option<(u32, i32, i32)> {
-    if a == b {
-        return Some((0, 0, 0));
-    }
+        &mut self,
+        a: &BitImage,
+        b: &BitImage,
+        max_err: u32,
+    ) -> Option<(u32, i32, i32)> {
+        if a == b {
+            return Some((0, 0, 0));
+        }
 
-    if a.width.abs_diff(b.width) > MAX_DIMENSION_DELTA
-        || a.height.abs_diff(b.height) > MAX_DIMENSION_DELTA
-    {
-        return None;
-    }
+        if a.width.abs_diff(b.width) > MAX_DIMENSION_DELTA
+            || a.height.abs_diff(b.height) > MAX_DIMENSION_DELTA
+        {
+            return None;
+        }
 
-    let awpr = ((a.width + 31) >> 5) as usize;
-    let bwpr = ((b.width + 31) >> 5) as usize;
-    let wpr_overlap = ((a.width.max(b.width) + 31) >> 5) as usize;
-    if self.tmp.len() < wpr_overlap {
-        self.tmp.resize(wpr_overlap, 0);
-    }
+        let awpr = (a.width + 31) >> 5;
+        let bwpr = (b.width + 31) >> 5;
+        let wpr_overlap = (a.width.max(b.width) + 31) >> 5;
+        if self.tmp.len() < wpr_overlap {
+            self.tmp.resize(wpr_overlap, 0);
+        }
 
-    let a_words = a.packed_words();
-    let b_words = b.packed_words();
+        let a_words = a.packed_words();
+        let b_words = b.packed_words();
 
-    let mut best_err = max_err + 1;
-    let mut best_dx = 0;
-    let mut best_dy = 0;
+        let mut best_err = max_err + 1;
+        let mut best_dx = 0;
+        let mut best_dy = 0;
 
-    for dy in -SEARCH_RADIUS..=SEARCH_RADIUS {
-        for dx in -SEARCH_RADIUS..=SEARCH_RADIUS {
-            // Overlap rectangle in a's coordinates
-            let left = dx.max(0) as i32;
-            let right = (dx + b.width as i32).min(a.width as i32);
-            let top = dy.max(0) as i32;
-            let bottom = (dy + b.height as i32).min(a.height as i32);
-
-            if left >= right || top >= bottom {
+        for dy in -SEARCH_RADIUS..=SEARCH_RADIUS {
+            let top_i = dy.max(0);
+            let bottom_i = (dy + b.height as i32).min(a.height as i32);
+            if top_i >= bottom_i {
                 continue;
             }
+            let top = top_i as usize;
+            let bottom = bottom_i as usize;
+            let overlap_height = bottom - top;
+            let b_row_start = (top as i32 - dy) as usize;
 
-            let overlap_width = (right - left) as usize;
-            let overlap_height = (bottom - top) as usize;
-            let cols_words = (overlap_width + 31) >> 5;
+            for dx in -SEARCH_RADIUS..=SEARCH_RADIUS {
+                let left_i = dx.max(0);
+                let right_i = (dx + b.width as i32).min(a.width as i32);
+                if left_i >= right_i {
+                    continue;
+                }
+                let left = left_i as usize;
+                let right = right_i as usize;
 
-            let mut err = 0u32;
-            let mut early_break = false;
+                let overlap_width = right - left;
+                let cols_words = (overlap_width + 31) >> 5;
+                let bit_shift = (dx & 31) as usize;
+                let word_shift = dx >> 5;
+                let mut err = 0u32;
+                let mut early_break = false;
 
-            for row in 0..overlap_height {
-                // Absolute row in a and b
-                let a_row = (top + row as i32) as usize;
-                let b_row = (top + row as i32 - dy) as usize; // because b is shifted by dy
+                for row in 0..overlap_height {
+                    let a_slice = &a_words[(top + row) * awpr..(top + row + 1) * awpr];
+                    let b_slice =
+                        &b_words[(b_row_start + row) * bwpr..(b_row_start + row + 1) * bwpr];
 
-                let a_row_start = a_row * awpr;
-                let b_row_start = b_row * bwpr;
-
-                // Safety: rows are within bounds because of overlap calculation
-                let a_slice = &a_words[a_row_start..a_row_start + awpr];
-                let b_slice = &b_words[b_row_start..b_row_start + bwpr];
-
-                let bit_shift = (dx & 31) as u32;
-                let word_shift = (dx >> 5) as isize;
-
-                for w in 0..cols_words {
-                    let a_idx = w as isize + word_shift;
-                    let aw = Self::get_word(a_slice, a_idx);
-                    let aw_next = if bit_shift == 0 {
-                        0
+                    if bit_shift == 0 {
+                        for w in 0..cols_words {
+                            let a_idx = w as i32 + word_shift;
+                            let aw = if a_idx < 0 {
+                                0
+                            } else {
+                                a_slice.get(a_idx as usize).copied().unwrap_or(0)
+                            };
+                            err += (aw ^ b_slice[w]).count_ones();
+                            if err >= best_err || err > max_err {
+                                early_break = true;
+                                break;
+                            }
+                        }
                     } else {
-                        Self::get_word(a_slice, a_idx + 1)
-                    };
-                    let aligned_a = if bit_shift == 0 {
-                        aw
-                    } else {
-                        (aw << bit_shift) | (aw_next >> (32 - bit_shift))
-                    };
+                        let bit_shift = bit_shift as u32;
+                        for w in 0..cols_words {
+                            let a_idx = w as i32 + word_shift;
+                            let aw = if a_idx < 0 {
+                                0
+                            } else {
+                                a_slice.get(a_idx as usize).copied().unwrap_or(0)
+                            };
+                            let aw_next = if a_idx + 1 < 0 {
+                                0
+                            } else {
+                                a_slice.get((a_idx + 1) as usize).copied().unwrap_or(0)
+                            };
+                            let aligned_a = (aw << bit_shift) | (aw_next >> (32 - bit_shift));
+                            err += (aligned_a ^ b_slice[w]).count_ones();
+                            if err >= best_err || err > max_err {
+                                early_break = true;
+                                break;
+                            }
+                        }
+                    }
 
-                    // b word at the same column (no shift because we already accounted for dx in a's access)
-                    let bw = b_slice[w];
-
-                    let xor_result = aligned_a ^ bw;
-                    let ones = xor_result.count_ones();
-                    err += ones;
-
-                    if err >= best_err || err > max_err {
-                        early_break = true;
+                    if early_break {
                         break;
                     }
                 }
 
-                if early_break {
-                    break;
-                }
-            }
-
-            if err < best_err {
-                best_err = err;
-                best_dx = dx;
-                best_dy = dy;
-            } else if err == best_err && !early_break {
-                // Tie-break by smaller Manhattan distance
-                let curr_dist = dx.abs() + dy.abs();
-                let best_dist = best_dx.abs() + best_dy.abs();
-                if curr_dist < best_dist {
+                if err < best_err {
+                    best_err = err;
                     best_dx = dx;
                     best_dy = dy;
+                } else if err == best_err && !early_break {
+                    let curr_dist = dx.abs() + dy.abs();
+                    let best_dist = best_dx.abs() + best_dy.abs();
+                    if curr_dist < best_dist {
+                        best_dx = dx;
+                        best_dy = dy;
+                    }
                 }
             }
         }
-    }
 
-    if best_err <= max_err {
-        Some((best_err, best_dx, best_dy))
-    } else {
-        None
+        if best_err <= max_err {
+            Some((best_err, best_dx, best_dy))
+        } else {
+            None
+        }
     }
-}
 }

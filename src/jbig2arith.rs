@@ -9,6 +9,7 @@
 use anyhow::Result;
 use anyhow::anyhow;
 use once_cell::sync::Lazy;
+#[cfg(debug_assertions)]
 use std::collections::HashMap;
 
 #[cfg(not(feature = "trace_arith"))]
@@ -614,7 +615,12 @@ impl Jbig2ArithCoder {
     /// The OOB signal is the bit pattern '1000' as per Table A.1 in the JBIG2 specification.
     pub fn encode_oob(&mut self, proc: IntProc) -> anyhow::Result<()> {
         let context_idx = proc as usize;
-        for (idx, bit) in [(1usize, true), (3usize, false), (6usize, false), (12usize, false)] {
+        for (idx, bit) in [
+            (1usize, true),
+            (3usize, false),
+            (6usize, false),
+            (12usize, false),
+        ] {
             let next_state = self.encode_bit_with_state_idx(self.int_ctx[context_idx][idx], bit);
             self.int_ctx[context_idx][idx] = next_state;
         }
@@ -778,7 +784,8 @@ impl Jbig2ArithCoder {
                 let col = first_bit % width;
                 log::debug!(
                     "first black pixel according to Rust packer: ({}, {})",
-                    col, row
+                    col,
+                    row
                 );
             } else {
                 log::debug!("packed data all zero - no black pixels");
@@ -791,76 +798,73 @@ impl Jbig2ArithCoder {
             }
         }
 
-        // Helper function matching the original C code's image_get
-        let image_get = |x: i32, y: i32| -> u8 {
-            if y < 0 || x >= width as i32 || y >= height as i32 {
-                return 0;
-            }
-            if x < 0 {
-                return 0;
-            }
-            Self::sample(packed, width, height, x, y) as u8
-        };
+        let words_per_row = (width + 31) / 32;
 
+        #[cfg(debug_assertions)]
         let mut context_distribution: HashMap<usize, usize> = HashMap::new();
-        let progress_interval = (height as f32 * 0.1).ceil() as i32;
+        #[cfg(debug_assertions)]
         let mut last_reported_progress = -1;
 
-        for y in 0..height as i32 {
-            // Report progress at 10% intervals
-            let progress = (y * 10) / height as i32;
-            if progress > last_reported_progress {
-                last_reported_progress = progress;
-                let unique_contexts = context_distribution.len();
-                let total_samples: usize = context_distribution.values().sum();
-                let avg_occurrences = if unique_contexts > 0 {
-                    total_samples / unique_contexts
-                } else {
-                    0
-                };
+        for y in 0..height {
+            #[cfg(debug_assertions)]
+            {
+                let progress = (y as i32 * 10) / height as i32;
+                if progress > last_reported_progress {
+                    last_reported_progress = progress;
+                    let unique_contexts = context_distribution.len();
+                    let total_samples: usize = context_distribution.values().sum();
+                    let avg_occurrences = if unique_contexts > 0 {
+                        total_samples / unique_contexts
+                    } else {
+                        0
+                    };
 
-                log::debug!(
-                    "Progress: {}% - Line {}/{} - Contexts: {} unique (avg {:.1} uses/context)",
-                    progress * 10,
-                    y,
-                    height,
-                    unique_contexts,
-                    avg_occurrences as f32
-                );
-
-                // Reset for next interval
-                context_distribution.clear();
+                    log::debug!(
+                        "Progress: {}% - Line {}/{} - Contexts: {} unique (avg {:.1} uses/context)",
+                        progress * 10,
+                        y,
+                        height,
+                        unique_contexts,
+                        avg_occurrences as f32
+                    );
+                    context_distribution.clear();
+                }
             }
 
-            // Initialize context values for this row, matching C code exactly
-            let x = 0;
-            let mut c1 = (image_get(x, y - 2) as u16) << 2
-                | (image_get(x + 1, y - 2) as u16) << 1
-                | (image_get(x + 2, y - 2) as u16);
-            let mut c2 = (image_get(x, y - 1) as u16) << 3
-                | (image_get(x + 1, y - 1) as u16) << 2
-                | (image_get(x + 2, y - 1) as u16) << 1
-                | (image_get(x + 3, y - 1) as u16);
+            let row = &packed[y * words_per_row..(y + 1) * words_per_row];
+            let prev1 = if y > 0 {
+                Some(&packed[(y - 1) * words_per_row..y * words_per_row])
+            } else {
+                None
+            };
+            let prev2 = if y > 1 {
+                Some(&packed[(y - 2) * words_per_row..(y - 1) * words_per_row])
+            } else {
+                None
+            };
+
+            let mut c1 = (Self::sample_row(prev2, width, 0) << 2)
+                | (Self::sample_row(prev2, width, 1) << 1)
+                | Self::sample_row(prev2, width, 2);
+            let mut c2 = (Self::sample_row(prev1, width, 0) << 3)
+                | (Self::sample_row(prev1, width, 1) << 2)
+                | (Self::sample_row(prev1, width, 2) << 1)
+                | Self::sample_row(prev1, width, 3);
             let mut c3: u16 = 0;
 
-            for x in 0..width as i32 {
-                // Form the context exactly as in the C code
+            for x in 0..width {
                 let tval = (c1 << 11) | (c2 << 4) | c3;
-                let pixel = image_get(x, y);
+                let pixel = Self::sample_row(Some(row), width, x);
 
                 self.encode_bit(tval as usize, pixel != 0);
-                *context_distribution.entry(tval as usize).or_insert(0) += 1;
+                #[cfg(debug_assertions)]
+                {
+                    *context_distribution.entry(tval as usize).or_insert(0) += 1;
+                }
 
-                // Update context values for next pixel, matching C code
-                c1 <<= 1;
-                c2 <<= 1;
-                c3 <<= 1;
-                c1 |= image_get(x + 3, y - 2) as u16;
-                c2 |= image_get(x + 4, y - 1) as u16;
-                c3 |= pixel as u16;
-                c1 &= 31; // keep only 5 bits
-                c2 &= 127; // keep only 7 bits
-                c3 &= 15; // keep only 4 bits
+                c1 = ((c1 << 1) | Self::sample_row(prev2, width, x + 3)) & 31;
+                c2 = ((c2 << 1) | Self::sample_row(prev1, width, x + 4)) & 127;
+                c3 = ((c3 << 1) | pixel) & 15;
             }
 
             #[cfg(debug_assertions)]
@@ -878,43 +882,15 @@ impl Jbig2ArithCoder {
     /// Reads from packed data in row-major order with MSb-first bit orientation,
     /// matching the format produced by BitImage::to_packed_words().
     #[inline(always)]
-    fn sample(packed: &[u32], width: usize, height: usize, x: i32, y: i32) -> u32 {
-        let result = if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
-            #[cfg(debug_assertions)]
-            if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
-                log::trace!(
-                    "sample: out of bounds access x={}, y={} (width={}, height={})",
-                    x,
-                    y,
-                    width,
-                    height
-                );
-            }
-            0
-        } else {
-            let words_per_row = (width + 31) / 32;
-            let row_offset = (y as usize) * words_per_row;
-            let word_in_row = (x as usize) / 32;
-            let idx = row_offset + word_in_row;
-            if idx >= packed.len() {
-                #[cfg(debug_assertions)]
-                log::warn!(
-                    "sample: index out of bounds: idx={}, packed.len()={}",
-                    idx,
-                    packed.len()
-                );
-                return 0;
-            }
-            // MSb-first bit ordering within each word
-            let word = packed[idx];
-            let bit_pos = 31 - (x as usize % 32); // Keep MSB-first
-            (word >> bit_pos) & 1
+    fn sample_row(row: Option<&[u32]>, width: usize, x: usize) -> u16 {
+        if x >= width {
+            return 0;
+        }
+        let Some(row) = row else {
+            return 0;
         };
-
-        #[cfg(debug_assertions)]
-        log::trace!("sample: x={}, y={} -> {}", x, y, result);
-
-        result
+        let word = row[x >> 5];
+        ((word >> (31 - (x & 31))) & 1) as u16
     }
     #[cfg(feature = "line_verify")]
     fn verify_line_contexts(
@@ -1054,10 +1030,9 @@ impl Jbig2ArithCoder {
 
                 // Adaptive template pixel from reference (bit 12)
                 if template == 0 {
-                    cx |= (reference.get_pixel_safely(
-                        rx + grat_x as i32,
-                        ry + grat_y as i32,
-                    ) as usize) << 12;
+                    cx |= (reference.get_pixel_safely(rx + grat_x as i32, ry + grat_y as i32)
+                        as usize)
+                        << 12;
                 }
 
                 let pixel = target.get_pixel_safely(x, y) != 0;

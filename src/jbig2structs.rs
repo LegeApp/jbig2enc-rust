@@ -28,9 +28,9 @@ pub struct Jbig2Config {
     pub text_ds_offset: i8,       // SBDSOFFSET (signed 5-bit)
     pub text_refine: bool,        // SBREFINE
     pub text_log_strips: u8,      // LOGSBSTRIPS (0-3)
-    pub text_ref_corner: u8,      // REFCORNER (0-3): 0=BOTTOMLEFT, 1=TOPLEFT, 2=BOTTOMRIGHT, 3=TOPRIGHT
-    pub text_transposed: bool,    // TRANSPOSED
-    pub text_comb_op: u8,         // SBCOMBOP (0-4)
+    pub text_ref_corner: u8, // REFCORNER (0-3): 0=BOTTOMLEFT, 1=TOPLEFT, 2=BOTTOMRIGHT, 3=TOPRIGHT
+    pub text_transposed: bool, // TRANSPOSED
+    pub text_comb_op: u8,    // SBCOMBOP (0-4)
     pub text_refine_template: u8, // SBRTEMPLATE (0 or 1)
 
     // Halftone region settings
