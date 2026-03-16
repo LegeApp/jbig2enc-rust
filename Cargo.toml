@@ -51,6 +51,7 @@ trace_arith = []
 line_verify = []
 cc-analysis = []
 symboldict = ["cc-analysis"]
+refine = []
 halftone_bin = ["dep:image"]
 parallel = ["dep:rayon"]
 

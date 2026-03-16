@@ -1,22 +1,22 @@
 //! Multi-page JBIG2 compression benchmark
 //!
-//! Measures encode performance and compression for generic vs symbol modes.
-//! Separates encode time from PDF packaging and disk I/O.
+//! Measures encode performance and compression for generic, symbol, and
+//! experimental symbol+refinement modes.
+//! Separates encode time from fragment writing / decode verification and disk I/O.
 //!
 //! Run with:
-//!   cargo test --test multi_page_benchmark --features symboldict -- --nocapture
+//!   cargo test --test multi_page_benchmark --features "symboldict refine" -- --nocapture
 //!
 //! Environment variables:
 //!   BENCH_PAGES   — comma-separated page counts (default: "10,20,50")
 //!                   example: BENCH_PAGES=1,5,10,20,50,100,all
-//!   BENCH_WRITE   — set to "1" to write PDFs to disk (default: memory only)
+//!   BENCH_WRITE   — set to "1" to write JBIG2 fragments + decoded PBMs (default: memory only)
 
 use jbig2enc_rust::jbig2enc::{EncoderMetrics, Jbig2Encoder, PdfSplitOutput};
 use jbig2enc_rust::jbig2structs::Jbig2Config;
-use lopdf::dictionary;
-use lopdf::{Document, Object, Stream};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Instant, SystemTime};
 
 // ── Data types ───────────────────────────────────────────────────────
@@ -42,7 +42,6 @@ struct BenchRow {
     mpix_per_s: f64,
     raw_jbig2_bytes: usize,
     globals_bytes: usize,
-    pdf_bytes: u64,
     savings_vs_generic: f64,
     savings_vs_pbm: f64,
     avg_page_kb: f64,
@@ -131,105 +130,76 @@ fn raw_jbig2_stats(split: &PdfSplitOutput) -> (usize, usize, Vec<f64>) {
     (raw_pages + globals_bytes, globals_bytes, page_sizes_kb)
 }
 
-// ── PDF builder ──────────────────────────────────────────────────────
+// ── Fragment writer / decoder ────────────────────────────────────────
 
-fn build_multi_page_pdf(pages: &[(&[u8], u32, u32)], global_data: Option<&[u8]>) -> Document {
-    let mut doc = Document::with_version("1.7");
-
-    let globals_id = global_data.map(|gd| {
-        let stream = Stream::new(lopdf::Dictionary::new(), gd.to_vec());
-        doc.add_object(stream)
-    });
-
-    let mut page_ids = Vec::new();
-
-    for &(page_data, width, height) in pages {
-        let pt_w = ((width as f64 / 300.0) * 72.0) as f32;
-        let pt_h = ((height as f64 / 300.0) * 72.0) as f32;
-
-        let mut img_dict = lopdf::Dictionary::new();
-        img_dict.set("Type", Object::Name(b"XObject".to_vec()));
-        img_dict.set("Subtype", Object::Name(b"Image".to_vec()));
-        img_dict.set("Width", Object::Integer(width as i64));
-        img_dict.set("Height", Object::Integer(height as i64));
-        img_dict.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
-        img_dict.set("BitsPerComponent", Object::Integer(1));
-        img_dict.set("Filter", Object::Name(b"JBIG2Decode".to_vec()));
-        img_dict.set("Decode", vec![Object::Integer(0), Object::Integer(1)]);
-
-        if let Some(gid) = globals_id {
-            let mut dp = lopdf::Dictionary::new();
-            dp.set("JBIG2Globals", Object::Reference(gid));
-            img_dict.set("DecodeParms", Object::Dictionary(dp));
+fn jbig2dec_command() -> Command {
+    #[cfg(windows)]
+    {
+        let local = Path::new(".\\jbig2dec.exe");
+        if local.exists() {
+            return Command::new(local);
         }
-
-        let img_stream = Stream::new(img_dict, page_data.to_vec());
-        let img_id = doc.add_object(img_stream);
-
-        let xobject_dict = dictionary! { "Im0" => Object::Reference(img_id) };
-        let resources = dictionary! { "XObject" => Object::Dictionary(xobject_dict) };
-
-        let content_str = format!("q {:.2} 0 0 {:.2} 0 0 cm /Im0 Do Q", pt_w, pt_h);
-        let content_id = doc.add_object(Stream::new(
-            lopdf::Dictionary::new(),
-            content_str.into_bytes(),
-        ));
-
-        let page_dict = dictionary! {
-            "Type" => "Page",
-            "MediaBox" => vec![0.into(), 0.into(), Object::Real(pt_w), Object::Real(pt_h)],
-            "Contents" => Object::Reference(content_id),
-            "Resources" => Object::Dictionary(resources),
-        };
-        let page_id = doc.add_object(page_dict);
-        page_ids.push(page_id);
+        Command::new("jbig2dec.exe")
     }
-
-    let kids: Vec<Object> = page_ids.iter().map(|id| Object::Reference(*id)).collect();
-    let pages_dict = dictionary! {
-        "Type" => "Pages",
-        "Kids" => kids,
-        "Count" => Object::Integer(page_ids.len() as i64),
-    };
-    let pages_id = doc.add_object(pages_dict);
-
-    for &pid in &page_ids {
-        if let Ok(Object::Dictionary(d)) = doc.get_object_mut(pid) {
-            d.set("Parent", Object::Reference(pages_id));
+    #[cfg(not(windows))]
+    {
+        let local = Path::new("./jbig2dec");
+        if local.exists() {
+            return Command::new(local);
         }
+        Command::new("jbig2dec")
     }
-
-    let catalog = dictionary! {
-        "Type" => "Catalog",
-        "Pages" => Object::Reference(pages_id),
-    };
-    let catalog_id = doc.add_object(catalog);
-    doc.trailer.set("Root", Object::Reference(catalog_id));
-    doc
 }
 
-/// Build PDF in memory or save to disk. Returns byte size.
-fn build_pdf_size(split: &PdfSplitOutput, pages: &[PageInfo], out_path: Option<&Path>) -> u64 {
-    let page_tuples: Vec<(&[u8], u32, u32)> = split
-        .page_streams
-        .iter()
-        .zip(pages.iter())
-        .map(|(data, pi)| (data.as_slice(), pi.width, pi.height))
-        .collect();
+fn write_fragments_and_decode(
+    split: &PdfSplitOutput,
+    out_dir: &Path,
+    prefix: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(out_dir)?;
 
-    let mut pdf = build_multi_page_pdf(&page_tuples, split.global_segments.as_deref());
+    let globals_path = if let Some(globals) = &split.global_segments {
+        let path = out_dir.join(format!("{prefix}_globals.jb2"));
+        std::fs::write(&path, globals)?;
+        Some(path)
+    } else {
+        None
+    };
 
-    match out_path {
-        Some(path) => {
-            pdf.save(path).unwrap();
-            std::fs::metadata(path).unwrap().len()
+    for (page_index, page_stream) in split.page_streams.iter().enumerate() {
+        let page_num = page_index + 1;
+        let fragment_path = out_dir.join(format!("{prefix}_page_{page_num:03}.jb2"));
+        let decoded_path = out_dir.join(format!("{prefix}_page_{page_num:03}.pbm"));
+        std::fs::write(&fragment_path, page_stream)?;
+
+        let mut cmd = jbig2dec_command();
+        cmd.arg("--format")
+            .arg("pbm")
+            .arg("--output")
+            .arg(&decoded_path);
+
+        if let Some(globals_path) = &globals_path {
+            cmd.arg(globals_path).arg(&fragment_path);
+        } else {
+            cmd.arg("--embedded").arg(&fragment_path);
         }
-        None => {
-            let mut buf = Vec::new();
-            pdf.save_to(&mut buf).unwrap();
-            buf.len() as u64
+
+        let output = cmd.output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(format!(
+                "jbig2dec failed for {}: {}\nstdout:\n{}\nstderr:\n{}",
+                fragment_path.display(),
+                output.status,
+                stdout,
+                stderr
+            )
+            .into());
         }
     }
+
+    Ok(())
 }
 
 // ── Config helpers ───────────────────────────────────────────────────
@@ -266,15 +236,21 @@ fn should_write_pdfs() -> bool {
 fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig2Config)> {
     let mut cfgs = vec![];
 
-    let mut cfg_no_at = Jbig2Config::text();
-    cfg_no_at.auto_thresh = false;
-    cfg_no_at.want_full_headers = false;
-    cfgs.push(("sym_no_at", cfg_no_at));
+    let mut cfg_symbol = Jbig2Config::text();
+    cfg_symbol.auto_thresh = false;
+    cfg_symbol.want_full_headers = false;
+    cfgs.push(("symbol", cfg_symbol));
 
     let _ = (count, total_pixels);
-    let mut cfg_at = Jbig2Config::text();
-    cfg_at.want_full_headers = false;
-    cfgs.push(("sym_at", cfg_at));
+    #[cfg(feature = "refine")]
+    {
+        let mut cfg_refine = Jbig2Config::text();
+        cfg_refine.auto_thresh = false;
+        cfg_refine.want_full_headers = false;
+        cfg_refine.refine = true;
+        cfg_refine.text_refine = false;
+        cfgs.push(("sym_refine", cfg_refine));
+    }
 
     cfgs
 }
@@ -324,20 +300,20 @@ fn multi_page_compression_benchmark() {
     println!("Loaded in {:.1}s\n", load_start.elapsed().as_secs_f64());
 
     let page_counts = parse_page_counts(total_pages);
-    let write_pdfs = should_write_pdfs();
+    let write_outputs = should_write_pdfs();
 
     let ts = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("test_output_pdfs")
+        .join("test_output_fragments")
         .join(format!("benchmark_{ts}"));
-    if write_pdfs {
+    if write_outputs {
         std::fs::create_dir_all(&out_dir).unwrap();
     }
 
-    println!("Source: confed/ ({total_pages} pages)  |  Write PDFs: {write_pdfs}");
+    println!("Source: confed/ ({total_pages} pages)  |  Write fragments: {write_outputs}");
     println!("Page counts: {:?}\n", page_counts);
 
     // ── Warmup ───────────────────────────────────────────────────
@@ -354,19 +330,18 @@ fn multi_page_compression_benchmark() {
 
     // ── Table header ─────────────────────────────────────────────
     println!(
-        "{:<6} {:<10} {:>10} {:>10} {:>10} {:>8} {:>10} {:>8} {:>8} {:>8}",
+        "{:<6} {:<10} {:>10} {:>10} {:>8} {:>10} {:>8} {:>8} {:>8}",
         "Pages",
         "Mode",
         "Raw KB",
         "Globals",
-        "PDF KB",
         "vs Gen",
         "Enc (s)",
         "ms/pg",
         "MPix/s",
         "vs PBM"
     );
-    println!("{}", "─".repeat(102));
+    println!("{}", "─".repeat(92));
 
     let mut all_rows: Vec<BenchRow> = Vec::new();
 
@@ -387,17 +362,14 @@ fn multi_page_compression_benchmark() {
         );
 
         let (gen_raw, gen_globals, gen_page_kb) = raw_jbig2_stats(&gen_result.split);
-        let gen_pdf_path = out_dir.join(format!("generic_{count}p.pdf"));
-        let gen_pdf_bytes = build_pdf_size(
-            &gen_result.split,
-            pages,
-            if write_pdfs {
-                Some(&gen_pdf_path)
-            } else {
-                None
-            },
-        );
-        assert!(gen_pdf_bytes > 0, "generic PDF is empty");
+        if write_outputs {
+            write_fragments_and_decode(
+                &gen_result.split,
+                &out_dir.join(format!("generic_{count}p")),
+                &format!("generic_{count}p"),
+            )
+            .expect("write/decode generic fragments failed");
+        }
 
         let gen_avg_page = gen_page_kb.iter().sum::<f64>() / gen_page_kb.len() as f64;
         let gen_min_page = gen_page_kb.iter().cloned().fold(f64::MAX, f64::min);
@@ -414,7 +386,6 @@ fn multi_page_compression_benchmark() {
             mpix_per_s: gen_mpix,
             raw_jbig2_bytes: gen_raw,
             globals_bytes: gen_globals,
-            pdf_bytes: gen_pdf_bytes,
             savings_vs_generic: 0.0,
             savings_vs_pbm: gen_vs_pbm,
             avg_page_kb: gen_avg_page,
@@ -447,12 +418,11 @@ fn multi_page_compression_benchmark() {
         };
 
         println!(
-            "{:<6} {:<10} {:>9.1} {:>9.1} {:>9.1} {:>7}  {:>9.2} {:>7.1} {:>7.1} {:>7.1}%",
+            "{:<6} {:<10} {:>9.1} {:>9.1} {:>7}  {:>9.2} {:>7.1} {:>7.1} {:>7.1}%",
             count,
             "generic",
             gen_raw as f64 / 1024.0,
             gen_globals as f64 / 1024.0,
-            gen_pdf_bytes as f64 / 1024.0,
             "—",
             gen_result.encode_secs,
             gen_ms,
@@ -473,16 +443,14 @@ fn multi_page_compression_benchmark() {
             );
 
             let (raw_total, globals_bytes, page_kb) = raw_jbig2_stats(&result.split);
-            let sym_pdf_path = out_dir.join(format!("{label}_{count}p.pdf"));
-            let pdf_bytes = build_pdf_size(
-                &result.split,
-                pages,
-                if write_pdfs {
-                    Some(&sym_pdf_path)
-                } else {
-                    None
-                },
-            );
+            if write_outputs {
+                write_fragments_and_decode(
+                    &result.split,
+                    &out_dir.join(format!("{label}_{count}p")),
+                    &format!("{label}_{count}p"),
+                )
+                .unwrap_or_else(|e| panic!("write/decode {label} fragments failed: {e}"));
+            }
 
             let savings_gen = (1.0 - raw_total as f64 / gen_raw as f64) * 100.0;
             let savings_pbm = (1.0 - raw_total as f64 / total_pbm_bytes as f64) * 100.0;
@@ -493,12 +461,11 @@ fn multi_page_compression_benchmark() {
             let max_page = page_kb.iter().cloned().fold(0.0_f64, f64::max);
 
             println!(
-                "{:<6} {:<10} {:>9.1} {:>9.1} {:>9.1} {:>6.1}%  {:>9.2} {:>7.1} {:>7.1} {:>7.1}%",
+                "{:<6} {:<10} {:>9.1} {:>9.1} {:>6.1}%  {:>9.2} {:>7.1} {:>7.1} {:>7.1}%",
                 count,
                 label,
                 raw_total as f64 / 1024.0,
                 globals_bytes as f64 / 1024.0,
-                pdf_bytes as f64 / 1024.0,
                 savings_gen,
                 result.encode_secs,
                 ms,
@@ -514,7 +481,6 @@ fn multi_page_compression_benchmark() {
                 mpix_per_s: mpix,
                 raw_jbig2_bytes: raw_total,
                 globals_bytes,
-                pdf_bytes,
                 savings_vs_generic: savings_gen,
                 savings_vs_pbm: savings_pbm,
                 avg_page_kb: avg_page,
@@ -582,14 +548,14 @@ fn multi_page_compression_benchmark() {
     println!();
 
     // ── CSV output ───────────────────────────────────────────────
-    if write_pdfs {
+    if write_outputs {
         let csv_path = out_dir.join("results.csv");
         let mut csv = String::from(
-            "pages,mode,encode_secs,ms_per_page,mpix_per_s,raw_jbig2_bytes,globals_bytes,pdf_bytes,savings_vs_generic,savings_vs_pbm,cc_secs,match_secs,cluster_secs,planning_secs,dict_secs,text_secs,generic_secs,symbols_discovered,symbols_exported,avg_symbol_reuse,global_symbol_count,local_symbol_count\n",
+            "pages,mode,encode_secs,ms_per_page,mpix_per_s,raw_jbig2_bytes,globals_bytes,savings_vs_generic,savings_vs_pbm,cc_secs,match_secs,cluster_secs,planning_secs,dict_secs,text_secs,generic_secs,symbols_discovered,symbols_exported,avg_symbol_reuse,global_symbol_count,local_symbol_count\n",
         );
         for row in &all_rows {
             csv += &format!(
-                "{},{},{:.4},{:.2},{:.2},{},{},{},{:.2},{:.2},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{},{:.4},{},{}\n",
+                "{},{},{:.4},{:.2},{:.2},{},{},{:.2},{:.2},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{},{:.4},{},{}\n",
                 row.pages,
                 row.mode,
                 row.encode_secs,
@@ -597,7 +563,6 @@ fn multi_page_compression_benchmark() {
                 row.mpix_per_s,
                 row.raw_jbig2_bytes,
                 row.globals_bytes,
-                row.pdf_bytes,
                 row.savings_vs_generic,
                 row.savings_vs_pbm,
                 row.cc_secs,
@@ -615,8 +580,11 @@ fn multi_page_compression_benchmark() {
             );
         }
         std::fs::write(&csv_path, csv).unwrap();
-        println!("PDFs + CSV written to: {}", out_dir.display());
+        println!(
+            "Fragments + decoded PBMs + CSV written to: {}",
+            out_dir.display()
+        );
     } else {
-        println!("(set BENCH_WRITE=1 to write PDFs and CSV to disk)");
+        println!("(set BENCH_WRITE=1 to write JBIG2 fragments, decoded PBMs, and CSV to disk)");
     }
 }

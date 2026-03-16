@@ -312,9 +312,6 @@ fn encode_single_bitimage(
     if !enc_config.symbol_mode {
         enc_config.refine = false;
         enc_config.text_refine = false;
-    } else {
-        enc_config.text_refine = enc_config.text_refine || enc_config.refine;
-        enc_config.refine = enc_config.text_refine;
     }
 
     let global_data = if ctx.get_symbol_mode() && ctx.get_pdf_mode() {
@@ -376,9 +373,6 @@ pub fn encode_rois(
     if !enc_config.symbol_mode {
         enc_config.refine = false;
         enc_config.text_refine = false;
-    } else {
-        enc_config.text_refine = enc_config.text_refine || enc_config.refine;
-        enc_config.refine = enc_config.text_refine;
     }
 
     // For PDF mode with symbol encoding, create global dictionary

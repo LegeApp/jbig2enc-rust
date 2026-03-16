@@ -484,19 +484,38 @@ impl From<GenericRegionConfig> for GenericRegionParams {
 pub struct SymbolDictParams {
     pub sd_template: u8,   // Symbol dictionary template (0-3)
     pub at: [(i8, i8); 4], // Adaptive template coordinates (a1x, a1y, ..., a4x, a4y)
+    pub refine_aggregate: bool,
+    pub refine_template: u8,
+    pub refine_at: [(i8, i8); 2],
     pub exsyms: u32,       // Number of exported symbols
     pub newsyms: u32,      // Number of new symbols
 }
 
 impl SymbolDictParams {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(2 + 8 + 4 + 4);
-        let b = self.sd_template & 0x03; // SDTEMPLATE in low 2 bits
-        buf.push(b);
-        buf.push(0); // Reserved flags
+        let mut buf = Vec::with_capacity(
+            2 + 8 + if self.refine_aggregate && self.refine_template == 0 { 4 } else { 0 } + 4 + 4,
+        );
+
+        let mut flags = 0u16;
+        flags |= ((self.sd_template & 0x03) as u16) << 10;
+        if self.refine_aggregate {
+            flags |= 1 << 1; // SDREFAGG
+        }
+        if self.refine_aggregate && (self.refine_template & 0x01) == 1 {
+            flags |= 1 << 12; // SDRTEMPLATE
+        }
+
+        buf.write_u16::<BigEndian>(flags).unwrap();
         for &(x, y) in &self.at {
             buf.push(x as u8);
             buf.push(y as u8);
+        }
+        if self.refine_aggregate && self.refine_template == 0 {
+            for &(x, y) in &self.refine_at {
+                buf.push(x as u8);
+                buf.push(y as u8);
+            }
         }
         buf.write_u32::<BigEndian>(self.exsyms).unwrap();
         buf.write_u32::<BigEndian>(self.newsyms).unwrap();
