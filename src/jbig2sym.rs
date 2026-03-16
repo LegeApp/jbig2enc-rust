@@ -460,20 +460,6 @@ impl BitImage {
     }
 }
 
-impl lutz::Image for BitImage {
-    fn width(&self) -> u32 {
-        usize_to_u32(self.width)
-    }
-
-    fn height(&self) -> u32 {
-        usize_to_u32(self.height)
-    }
-
-    fn has_pixel(&self, x: u32, y: u32) -> bool {
-        self.get(x, y)
-    }
-}
-
 // ==============================================
 // Rectangle and symbol structures
 // ==============================================

@@ -40,7 +40,7 @@ macro_rules! trace {
 use crate::{debug, trace};
 
 use ndarray::Array2;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,50 @@ use rayon::prelude::*;
 /// A key type for hashing bitmaps efficiently
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HashKey(u64);
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SymbolSignature {
+    black: u16,
+    left_col: u16,
+    right_col: u16,
+    top_row: u16,
+    bottom_row: u16,
+    cx_times_256: u16,
+    cy_times_256: u16,
+}
+
+#[derive(Debug)]
+struct RecentSymbolCache {
+    recent: VecDeque<usize>,
+    cap: usize,
+}
+
+impl RecentSymbolCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            recent: VecDeque::with_capacity(cap),
+            cap,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.recent.clear();
+    }
+
+    fn touch(&mut self, idx: usize) {
+        if let Some(pos) = self.recent.iter().position(|&entry| entry == idx) {
+            self.recent.remove(pos);
+        }
+        self.recent.push_front(idx);
+        while self.recent.len() > self.cap {
+            self.recent.pop_back();
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.recent.iter().copied()
+    }
+}
 
 impl Hash for HashKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -159,6 +203,11 @@ pub struct SymbolModeStats {
     pub avg_symbol_reuse: f64,
     pub global_symbol_count: usize,
     pub local_symbol_count: usize,
+    pub comparator_calls: usize,
+    pub comparator_hits: usize,
+    pub exact_hits: usize,
+    pub refined_hits: usize,
+    pub signature_rejects: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -197,6 +246,7 @@ struct PlannedPageLayout {
     region_segment_number: u32,
     end_of_page_segment_number: u32,
     local_symbols: Vec<usize>,
+    use_generic_region: bool,
 }
 
 #[derive(Debug)]
@@ -236,6 +286,9 @@ pub struct Jbig2Encoder<'a> {
 
     /// Black pixel count cache for each global symbol (for fast pre-filtering)
     symbol_pixel_counts: Vec<usize>,
+
+    /// Cheap structural signatures used to reject bad matches before full comparison
+    symbol_signatures: Vec<SymbolSignature>,
 
     /// Number of distinct pages where each symbol appears
     symbol_page_count: Vec<usize>,
@@ -284,6 +337,7 @@ impl<'a> Jbig2Encoder<'a> {
             global_symbols: Vec::new(),
             symbol_usage: Vec::new(),
             symbol_pixel_counts: Vec::new(),
+            symbol_signatures: Vec::new(),
             symbol_page_count: Vec::new(),
             symbol_last_page_seen: Vec::new(),
             hash_map: HashMap::new(),
@@ -326,6 +380,231 @@ impl<'a> Jbig2Encoder<'a> {
         )
     }
 
+    fn compute_symbol_signature(img: &BitImage) -> SymbolSignature {
+        let mut black = 0usize;
+        let mut left_col = img.width;
+        let mut right_col = 0usize;
+        let mut top_row = img.height;
+        let mut bottom_row = 0usize;
+        let mut sum_x = 0usize;
+        let mut sum_y = 0usize;
+
+        for y in 0..img.height {
+            for x in 0..img.width {
+                if img.get_usize(x, y) {
+                    black += 1;
+                    left_col = left_col.min(x);
+                    right_col = right_col.max(x);
+                    top_row = top_row.min(y);
+                    bottom_row = bottom_row.max(y);
+                    sum_x += x;
+                    sum_y += y;
+                }
+            }
+        }
+
+        let (cx, cy) = if black == 0 {
+            (0, 0)
+        } else {
+            (
+                ((sum_x * 256) / black).min(u16::MAX as usize) as u16,
+                ((sum_y * 256) / black).min(u16::MAX as usize) as u16,
+            )
+        };
+
+        SymbolSignature {
+            black: black.min(u16::MAX as usize) as u16,
+            left_col: left_col.min(u16::MAX as usize) as u16,
+            right_col: right_col.min(u16::MAX as usize) as u16,
+            top_row: top_row.min(u16::MAX as usize) as u16,
+            bottom_row: bottom_row.min(u16::MAX as usize) as u16,
+            cx_times_256: cx,
+            cy_times_256: cy,
+        }
+    }
+
+    fn signatures_are_compatible(
+        &self,
+        candidate: SymbolSignature,
+        symbol_index: usize,
+        refine: bool,
+    ) -> bool {
+        let stored = self.symbol_signatures[symbol_index];
+        let black_tol = if refine { 12 } else { 8 };
+        let pos_tol = if refine { 2 } else { 2 };
+        let centroid_tol = if refine { 96 } else { 64 };
+
+        candidate.black.abs_diff(stored.black) <= black_tol
+            && candidate.left_col.abs_diff(stored.left_col) <= pos_tol
+            && candidate.right_col.abs_diff(stored.right_col) <= pos_tol
+            && candidate.top_row.abs_diff(stored.top_row) <= pos_tol
+            && candidate.bottom_row.abs_diff(stored.bottom_row) <= pos_tol
+            && candidate.cx_times_256.abs_diff(stored.cx_times_256) <= centroid_tol
+            && candidate.cy_times_256.abs_diff(stored.cy_times_256) <= centroid_tol
+    }
+
+    fn should_skip_symbol_candidate(width: usize, height: usize, black_pixels: usize) -> bool {
+        if width == 0 || height == 0 || black_pixels <= 1 {
+            return true;
+        }
+        if (width >= 64 && height <= 2) || (height >= 64 && width <= 2) {
+            return true;
+        }
+        if width > 256 || height > 256 {
+            return true;
+        }
+
+        let area = width.saturating_mul(height).max(1);
+        let density = black_pixels as f32 / area as f32;
+        !(0.01..=0.90).contains(&density)
+    }
+
+    fn should_accept_match(
+        &self,
+        err: u32,
+        dx: i32,
+        dy: i32,
+        exact_dims: bool,
+        max_err: u32,
+    ) -> (bool, bool) {
+        if err == 0 && dx == 0 && dy == 0 && exact_dims {
+            return (true, false);
+        }
+
+        if self.config.text_refine {
+            if dx.abs() <= 1 && dy.abs() <= 1 && err <= (max_err / 2).max(2) {
+                return (true, true);
+            }
+            return (false, false);
+        }
+
+        if dx.abs() <= 1 && dy == 0 {
+            return (true, false);
+        }
+
+        (false, false)
+    }
+
+    fn evaluate_symbol_match(
+        &mut self,
+        candidate: &BitImage,
+        candidate_sig: SymbolSignature,
+        candidate_pixels: usize,
+        symbol_index: usize,
+        comparator: &mut Comparator,
+        max_err: u32,
+    ) -> Option<(u32, i32, i32, bool)> {
+        let proto = &self.global_symbols[symbol_index];
+        let dim_limit = if self.config.text_refine { 2 } else { 0 };
+        if (candidate.width as i32 - proto.width as i32).unsigned_abs() > dim_limit
+            || (candidate.height as i32 - proto.height as i32).unsigned_abs() > dim_limit
+        {
+            return None;
+        }
+        if self.symbol_pixel_counts[symbol_index].abs_diff(candidate_pixels)
+            > max_err as usize + if self.config.text_refine { 8 } else { 6 }
+        {
+            return None;
+        }
+        if !self.signatures_are_compatible(candidate_sig, symbol_index, self.config.text_refine) {
+            self.metrics.symbol_stats.signature_rejects += 1;
+            return None;
+        }
+
+        self.metrics.symbol_stats.comparator_calls += 1;
+        let (err, dx, dy) = comparator.distance(candidate, proto, max_err)?;
+        self.metrics.symbol_stats.comparator_hits += 1;
+
+        let exact_dims = candidate.width == proto.width && candidate.height == proto.height;
+        let (accept, needs_refinement) = self.should_accept_match(err, dx, dy, exact_dims, max_err);
+        if !accept {
+            return None;
+        }
+
+        if needs_refinement {
+            self.metrics.symbol_stats.refined_hits += 1;
+        } else if err == 0 && dx == 0 && dy == 0 && exact_dims {
+            self.metrics.symbol_stats.exact_hits += 1;
+        }
+
+        Some((err, dx, dy, needs_refinement))
+    }
+
+    fn estimate_local_symbol_gain(&self, page: &PageData, symbol_index: usize) -> i64 {
+        let uses = page
+            .symbol_instances
+            .iter()
+            .filter(|instance| instance.symbol_index == symbol_index)
+            .count() as i64;
+        let symbol = &self.global_symbols[symbol_index];
+        let area = (symbol.width * symbol.height) as i64;
+        let dict_cost = 24 + (area / 8);
+        let saved_per_use = (area / 10).max(2);
+        (uses * saved_per_use) - dict_cost
+    }
+
+    fn choose_cluster_prototype(&self, members: &[usize]) -> usize {
+        if members.len() <= 1 || !self.config.text_refine {
+            return *members
+                .iter()
+                .max_by(|&&lhs, &&rhs| {
+                    self.symbol_usage[lhs]
+                        .cmp(&self.symbol_usage[rhs])
+                        .then_with(|| {
+                            self.symbol_pixel_counts[lhs].cmp(&self.symbol_pixel_counts[rhs])
+                        })
+                        .then_with(|| rhs.cmp(&lhs))
+                })
+                .unwrap();
+        }
+
+        let mut comparator = Comparator::default();
+        let mut best_idx = members[0];
+        let mut best_cost = u64::MAX;
+
+        for &candidate in members {
+            let candidate_symbol = &self.global_symbols[candidate];
+            let mut total_cost = 0u64;
+            for &other in members {
+                if candidate == other {
+                    continue;
+                }
+                let other_symbol = &self.global_symbols[other];
+                let area = candidate_symbol.width.max(other_symbol.width)
+                    * candidate_symbol.height.max(other_symbol.height);
+                let max_err = ((self.symbol_pixel_counts[candidate]
+                    .max(self.symbol_pixel_counts[other]) as f32
+                    * 0.10) as u32)
+                    .max((area / self.config.match_tolerance.max(1) as usize) as u32)
+                    .clamp(3, 20);
+
+                match comparator.distance(other_symbol, candidate_symbol, max_err) {
+                    Some((err, dx, dy)) => {
+                        let refinement_penalty = err as u64 + ((dx.abs() + dy.abs()) as u64 * 2);
+                        total_cost += refinement_penalty * self.symbol_usage[other] as u64;
+                    }
+                    None => total_cost += 1_000_000,
+                }
+            }
+
+            if total_cost < best_cost
+                || (total_cost == best_cost
+                    && (
+                        self.symbol_usage[candidate],
+                        self.symbol_pixel_counts[candidate],
+                    ) > (
+                        self.symbol_usage[best_idx],
+                        self.symbol_pixel_counts[best_idx],
+                    ))
+            {
+                best_cost = total_cost;
+                best_idx = candidate;
+            }
+        }
+
+        best_idx
+    }
+
     fn note_symbol_page(&mut self, symbol_index: usize, page_num: usize) {
         if self.symbol_last_page_seen[symbol_index] != Some(page_num) {
             self.symbol_last_page_seen[symbol_index] = Some(page_num);
@@ -336,6 +615,8 @@ impl<'a> Jbig2Encoder<'a> {
 
     fn push_symbol(&mut self, symbol: BitImage, pixel_count: usize, page_num: usize) -> usize {
         let idx = self.global_symbols.len();
+        self.symbol_signatures
+            .push(Self::compute_symbol_signature(&symbol));
         self.symbol_pixel_counts.push(pixel_count);
         self.global_symbols.push(symbol);
         self.symbol_usage.push(1);
@@ -350,6 +631,16 @@ impl<'a> Jbig2Encoder<'a> {
         self.symbol_page_count = vec![0; self.global_symbols.len()];
         self.symbol_last_page_seen = vec![None; self.global_symbols.len()];
         self.page_symbol_indices = vec![Vec::new(); self.pages.len()];
+        self.symbol_pixel_counts = self
+            .global_symbols
+            .iter()
+            .map(BitImage::count_ones)
+            .collect();
+        self.symbol_signatures = self
+            .global_symbols
+            .iter()
+            .map(Self::compute_symbol_signature)
+            .collect();
 
         for page_num in 0..self.pages.len() {
             let instance_indices: Vec<usize> = self.pages[page_num]
@@ -401,14 +692,14 @@ impl<'a> Jbig2Encoder<'a> {
                 let losslevel = if self.config.is_lossless { 0 } else { 1 };
                 let cc_start = Instant::now();
                 let cc_image = analyze_page(&bitimage, dpi, losslevel);
-                let extracted = cc_image.extract_shapes();
+                let extracted = cc_image.extract_shape_refs();
                 self.metrics.symbol_mode.cc_extraction += cc_start.elapsed();
 
                 // Check if symbol extraction makes sense for this image
                 // If we only get one symbol that covers the entire image,
                 // it's better to use generic region encoding
                 let should_use_symbols = if extracted.len() == 1 {
-                    let (_, bbox) = &extracted[0];
+                    let bbox = extracted[0].bbox;
                     !(bbox.xmin == 0
                         && bbox.ymin == 0
                         && bbox.width() as usize >= bitimage.width.saturating_sub(2)
@@ -419,25 +710,52 @@ impl<'a> Jbig2Encoder<'a> {
 
                 if should_use_symbols {
                     let matching_start = Instant::now();
-                    for (symbol, bbox) in extracted {
+                    let mut recent_cache = RecentSymbolCache::new(64);
+                    let mut last_y = 0u32;
+
+                    for shape in extracted {
+                        if Self::should_skip_symbol_candidate(
+                            shape.bbox.width().max(0) as usize,
+                            shape.bbox.height().max(0) as usize,
+                            shape.black_pixels,
+                        ) || shape.run_count == 0
+                        {
+                            continue;
+                        }
+                        let Some(symbol) = cc_image.get_bitmap_for_cc(shape.ccid) else {
+                            continue;
+                        };
                         let (trim_offset, trimmed) = symbol.trim();
+                        let pixel_count = trimmed.count_ones();
+                        if Self::should_skip_symbol_candidate(
+                            trimmed.width,
+                            trimmed.height,
+                            pixel_count,
+                        ) {
+                            continue;
+                        }
+
                         // The CC bbox is the bounding box from CC analysis.
                         // trim() may remove whitespace rows/cols from the symbol.
                         // Adjust position by trim offset so the dictionary bitmap
                         // renders at the correct location on the page.
                         let rect = Rect {
-                            x: bbox.xmin as u32 + trim_offset.x,
-                            y: bbox.ymin as u32 + trim_offset.y,
+                            x: shape.bbox.xmin as u32 + trim_offset.x,
+                            y: shape.bbox.ymin as u32 + trim_offset.y,
                             width: trimmed.width as u32,
                             height: trimmed.height as u32,
                         };
+                        if rect.y > last_y.saturating_add(24) {
+                            recent_cache.clear();
+                        }
+                        last_y = rect.y;
+
                         let key = hash_key(&trimmed);
+                        let trimmed_sig = Self::compute_symbol_signature(&trimmed);
                         let mut matched = false;
                         let mut instance_bitmap = Some(symbol);
 
                         // Error tolerance for matching.
-                        // Lossy PM&S: 5% of area (min 2) — scales proportionally.
-                        // Refinement: use configured tolerance (typically ~14%).
                         let area = (trimmed.width * trimmed.height) as u32;
                         let max_err = if self.config.text_refine {
                             (area / self.config.match_tolerance).max(3)
@@ -445,10 +763,63 @@ impl<'a> Jbig2Encoder<'a> {
                             ((area as f32 * 0.05) as u32).max(2)
                         };
 
-                        // Check the primary bucket and adjacent dimension buckets.
-                        // Refinement mode: ±2 pixels (refinement encodes the difference).
-                        // Lossy PM&S: exact dimensions only (prevents visible scaling).
                         if !no_reuse {
+                            let recent_candidates: Vec<usize> = recent_cache.iter().collect();
+                            'recent_search: for idx in recent_candidates {
+                                if let Some((err, dx, dy, needs_refinement)) = self
+                                    .evaluate_symbol_match(
+                                        &trimmed,
+                                        trimmed_sig,
+                                        pixel_count,
+                                        idx,
+                                        &mut comparator,
+                                        max_err,
+                                    )
+                                {
+                                    if debug_matching {
+                                        let mode = if needs_refinement {
+                                            "REFINE"
+                                        } else if err == 0 && dx == 0 && dy == 0 {
+                                            "EXACT "
+                                        } else {
+                                            "LOSSY "
+                                        };
+                                        let proto = &self.global_symbols[idx];
+                                        debug_lines.push(format!(
+                                            "CC#{:04} {} pos=({},{}) {}x{} → proto#{} {}x{} err={} dx={} dy={} [recent]",
+                                            cc_index,
+                                            mode,
+                                            rect.x,
+                                            rect.y,
+                                            rect.width,
+                                            rect.height,
+                                            idx,
+                                            proto.width,
+                                            proto.height,
+                                            err,
+                                            dx,
+                                            dy
+                                        ));
+                                    }
+
+                                    self.symbol_usage[idx] += 1;
+                                    self.note_symbol_page(idx, page_num);
+                                    symbol_instances.push(SymbolInstance {
+                                        symbol_index: idx,
+                                        position: rect,
+                                        instance_bitmap: instance_bitmap.take().unwrap(),
+                                        needs_refinement,
+                                        refinement_dx: if needs_refinement { dx } else { 0 },
+                                        refinement_dy: if needs_refinement { dy } else { 0 },
+                                    });
+                                    recent_cache.touch(idx);
+                                    matched = true;
+                                    break 'recent_search;
+                                }
+                            }
+                        }
+
+                        if !matched && !no_reuse {
                             let h = trimmed.height as u64;
                             let w = trimmed.width as u64;
                             let dim_range: u64 = if self.config.text_refine { 2 } else { 0 };
@@ -465,88 +836,68 @@ impl<'a> Jbig2Encoder<'a> {
                                     }
 
                                     let nk = HashKey(dh * 10_000 + dw);
-                                    if let Some(bucket) = self.hash_map.get(&nk) {
-                                        for &idx in bucket {
-                                            let proto = &self.global_symbols[idx];
-
-                                            if (trimmed.width as i32 - proto.width as i32)
-                                                .unsigned_abs()
-                                                > dim_range as u32
-                                                || (trimmed.height as i32 - proto.height as i32)
-                                                    .unsigned_abs()
-                                                    > dim_range as u32
-                                            {
+                                    if let Some(bucket) = self.hash_map.get(&nk).cloned() {
+                                        for idx in bucket {
+                                            let Some((err, dx, dy, needs_refinement)) = self
+                                                .evaluate_symbol_match(
+                                                    &trimmed,
+                                                    trimmed_sig,
+                                                    pixel_count,
+                                                    idx,
+                                                    &mut comparator,
+                                                    max_err,
+                                                )
+                                            else {
                                                 continue;
+                                            };
+
+                                            if debug_matching {
+                                                let mode = if needs_refinement {
+                                                    "REFINE"
+                                                } else if err == 0 && dx == 0 && dy == 0 {
+                                                    "EXACT "
+                                                } else {
+                                                    "LOSSY "
+                                                };
+                                                let proto = &self.global_symbols[idx];
+                                                debug_lines.push(format!(
+                                                    "CC#{:04} {} pos=({},{}) {}x{} → proto#{} {}x{} err={} dx={} dy={}",
+                                                    cc_index,
+                                                    mode,
+                                                    rect.x,
+                                                    rect.y,
+                                                    rect.width,
+                                                    rect.height,
+                                                    idx,
+                                                    proto.width,
+                                                    proto.height,
+                                                    err,
+                                                    dx,
+                                                    dy
+                                                ));
                                             }
 
-                                            if let Some((err, dx, dy)) =
-                                                comparator.distance(&trimmed, proto, max_err)
-                                            {
-                                                if !self.config.text_refine
-                                                    && (dx.abs() > 1 || dy != 0)
-                                                {
-                                                    continue;
-                                                }
-
-                                                let exact_match = err == 0
-                                                    && dx == 0
-                                                    && dy == 0
-                                                    && trimmed.width == proto.width
-                                                    && trimmed.height == proto.height;
-
-                                                if debug_matching {
-                                                    let mode = if exact_match {
-                                                        "EXACT "
-                                                    } else if self.config.text_refine {
-                                                        "REFINE"
-                                                    } else {
-                                                        "LOSSY "
-                                                    };
-                                                    debug_lines.push(format!(
-                                                        "CC#{:04} {} pos=({},{}) {}x{} → proto#{} {}x{} err={} dx={} dy={}",
-                                                        cc_index,
-                                                        mode,
-                                                        rect.x,
-                                                        rect.y,
-                                                        rect.width,
-                                                        rect.height,
-                                                        idx,
-                                                        proto.width,
-                                                        proto.height,
-                                                        err,
-                                                        dx,
-                                                        dy
-                                                    ));
-                                                }
-
-                                                self.symbol_usage[idx] += 1;
-                                                self.note_symbol_page(idx, page_num);
-                                                symbol_instances.push(SymbolInstance {
-                                                    symbol_index: idx,
-                                                    position: rect,
-                                                    instance_bitmap: instance_bitmap
-                                                        .take()
-                                                        .unwrap(),
-                                                    needs_refinement: !exact_match
-                                                        && self.config.text_refine,
-                                                    refinement_dx: if exact_match
-                                                        || !self.config.text_refine
-                                                    {
-                                                        0
-                                                    } else {
-                                                        dx
-                                                    },
-                                                    refinement_dy: if exact_match
-                                                        || !self.config.text_refine
-                                                    {
-                                                        0
-                                                    } else {
-                                                        dy
-                                                    },
-                                                });
-                                                matched = true;
-                                                break 'bucket_search;
-                                            }
+                                            self.symbol_usage[idx] += 1;
+                                            self.note_symbol_page(idx, page_num);
+                                            symbol_instances.push(SymbolInstance {
+                                                symbol_index: idx,
+                                                position: rect,
+                                                instance_bitmap: instance_bitmap.take().unwrap(),
+                                                needs_refinement,
+                                                refinement_dx: if needs_refinement {
+                                                    dx
+                                                } else {
+                                                    0
+                                                },
+                                                refinement_dy: if needs_refinement {
+                                                    dy
+                                                } else {
+                                                    0
+                                                },
+                                            });
+                                            recent_cache.touch(idx);
+                                            matched = true;
+                                            break 'bucket_search;
                                         }
                                     }
                                 }
@@ -554,7 +905,6 @@ impl<'a> Jbig2Encoder<'a> {
                         }
 
                         if !matched {
-                            let pixel_count = trimmed.count_ones();
                             let idx = self.push_symbol(trimmed, pixel_count, page_num);
                             self.metrics.symbol_stats.symbols_discovered += 1;
                             if debug_matching {
@@ -574,6 +924,7 @@ impl<'a> Jbig2Encoder<'a> {
                                 refinement_dx: 0,
                                 refinement_dy: 0,
                             });
+                            recent_cache.touch(idx);
                         }
                         cc_index += 1;
                     }
@@ -666,7 +1017,7 @@ impl<'a> Jbig2Encoder<'a> {
             .map(|(i, _)| i)
             .collect();
 
-        let page_local_symbols: Vec<Vec<usize>> = self
+        let mut page_local_symbols: Vec<Vec<usize>> = self
             .page_symbol_indices
             .iter()
             .map(|symbols| {
@@ -678,7 +1029,33 @@ impl<'a> Jbig2Encoder<'a> {
             })
             .collect();
 
-        self.validate_symbol_partition(&global_symbol_indices, &page_local_symbols)?;
+        let global_set: HashSet<usize> = global_symbol_indices.iter().copied().collect();
+        let mut page_uses_generic_region = vec![false; self.pages.len()];
+        for (page_num, page) in self.pages.iter().enumerate() {
+            let local_symbols = &page_local_symbols[page_num];
+            let page_local_gain: i64 = local_symbols
+                .iter()
+                .map(|&symbol_index| self.estimate_local_symbol_gain(page, symbol_index))
+                .sum();
+            let uses_only_locals = page
+                .symbol_instances
+                .iter()
+                .all(|inst| !global_set.contains(&inst.symbol_index));
+            if uses_only_locals
+                && local_symbols.len() <= 2
+                && page.symbol_instances.len() <= 2
+                && page_local_gain <= 0
+            {
+                page_local_symbols[page_num].clear();
+                page_uses_generic_region[page_num] = true;
+            }
+        }
+
+        self.validate_symbol_partition(
+            &global_symbol_indices,
+            &page_local_symbols,
+            &page_uses_generic_region,
+        )?;
         self.metrics.symbol_stats.global_symbol_count = global_symbol_indices.len();
         self.metrics.symbol_stats.local_symbol_count =
             page_local_symbols.iter().map(Vec::len).sum::<usize>();
@@ -756,6 +1133,7 @@ impl<'a> Jbig2Encoder<'a> {
             current_segment_number += 1;
             let end_of_page_segment_number = current_segment_number;
             current_segment_number += 1;
+            let use_generic_region = page_uses_generic_region[page_num];
 
             page_layouts.push(PlannedPageLayout {
                 page_index: page_num,
@@ -765,6 +1143,7 @@ impl<'a> Jbig2Encoder<'a> {
                 region_segment_number,
                 end_of_page_segment_number,
                 local_symbols: page_local_symbols[page_num].clone(),
+                use_generic_region,
             });
         }
 
@@ -874,7 +1253,10 @@ impl<'a> Jbig2Encoder<'a> {
             payload: page_info_payload,
         });
 
-        if self.config.symbol_mode && !page.symbol_instances.is_empty() {
+        if self.config.symbol_mode
+            && !page.symbol_instances.is_empty()
+            && !layout.use_generic_region
+        {
             let mut referred_to_for_text_region = Vec::new();
             if let Some(global_dict_seg_num) = self.global_dict_segment_number {
                 referred_to_for_text_region.push(global_dict_seg_num);
@@ -1174,14 +1556,22 @@ impl<'a> Jbig2Encoder<'a> {
 
             let a_sym = &self.global_symbols[a_idx];
             let b_sym = &self.global_symbols[b_idx];
-            if (a_sym.width as i32 - b_sym.width as i32).abs() > 1
-                || (a_sym.height as i32 - b_sym.height as i32).abs() > 1
+            let dim_limit = if self.config.text_refine { 2 } else { 1 };
+            if (a_sym.width as i32 - b_sym.width as i32).abs() > dim_limit
+                || (a_sym.height as i32 - b_sym.height as i32).abs() > dim_limit
             {
                 return;
             }
 
             let area = a_sym.width.max(b_sym.width) * a_sym.height.max(b_sym.height);
-            let max_err = ((area as f32 * 0.04) as u32).clamp(2, 12);
+            let max_err = if self.config.text_refine {
+                ((self.symbol_pixel_counts[a_idx].max(self.symbol_pixel_counts[b_idx]) as f32
+                    * 0.10) as u32)
+                    .max(((area as f32) * 0.05) as u32)
+                    .clamp(3, 20)
+            } else {
+                ((area as f32 * 0.04) as u32).clamp(2, 12)
+            };
             if self.symbol_pixel_counts[a_idx].abs_diff(self.symbol_pixel_counts[b_idx])
                 > max_err as usize
             {
@@ -1189,7 +1579,8 @@ impl<'a> Jbig2Encoder<'a> {
             }
 
             if let Some((_, dx, dy)) = comparator.distance(a_sym, b_sym, max_err) {
-                if dx.abs() <= 1 && dy == 0 {
+                let dy_limit = if self.config.text_refine { 1 } else { 0 };
+                if dx.abs() <= dim_limit && dy.abs() <= dy_limit {
                     uf_union(&mut parent, &mut uf_rank, a_idx, b_idx);
                 }
             }
@@ -1238,17 +1629,7 @@ impl<'a> Jbig2Encoder<'a> {
             if members.len() <= 1 {
                 continue;
             }
-            let &prototype = members
-                .iter()
-                .max_by(|&&lhs, &&rhs| {
-                    self.symbol_usage[lhs]
-                        .cmp(&self.symbol_usage[rhs])
-                        .then_with(|| {
-                            self.symbol_pixel_counts[lhs].cmp(&self.symbol_pixel_counts[rhs])
-                        })
-                        .then_with(|| rhs.cmp(&lhs))
-                })
-                .unwrap();
+            let prototype = self.choose_cluster_prototype(members);
             for &m in members {
                 old_to_prototype[m] = prototype;
             }
@@ -1342,9 +1723,13 @@ impl<'a> Jbig2Encoder<'a> {
         &self,
         global_symbol_indices: &[usize],
         page_local_symbols: &[Vec<usize>],
+        page_uses_generic_region: &[bool],
     ) -> Result<()> {
         let global_set: HashSet<usize> = global_symbol_indices.iter().copied().collect();
         for (page_num, page) in self.pages.iter().enumerate() {
+            if page_uses_generic_region[page_num] {
+                continue;
+            }
             let local_set: HashSet<usize> = page_local_symbols[page_num].iter().copied().collect();
             for inst in &page.symbol_instances {
                 let idx = inst.symbol_index;

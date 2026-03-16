@@ -132,8 +132,9 @@ impl Jbig2Config {
         cfg.symbol_mode = true;
         cfg.auto_thresh = true;
         cfg.duplicate_line_removal = true;
-        // text_refine=false → lossy PM&S: approximate matches become direct
-        // substitutions. Set text_refine=true for lossless SPM (refinement coding).
+        // Refinement remains opt-in on the preset because SBREFINE=1 adds
+        // per-instance overhead. Enable it explicitly when clustering or
+        // near-match preservation is expected to pay off.
         cfg
     }
 

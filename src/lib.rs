@@ -309,8 +309,13 @@ fn encode_single_bitimage(
 ) -> Result<Jbig2EncodeResult, Jbig2Error> {
     let mut enc_config = ctx.config.clone();
     enc_config.want_full_headers = !ctx.get_pdf_mode();
-    enc_config.auto_thresh = false;
-    enc_config.refine = false;
+    if !enc_config.symbol_mode {
+        enc_config.refine = false;
+        enc_config.text_refine = false;
+    } else {
+        enc_config.text_refine = enc_config.text_refine || enc_config.refine;
+        enc_config.refine = enc_config.text_refine;
+    }
 
     let global_data = if ctx.get_symbol_mode() && ctx.get_pdf_mode() {
         let mut dict_encoder = Jbig2Encoder::new(&enc_config).dict_only();
@@ -368,11 +373,13 @@ pub fn encode_rois(
     // Initialize encoder configuration - use the context's config instead of default
     let mut enc_config = ctx.config.clone();
     enc_config.want_full_headers = !ctx.get_pdf_mode(); // PDF mode shouldn't have file headers
-    enc_config.auto_thresh = false; // Disable auto-threshold to avoid index errors
-    // IMPORTANT: Disable refinement to ensure text regions are encoded with payloads
-    // The current encoder's refine path is not wired in `flush()`, which can
-    // lead to empty ImmediateTextRegion payloads and invalid JBIG2 files.
-    enc_config.refine = false;
+    if !enc_config.symbol_mode {
+        enc_config.refine = false;
+        enc_config.text_refine = false;
+    } else {
+        enc_config.text_refine = enc_config.text_refine || enc_config.refine;
+        enc_config.refine = enc_config.text_refine;
+    }
 
     // For PDF mode with symbol encoding, create global dictionary
     let global_dict = if ctx.get_symbol_mode() && ctx.get_pdf_mode() {
