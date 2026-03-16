@@ -6,7 +6,7 @@
 use crate::jbig2shared::{save_debug_pbm, usize_to_u32};
 use crate::jbig2sym::{compute_glyph_hash, BitImage, Rect, Symbol};
 // Image import removed as it's not used
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// A connected component with bounding box and pixel information
 #[derive(Debug, Clone, PartialEq)]
@@ -74,12 +74,13 @@ impl SymbolExtractionConfig {
     pub fn from_jbig2_config(config: &crate::jbig2structs::Jbig2Config) -> Self {
         let mut cfg = Self::default();
 
-        // Balanced filtering - remove noise but preserve punctuation
-        cfg.min_component_size = if config.auto_thresh { 12 } else { 10 };
+        // Increase min_component_size to filter noise and small fragments
+        cfg.min_component_size = if config.auto_thresh { 25 } else { 20 };
 
-        // More restrictive dot detection to avoid fragmenting characters
-        cfg.max_dot_area_ratio = 0.05; // Reduced from 0.1
-        cfg.max_dot_height_ratio = 0.3; // Reduced from 0.5
+        // Loosen dot detection to avoid fragmenting characters
+        cfg.max_dot_area_ratio = 0.15; // Increased from 0.05
+        cfg.max_dot_height_ratio = 0.4; // Increased from 0.3
+        cfg.dot_aspect_ratio_range = (0.4, 2.5); // Widened for oval dots
 
         cfg
     }
@@ -88,11 +89,11 @@ impl SymbolExtractionConfig {
 impl Default for SymbolExtractionConfig {
     fn default() -> Self {
         Self {
-            max_dot_area_ratio: 0.1,
-            max_dot_height_ratio: 0.5,
-            dot_aspect_ratio_range: (0.5, 2.0),
-            dot_merge_distance_ratio: 0.5,
-            min_component_size: 10, // Balanced to preserve punctuation but filter noise
+            max_dot_area_ratio: 0.15,  // Slightly more permissive for punctuation
+            max_dot_height_ratio: 0.6, // Allow taller dots/punctuation
+            dot_aspect_ratio_range: (0.3, 3.0), // Wider range for various punctuation
+            dot_merge_distance_ratio: 0.4, // Slightly stricter merging
+            min_component_size: 20,    // Increased to filter more noise and tiny artifacts
             split_config: SplitConfig::default(),
         }
     }
@@ -111,11 +112,11 @@ pub struct SplitConfig {
 impl Default for SplitConfig {
     fn default() -> Self {
         Self {
-            rolling_window: 10,
-            max_width_ratio: 1.5,
-            min_gap: 2,
-            gap_height_frac: 0.9,
-            min_subglyph_width: 5,
+            rolling_window: 15,    // Increased for better width averaging
+            max_width_ratio: 4.0,  // Much more conservative - only split very wide ligatures
+            min_gap: 5,            // Increased to require more substantial gaps
+            gap_height_frac: 0.98, // Require 98% height gaps for splitting
+            min_subglyph_width: 8, // Increased to avoid tiny fragments
         }
     }
 }
@@ -439,12 +440,21 @@ pub fn extract_symbols(image: &BitImage, config: SymbolExtractionConfig) -> Vec<
                 continue; // Skip empty symbols
             }
 
-            // Check symbol size limits (JBIG2 maximum dimensions are 2^32-1)
-            if trimmed_piece.width > 10_000 || trimmed_piece.height > 10_000 {
-                eprintln!(
-                    "Warning: Skipping oversized symbol: {}x{}",
-                    trimmed_piece.width, trimmed_piece.height
-                );
+            // Check symbol size limits - filter out unrealistic symbol sizes
+            if trimmed_piece.width < 2
+                || trimmed_piece.height < 4
+                || trimmed_piece.width > 150
+                || trimmed_piece.height > 100
+            {
+                // Skip symbols that are too small (noise) or too large (not characters)
+                continue;
+            }
+
+            // Additional quality filter: ensure the symbol has enough content
+            let pixel_density = trimmed_piece.count_ones() as f32
+                / (trimmed_piece.width * trimmed_piece.height) as f32;
+            if pixel_density < 0.05 || pixel_density > 0.95 {
+                // Skip symbols that are too sparse or too dense (likely noise/artifacts)
                 continue;
             }
 
@@ -488,23 +498,54 @@ pub fn extract_symbols(image: &BitImage, config: SymbolExtractionConfig) -> Vec<
         }
     }
 
-    // Consolidate similar symbols to reduce dictionary size
-    consolidate_symbols(symbols)
+    // Group symbols by height before consolidation to avoid comparing different font sizes
+    let mut height_groups: FxHashMap<usize, Vec<(Rect, Symbol)>> = FxHashMap::default();
+    for sym in symbols {
+        let height_key = (sym.1.image.height / 5) * 5; // Smaller buckets for better grouping
+        height_groups.entry(height_key).or_default().push(sym);
+    }
+
+    let mut consolidated = Vec::new();
+    for group in height_groups.values() {
+        consolidated.extend(consolidate_symbols(group.clone())); // Dedup per height group
+    }
+
+    // Apply global limit across all height groups to prevent dictionary explosion
+    if consolidated.len() > 200 {
+        // Sort by symbol quality: larger symbols with more pixels are more likely to be real characters
+        consolidated.sort_by_key(|(_, s)| -(s.image.count_ones() as isize));
+        let original_len = consolidated.len();
+        consolidated.truncate(200);
+        eprintln!(
+            "Info: Reduced symbol dictionary from {} to {} symbols for optimal performance",
+            original_len,
+            consolidated.len()
+        );
+    }
+
+    consolidated
 }
 
 /// Consolidates similar symbols to reduce dictionary size
 /// This is crucial for preventing 300+ symbol dictionaries
 fn consolidate_symbols(mut symbols: Vec<(Rect, Symbol)>) -> Vec<(Rect, Symbol)> {
-    if symbols.len() <= 50 {
-        return symbols; // Already reasonable size
+    if symbols.len() <= 30 {
+        return symbols; // Already reasonable size for a height group
     }
 
-    // Cap at 200 symbols to prevent performance issues
-    if symbols.len() > 200 {
-        symbols.truncate(200);
+    // Much more conservative limit per height group
+    if symbols.len() > 80 {
+        // Sort by pixel count and area - larger, more complete symbols first
+        symbols.sort_by_key(|(_, s)| {
+            let pixel_count = s.image.count_ones() as isize;
+            let area = (s.image.width * s.image.height) as isize;
+            -(pixel_count + area / 4) // Favor symbols with more content
+        });
+        symbols.truncate(80);
         eprintln!(
-            "Warning: Too many symbols ({}), truncated to 200 to prevent performance issues",
-            symbols.len()
+            "Info: Height group had {} symbols, reduced to {} highest quality symbols",
+            symbols.len(),
+            80
         );
     }
 
@@ -530,8 +571,8 @@ fn consolidate_symbols(mut symbols: Vec<(Rect, Symbol)>) -> Vec<(Rect, Symbol)> 
 
             let (_, ref symbol_j) = symbols[j];
 
-            // Allow up to 3% pixel difference for consolidation (more conservative)
-            let max_err = ((symbol_i.image.width * symbol_i.image.height) / 33).max(1) as u32;
+            // Allow up to 10% pixel difference for consolidation (improved from 3%)
+            let max_err = ((symbol_i.image.width * symbol_i.image.height) / 10).max(3) as u32;
 
             if comparator
                 .distance(&symbol_i.image, &symbol_j.image, max_err)
