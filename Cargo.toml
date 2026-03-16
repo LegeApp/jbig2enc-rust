@@ -39,6 +39,7 @@ rustc-hash = "1.1"
 fax = { version = "0.2.6", default-features = false }
 image = { version = "0.24", default-features = false, features = ["png", "jpeg"], optional = true }
 rayon = { version = "1.10", optional = true }
+pprof = { version = "0.15", features = ["flamegraph"], optional = true }
 
 [build-dependencies]
 vergen = { version = "9.0.6", default-features = false, features = ["build"] }
@@ -54,11 +55,17 @@ symboldict = ["cc-analysis"]
 refine = []
 halftone_bin = ["dep:image"]
 parallel = ["dep:rayon"]
+profiling = ["dep:pprof"]
 
 [[bin]]
 name = "halftone_tester"
 path = "src/bin/halftone_tester.rs"
 required-features = ["halftone_bin"]
+
+[[bin]]
+name = "profile_sym_collapse"
+path = "src/bin/profile_sym_collapse.rs"
+required-features = ["profiling"]
 
 [dev-dependencies]
 tracing = { version = "0.1", features = ["std"] }

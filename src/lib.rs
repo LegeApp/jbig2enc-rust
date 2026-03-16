@@ -119,6 +119,7 @@ impl From<ndarray::ShapeError> for Jbig2Error {
 pub mod jbig2arith;
 #[cfg(feature = "cc-analysis")]
 pub mod jbig2cc;
+pub mod jbig2collapse;
 pub mod jbig2comparator;
 pub mod jbig2enc;
 pub mod jbig2halftone;

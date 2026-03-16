@@ -1,15 +1,21 @@
 //! This module contains the main JBIG2 encoder logic.
 use crate::jbig2arith::{IntProc, Jbig2ArithCoder};
+use crate::jbig2collapse::{
+    CollapseFamilyBuildInputs, FamilyBucketKey, PrototypeBuildInputs, SymbolSignature,
+    build_lossy_prototype, build_lossy_symbol_families,
+    compute_symbol_signature as compute_symbol_signature_shared,
+    family_bucket_key_for_symbol, family_bucket_neighbors, family_match_details,
+    refine_compare_score,
+};
 use crate::jbig2comparator::{
-    CollapseCompareLimits, Comparator, CompareResult, MAX_DIMENSION_DELTA,
+    Comparator, MAX_DIMENSION_DELTA,
 };
 // Symbol extraction using CC analysis
 #[cfg(feature = "cc-analysis")]
 use crate::jbig2cc::analyze_page;
 use crate::jbig2structs::{
-    FileHeader, GenericRegionConfig, GenericRegionParams, Jbig2Config,
-    LossyCollapsePrototypeMode, PageInfo, Segment, SegmentType, SymbolDictParams,
-    TextRegionParams,
+    FileHeader, GenericRegionConfig, GenericRegionParams, Jbig2Config, PageInfo, Segment,
+    SegmentType, SymbolDictParams, TextRegionParams,
 };
 
 use crate::jbig2sym::{BitImage, Rect};
@@ -43,6 +49,7 @@ macro_rules! trace {
 use crate::{debug, trace};
 
 use ndarray::Array2;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
@@ -53,20 +60,6 @@ use rayon::prelude::*;
 /// A key type for hashing bitmaps efficiently
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HashKey(u64);
-
-#[derive(Debug, Clone, Copy, Default)]
-struct SymbolSignature {
-    black: u32,
-    area: u32,
-    left_col: u16,
-    right_col: u16,
-    top_row: u16,
-    bottom_row: u16,
-    cx_times_256: u16,
-    cy_times_256: u16,
-    left_mass: u16,
-    right_mass: u16,
-}
 
 #[derive(Debug)]
 struct RecentSymbolCache {
@@ -299,42 +292,6 @@ struct RefinementPlan {
     refinement_dy: i32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FamilyBucketKey {
-    w_bin: u16,
-    h_bin: u16,
-    density_bin: u8,
-    aspect_bin: u8,
-    centroid_y_bin: u8,
-    lr_balance_bin: u8,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LossyFamilyMatch {
-    member_index: usize,
-    dx: i32,
-    dy: i32,
-    err: u32,
-}
-
-#[derive(Debug, Clone)]
-struct LossyFamily {
-    prototype_index: usize,
-    members: Vec<LossyFamilyMatch>,
-    total_usage: usize,
-    page_span: usize,
-}
-
-#[derive(Debug, Clone)]
-enum LossyFamilyProbe {
-    Accept(CompareResult),
-    Reject {
-        reason: &'static str,
-        result: Option<CompareResult>,
-        limits: Option<CollapseCompareLimits>,
-    },
-}
-
 #[derive(Debug, Clone, Default)]
 struct EncodedSymbolDictionary {
     payload: Vec<u8>,
@@ -384,7 +341,7 @@ pub struct Jbig2Encoder<'a> {
     symbol_last_page_seen: Vec<Option<usize>>,
 
     /// Hash map for quick symbol lookup
-    hash_map: HashMap<HashKey, Vec<usize>>,
+    hash_map: FxHashMap<HashKey, Vec<usize>>,
 
     /// Page data for each page in the document
     pages: Vec<PageData>,
@@ -429,7 +386,7 @@ impl<'a> Jbig2Encoder<'a> {
             symbol_signatures: Vec::new(),
             symbol_page_count: Vec::new(),
             symbol_last_page_seen: Vec::new(),
-            hash_map: HashMap::new(),
+            hash_map: FxHashMap::default(),
             pages: Vec::new(),
             page_symbol_indices: Vec::new(),
             next_segment_number: 0,
@@ -474,56 +431,7 @@ impl<'a> Jbig2Encoder<'a> {
     }
 
     fn compute_symbol_signature(img: &BitImage) -> SymbolSignature {
-        let mut black = 0u32;
-        let mut left_col = img.width;
-        let mut right_col = 0usize;
-        let mut top_row = img.height;
-        let mut bottom_row = 0usize;
-        let mut sum_x = 0u32;
-        let mut sum_y = 0u32;
-        let mut left_mass = 0u32;
-        let mut right_mass = 0u32;
-        let mid_x = img.width / 2;
-        for y in 0..img.height {
-            for x in 0..img.width {
-                if img.get_usize(x, y) {
-                    black += 1;
-                    left_col = left_col.min(x);
-                    right_col = right_col.max(x);
-                    top_row = top_row.min(y);
-                    bottom_row = bottom_row.max(y);
-                    sum_x += x as u32;
-                    sum_y += y as u32;
-                    if x < mid_x {
-                        left_mass += 1;
-                    } else {
-                        right_mass += 1;
-                    }
-                }
-            }
-        }
-
-        let (cx, cy) = if black == 0 {
-            (0, 0)
-        } else {
-            (
-                ((sum_x * 256) / black).min(u16::MAX as u32) as u16,
-                ((sum_y * 256) / black).min(u16::MAX as u32) as u16,
-            )
-        };
-
-        SymbolSignature {
-            black,
-            area: img.width.saturating_mul(img.height).min(u32::MAX as usize) as u32,
-            left_col: left_col.min(u16::MAX as usize) as u16,
-            right_col: right_col.min(u16::MAX as usize) as u16,
-            top_row: top_row.min(u16::MAX as usize) as u16,
-            bottom_row: bottom_row.min(u16::MAX as usize) as u16,
-            cx_times_256: cx,
-            cy_times_256: cy,
-            left_mass: left_mass.min(u16::MAX as u32) as u16,
-            right_mass: right_mass.min(u16::MAX as u32) as u16,
-        }
+        compute_symbol_signature_shared(img)
     }
 
     fn signatures_are_compatible(
@@ -760,364 +668,40 @@ impl<'a> Jbig2Encoder<'a> {
 
     fn rebuild_hash_map(&mut self) {
         self.hash_map.clear();
+        self.hash_map.reserve(self.global_symbols.len());
         for (idx, symbol) in self.global_symbols.iter().enumerate() {
             let key = hash_key(symbol);
             self.hash_map.entry(key).or_default().push(idx);
         }
     }
 
-    fn choose_lossy_family_prototype(&self, members: &[usize]) -> usize {
-        if members.len() == 1 {
-            return members[0];
-        }
-
-        let mut comparator = Comparator::default();
-        let mut best_idx = members[0];
-        let mut best_score = u64::MAX;
-        let mut best_support = 0u64;
-
-        for &candidate in members {
-            let mut score = 0u64;
-            for &other in members {
-                if candidate == other {
-                    continue;
-                }
-
-                let weight = self.symbol_usage[other].max(1) as u64;
-                match lossy_family_match_details(
-                    &mut comparator,
-                    &self.global_symbols[other],
-                    other,
-                    &self.global_symbols[candidate],
-                    candidate,
-                    &self.symbol_signatures,
-                    &self.symbol_pixel_counts,
-                    self.config.lossy_collapse_max_err,
-                    self.config.lossy_collapse_max_dx,
-                    self.config.lossy_collapse_max_dy,
-                ) {
-                    Some(result) => {
-                        score += collapse_compare_score(&result) as u64 * weight;
-                    }
-                    None => score += 1_000_000 * weight,
-                }
-            }
-
-            let candidate_support =
-                (self.symbol_page_count[candidate] as u64 * 8) + self.symbol_usage[candidate] as u64;
-            let score_close = if best_score == u64::MAX {
-                false
-            } else {
-                score <= best_score + best_score / 50
-            };
-
-            if score < best_score || (score_close && candidate_support > best_support) {
-                best_score = score;
-                best_idx = candidate;
-                best_support = candidate_support;
-            }
-        }
-
-        best_idx
-    }
-
-    fn cleanup_symbol_bitmap(symbol: &BitImage) -> BitImage {
-        let mut out = symbol.clone();
-        if symbol.width < 3 || symbol.height < 3 {
-            return out;
-        }
-
-        for y in 1..(symbol.height - 1) {
-            for x in 1..(symbol.width - 1) {
-                let on = symbol.get_usize(x, y);
-                let mut neighbors = 0usize;
-                for yy in (y - 1)..=(y + 1) {
-                    for xx in (x - 1)..=(x + 1) {
-                        if xx == x && yy == y {
-                            continue;
-                        }
-                        if symbol.get_usize(xx, yy) {
-                            neighbors += 1;
-                        }
-                    }
-                }
-
-                if on && neighbors <= 1 {
-                    out.set_usize(x, y, false);
-                } else if !on && neighbors >= 7 {
-                    out.set_usize(x, y, true);
-                }
-            }
-        }
-
-        out
-    }
-
-    fn majority_vote_prototype(
-        &self,
-        prototype_index: usize,
-        members: &[LossyFamilyMatch],
-    ) -> BitImage {
-        let prototype = &self.global_symbols[prototype_index];
-        let mut votes = vec![0u16; prototype.width * prototype.height];
-        let mut samples = 1u16;
-
-        for y in 0..prototype.height {
-            for x in 0..prototype.width {
-                if prototype.get_usize(x, y) {
-                    votes[y * prototype.width + x] += 1;
-                }
-            }
-        }
-
-        for member in members {
-            let image = &self.global_symbols[member.member_index];
-            for y in 0..prototype.height {
-                for x in 0..prototype.width {
-                    let sx = x as i32 - member.dx;
-                    let sy = y as i32 - member.dy;
-                    if sx < 0 || sy < 0 {
-                        continue;
-                    }
-                    let sx = sx as usize;
-                    let sy = sy as usize;
-                    if sx >= image.width || sy >= image.height {
-                        continue;
-                    }
-                    if image.get_usize(sx, sy) {
-                        votes[y * prototype.width + x] += 1;
-                    }
-                }
-            }
-            samples += 1;
-        }
-
-        let mut out = prototype.clone();
-        let threshold = ((samples as f32) * 0.60).ceil() as u16;
-        for y in 0..prototype.height {
-            for x in 0..prototype.width {
-                out.set_usize(x, y, votes[y * prototype.width + x] >= threshold);
-            }
-        }
-        out
-    }
-
-    fn build_lossy_symbol_families(&mut self) -> Vec<LossyFamily> {
-        if !self.config.lossy_symbol_collapse || self.global_symbols.len() <= 1 {
-            return Vec::new();
-        }
-
-        let all_indices: Vec<usize> = (0..self.global_symbols.len()).collect();
-        let mut bucket_map: HashMap<FamilyBucketKey, Vec<usize>> = HashMap::new();
-        for &symbol_index in &all_indices {
-            let key = family_bucket_key_for_symbol(
-                &self.global_symbols[symbol_index],
-                &self.symbol_signatures[symbol_index],
-            );
-            bucket_map.entry(key).or_default().push(symbol_index);
-        }
-
-        let mut comparator = Comparator::default();
-        let mut parent: Vec<usize> = (0..self.global_symbols.len()).collect();
-        let mut rank = vec![0u32; self.global_symbols.len()];
-        let mut accepted_pair_count = 0usize;
-        let mut rejected_pair_count = 0usize;
-        let mut accepted_samples = Vec::new();
-        let mut rejected_samples = Vec::new();
-        let mut reject_reason_counts: HashMap<&'static str, usize> = HashMap::new();
-        let mut reject_reason_sample_counts: HashMap<&'static str, usize> = HashMap::new();
-
-        for &symbol_index in &all_indices {
-            let key = family_bucket_key_for_symbol(
-                &self.global_symbols[symbol_index],
-                &self.symbol_signatures[symbol_index],
-            );
-
-            for neighbor in family_bucket_neighbors(key) {
-                let Some(bucket) = bucket_map.get(&neighbor) else {
-                    continue;
-                };
-                for &other_index in bucket {
-                    if other_index >= symbol_index {
-                        continue;
-                    }
-                    match lossy_family_probe(
-                        &mut comparator,
-                        &self.global_symbols[symbol_index],
-                        symbol_index,
-                        &self.global_symbols[other_index],
-                        other_index,
-                        &self.symbol_signatures,
-                        &self.symbol_pixel_counts,
-                        self.config.lossy_collapse_max_err,
-                        self.config.lossy_collapse_max_dx,
-                        self.config.lossy_collapse_max_dy,
-                    ) {
-                        LossyFamilyProbe::Accept(result) => {
-                            accepted_pair_count += 1;
-                            if accepted_samples.len() < 48 {
-                                accepted_samples.push(format!(
-                                    "collapse pair accept: lhs={} rhs={} dx={} dy={} overlap={} outside={} row={} col={} black_delta={} total={}",
-                                    symbol_index,
-                                    other_index,
-                                    result.dx,
-                                    result.dy,
-                                    result.overlap_err,
-                                    result.outside_ink_err,
-                                    result.row_profile_err,
-                                    result.col_profile_err,
-                                    result.black_delta,
-                                    result.total_err
-                                ));
-                            }
-                            uf_union(&mut parent, &mut rank, symbol_index, other_index);
-                        }
-                        LossyFamilyProbe::Reject {
-                            reason,
-                            result,
-                            limits,
-                        } => {
-                            rejected_pair_count += 1;
-                            *reject_reason_counts.entry(reason).or_insert(0) += 1;
-                            let sample_count = reject_reason_sample_counts.entry(reason).or_insert(0);
-                            if *sample_count < 12 {
-                                *sample_count += 1;
-                                rejected_samples.push(format_collapse_probe_reject(
-                                    symbol_index,
-                                    other_index,
-                                    reason,
-                                    result,
-                                    limits,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
-        for &symbol_index in &all_indices {
-            let root = uf_find(&mut parent, symbol_index);
-            groups.entry(root).or_default().push(symbol_index);
-        }
-
-        let mut families = Vec::new();
-        let mut skipped_low_value = 0usize;
-        let mut skipped_samples = Vec::new();
-        for mut members in groups.into_values() {
-            members.sort_unstable();
-            let eligible: Vec<usize> = members
-                .into_iter()
-                .filter(|&index| self.symbol_usage[index] >= self.config.lossy_collapse_min_usage)
-                .collect();
-            if eligible.len() < self.config.lossy_collapse_min_family_size {
-                continue;
-            }
-
-            let prototype_index = self.choose_lossy_family_prototype(&eligible);
-            let eligible_set: HashSet<usize> = eligible.iter().copied().collect();
-            let family_total_usage = eligible.iter().map(|&index| self.symbol_usage[index]).sum();
-            let family_page_span = self
-                .pages
-                .iter()
-                .filter(|page| {
-                    page.symbol_instances
-                        .iter()
-                        .any(|instance| eligible_set.contains(&instance.symbol_index))
-                })
-                .count();
-            let prototype_usage = self.symbol_usage[prototype_index];
-            let is_economically_useful = family_total_usage
-                >= self.config.lossy_collapse_min_total_usage
-                && (prototype_usage >= self.config.lossy_collapse_min_prototype_usage
-                    || family_page_span >= self.config.lossy_collapse_min_page_span);
-            if !is_economically_useful {
-                skipped_low_value += 1;
-                if skipped_samples.len() < 64 {
-                    skipped_samples.push(format!(
-                        "collapse skip low-value: prototype={} members={} total_usage={} prototype_usage={} page_span={}",
-                        prototype_index,
-                        eligible.len(),
-                        family_total_usage,
-                        prototype_usage,
-                        family_page_span
-                    ));
-                }
-                continue;
-            }
-            let mut family_members = Vec::new();
-            for &member_index in &eligible {
-                if member_index == prototype_index {
-                    continue;
-                }
-                if let Some(result) = lossy_family_match_details(
-                    &mut comparator,
-                    &self.global_symbols[member_index],
-                    member_index,
-                    &self.global_symbols[prototype_index],
-                    prototype_index,
-                    &self.symbol_signatures,
-                    &self.symbol_pixel_counts,
-                    self.config.lossy_collapse_max_err,
-                    self.config.lossy_collapse_max_dx,
-                    self.config.lossy_collapse_max_dy,
-                ) {
-                    family_members.push(LossyFamilyMatch {
-                        member_index,
-                        dx: result.dx,
-                        dy: result.dy,
-                        err: result.total_err,
-                    });
-                }
-            }
-
-            if family_members.len() + 1 >= self.config.lossy_collapse_min_family_size {
-                families.push(LossyFamily {
-                    prototype_index,
-                    members: family_members,
-                    total_usage: family_total_usage,
-                    page_span: family_page_span,
-                });
-            }
-        }
-
-        debug!(
-            "lossy collapse economic filter: kept {} families, skipped {}",
-            families.len(),
-            skipped_low_value
-        );
-        for line in skipped_samples {
-            trace!("{line}");
-        }
-
-        self.state.decision_debug_lines.push(format!(
-            "collapse pair probes: accepted={} rejected={}",
-            accepted_pair_count, rejected_pair_count
-        ));
-        let mut reject_summary: Vec<_> = reject_reason_counts.into_iter().collect();
-        reject_summary.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| lhs.0.cmp(rhs.0)));
-        for (reason, count) in reject_summary {
-            self.state
-                .decision_debug_lines
-                .push(format!("collapse pair rejects[{reason}]={count}"));
-        }
-        self.state.decision_debug_lines.extend(accepted_samples);
-        self.state.decision_debug_lines.extend(rejected_samples);
-
+    fn build_lossy_symbol_families(&mut self) -> Vec<crate::jbig2collapse::LossyFamily> {
+        let (families, diagnostics) = build_lossy_symbol_families(CollapseFamilyBuildInputs {
+            config: self.config,
+            global_symbols: &self.global_symbols,
+            symbol_usage: &self.symbol_usage,
+            symbol_page_count: &self.symbol_page_count,
+            symbol_signatures: &self.symbol_signatures,
+            symbol_pixel_counts: &self.symbol_pixel_counts,
+            page_symbol_indices: &self.page_symbol_indices,
+        });
+        self.state.decision_debug_lines.extend(diagnostics.lines);
         families
     }
 
-    fn make_lossy_prototype(&self, family: &LossyFamily) -> BitImage {
-        match self.config.lossy_collapse_prototype_mode {
-            LossyCollapsePrototypeMode::Medoid => self.global_symbols[family.prototype_index].clone(),
-            LossyCollapsePrototypeMode::MajorityVote => {
-                self.majority_vote_prototype(family.prototype_index, &family.members)
-            }
-            LossyCollapsePrototypeMode::MedoidThenCleanup => {
-                Self::cleanup_symbol_bitmap(&self.global_symbols[family.prototype_index])
-            }
-        }
+    fn make_lossy_prototype(
+        &self,
+        family: &crate::jbig2collapse::LossyFamily,
+    ) -> (BitImage, crate::jbig2collapse::PrototypeBuildStats) {
+        build_lossy_prototype(PrototypeBuildInputs {
+            config: self.config,
+            family,
+            global_symbols: &self.global_symbols,
+            symbol_usage: &self.symbol_usage,
+            symbol_page_count: &self.symbol_page_count,
+            symbol_signatures: &self.symbol_signatures,
+            symbol_pixel_counts: &self.symbol_pixel_counts,
+        })
     }
 
     fn compact_symbol_table_after_remap(&mut self) {
@@ -1170,7 +754,8 @@ impl<'a> Jbig2Encoder<'a> {
             return Ok(());
         }
 
-        let mut global_bucket_map: HashMap<HashKey, Vec<usize>> = HashMap::new();
+        let mut global_bucket_map: FxHashMap<HashKey, Vec<usize>> =
+            FxHashMap::with_capacity_and_hasher(global_indices.len(), Default::default());
         for &symbol_index in &global_indices {
             global_bucket_map
                 .entry(hash_key(&self.global_symbols[symbol_index]))
@@ -1184,7 +769,8 @@ impl<'a> Jbig2Encoder<'a> {
         let mut aliased_instances = 0usize;
         let mut alias_samples = Vec::new();
         for page in &mut self.pages {
-            let mut page_local_symbols = HashSet::new();
+            let mut page_local_symbols: FxHashSet<usize> =
+                FxHashSet::with_capacity_and_hasher(256, Default::default());
             for instance in &page.symbol_instances {
                 if self.symbol_page_count[instance.symbol_index] <= 1 {
                     page_local_symbols.insert(instance.symbol_index);
@@ -1341,6 +927,7 @@ impl<'a> Jbig2Encoder<'a> {
             return Ok(());
         }
 
+        let before_exported = self.global_symbols.len();
         let families = self.build_lossy_symbol_families();
         if families.is_empty() {
             self.state
@@ -1357,13 +944,15 @@ impl<'a> Jbig2Encoder<'a> {
         ));
         for family in families.iter().take(64) {
             self.state.decision_debug_lines.push(format!(
-                "collapse family: prototype={} members={} usage={} total_usage={} page_span={} mode={:?}",
+                "collapse family: prototype={} members={} usage={} total_usage={} page_span={} mode={:?} selector={:?} family_score={}",
                 family.prototype_index,
                 family.members.len() + 1,
                 self.symbol_usage[family.prototype_index],
                 family.total_usage,
                 family.page_span,
-                self.config.lossy_collapse_prototype_mode
+                self.config.lossy_collapse_prototype_mode,
+                self.config.lossy_collapse_prototype_selector_mode,
+                family.prototype_score
             ));
         }
 
@@ -1376,7 +965,26 @@ impl<'a> Jbig2Encoder<'a> {
         }
 
         for family in &families {
-            self.global_symbols[family.prototype_index] = self.make_lossy_prototype(family);
+            let prototype_usage = self.symbol_usage[family.prototype_index];
+            let prototype_page_span = self.symbol_page_count[family.prototype_index];
+            let (prototype, stats) = self.make_lossy_prototype(family);
+            self.state.decision_debug_lines.push(format!(
+                "collapse prototype: prototype={} members={} total_usage={} proto_usage={} proto_pages={} mode={} medoid_black={} output_black={} kept={} removed={} added={} avg_before={:.2} avg_after={:.2}",
+                family.prototype_index,
+                family.members.len() + 1,
+                family.total_usage,
+                prototype_usage,
+                prototype_page_span,
+                stats.mode,
+                stats.medoid_black_pixels,
+                stats.output_black_pixels,
+                stats.pixels_kept,
+                stats.pixels_removed,
+                stats.pixels_added,
+                stats.avg_member_score_before,
+                stats.avg_member_score_after
+            ));
+            self.global_symbols[family.prototype_index] = prototype;
         }
 
         for page in &mut self.pages {
@@ -1389,6 +997,12 @@ impl<'a> Jbig2Encoder<'a> {
         }
 
         self.compact_symbol_table_after_remap();
+        self.state.decision_debug_lines.push(format!(
+            "collapse export summary: before={} after={} removed={}",
+            before_exported,
+            self.global_symbols.len(),
+            before_exported.saturating_sub(self.global_symbols.len())
+        ));
         self.state.lossy_collapse_applied = true;
         Ok(())
     }
@@ -1566,8 +1180,11 @@ impl<'a> Jbig2Encoder<'a> {
                                     }
 
                                     let nk = HashKey(dh * 10_000 + dw);
-                                    if let Some(bucket) = self.hash_map.get(&nk).cloned() {
-                                        for idx in bucket {
+                                    if let Some(bucket) = self.hash_map.get(&nk) {
+                                        let bucket_len = bucket.len();
+                                        let bucket_ptr = bucket.as_ptr();
+                                        for bucket_pos in 0..bucket_len {
+                                            let idx = unsafe { *bucket_ptr.add(bucket_pos) };
                                             let Some((err, dx, dy, needs_refinement)) = self
                                                 .evaluate_symbol_match(
                                                     &trimmed,
@@ -3054,7 +2671,7 @@ fn build_refinement_family_layout(
     let mut comparator = Comparator::default();
     let signatures: Vec<SymbolSignature> = symbols
         .iter()
-        .map(|sym| compute_symbol_signature_static(sym))
+        .map(|sym| compute_symbol_signature_shared(sym))
         .collect();
     let black_counts: Vec<usize> = symbols.iter().map(|sym| sym.count_ones()).collect();
 
@@ -3219,313 +2836,6 @@ fn build_refinement_family_layout(
     }
 }
 
-fn compute_symbol_signature_static(img: &BitImage) -> SymbolSignature {
-    let mut black = 0u32;
-    let mut left_col = img.width;
-    let mut right_col = 0usize;
-    let mut top_row = img.height;
-    let mut bottom_row = 0usize;
-    let mut sum_x = 0u32;
-    let mut sum_y = 0u32;
-    let mut left_mass = 0u32;
-    let mut right_mass = 0u32;
-    let mid_x = img.width / 2;
-
-    for y in 0..img.height {
-        for x in 0..img.width {
-            if img.get_usize(x, y) {
-                black += 1;
-                left_col = left_col.min(x);
-                right_col = right_col.max(x);
-                top_row = top_row.min(y);
-                bottom_row = bottom_row.max(y);
-                sum_x += x as u32;
-                sum_y += y as u32;
-                if x < mid_x {
-                    left_mass += 1;
-                } else {
-                    right_mass += 1;
-                }
-            }
-        }
-    }
-
-    let (cx, cy) = if black == 0 {
-        (0, 0)
-    } else {
-        (
-            ((sum_x * 256) / black).min(u16::MAX as u32) as u16,
-            ((sum_y * 256) / black).min(u16::MAX as u32) as u16,
-        )
-    };
-
-    SymbolSignature {
-        black,
-        area: img.width.saturating_mul(img.height).min(u32::MAX as usize) as u32,
-        left_col: left_col.min(u16::MAX as usize) as u16,
-        right_col: right_col.min(u16::MAX as usize) as u16,
-        top_row: top_row.min(u16::MAX as usize) as u16,
-        bottom_row: bottom_row.min(u16::MAX as usize) as u16,
-        cx_times_256: cx,
-        cy_times_256: cy,
-        left_mass: left_mass.min(u16::MAX as u32) as u16,
-        right_mass: right_mass.min(u16::MAX as u32) as u16,
-    }
-}
-
-#[inline]
-fn quantize_ratio_u8(num: u32, den: u32, bins: u32) -> u8 {
-    if den == 0 || bins == 0 {
-        return 0;
-    }
-    ((num.saturating_mul(bins)) / den)
-        .min(bins.saturating_sub(1)) as u8
-}
-
-fn family_bucket_key_for_symbol(symbol: &BitImage, sig: &SymbolSignature) -> FamilyBucketKey {
-    let w = symbol.width as u32;
-    let h = symbol.height as u32;
-    let area = sig.area.max(1);
-
-    FamilyBucketKey {
-        w_bin: ((w + 1) / 2).min(u16::MAX as u32) as u16,
-        h_bin: ((h + 1) / 2).min(u16::MAX as u32) as u16,
-        density_bin: quantize_ratio_u8(sig.black, area, 16),
-        aspect_bin: quantize_ratio_u8(w, h.max(1), 16),
-        centroid_y_bin: ((sig.cy_times_256 as u32 * 16) / (h.max(1) * 256)).min(15) as u8,
-        lr_balance_bin: quantize_ratio_u8(sig.left_mass as u32, sig.black.max(1), 8),
-    }
-}
-
-fn family_bucket_neighbors(key: FamilyBucketKey) -> Vec<FamilyBucketKey> {
-    let mut out = Vec::with_capacity(27);
-    for dh in -1i32..=1 {
-        for dw in -1i32..=1 {
-            for dd in -1i32..=1 {
-                out.push(FamilyBucketKey {
-                    w_bin: (key.w_bin as i32 + dw).max(0) as u16,
-                    h_bin: (key.h_bin as i32 + dh).max(0) as u16,
-                    density_bin: (key.density_bin as i32 + dd).clamp(0, 15) as u8,
-                    aspect_bin: key.aspect_bin,
-                    centroid_y_bin: key.centroid_y_bin,
-                    lr_balance_bin: key.lr_balance_bin,
-                });
-            }
-        }
-    }
-    out
-}
-
-fn family_signatures_are_compatible(
-    lhs: SymbolSignature,
-    rhs: SymbolSignature,
-    lhs_black: usize,
-    rhs_black: usize,
-) -> bool {
-    let area_scale = lhs_black.max(rhs_black).max(4);
-    let black_tol = (area_scale / 10).clamp(4, 10) as u32;
-    let mass_tol = (area_scale / 8).clamp(4, 12) as u16;
-
-    lhs.black.abs_diff(rhs.black) <= black_tol
-        && lhs.left_col.abs_diff(rhs.left_col) <= 2
-        && lhs.right_col.abs_diff(rhs.right_col) <= 2
-        && lhs.top_row.abs_diff(rhs.top_row) <= 1
-        && lhs.bottom_row.abs_diff(rhs.bottom_row) <= 1
-        && lhs.cx_times_256.abs_diff(rhs.cx_times_256) <= 96
-        && lhs.cy_times_256.abs_diff(rhs.cy_times_256) <= 96
-        && lhs.left_mass.abs_diff(rhs.left_mass) <= mass_tol
-        && lhs.right_mass.abs_diff(rhs.right_mass) <= mass_tol
-}
-
-#[inline]
-fn collapse_compare_score(result: &CompareResult) -> u32 {
-    result
-        .overlap_err
-        .saturating_add(result.outside_ink_err.saturating_mul(2))
-        .saturating_add(result.black_delta)
-}
-
-#[inline]
-fn refine_compare_score(err: u32, dx: i32, dy: i32) -> u32 {
-    err.saturating_add(((dx.abs() + dy.abs()) as u32).saturating_mul(2))
-}
-
-fn family_match_details(
-    comparator: &mut Comparator,
-    target: &BitImage,
-    target_index: usize,
-    reference: &BitImage,
-    reference_index: usize,
-    signatures: &[SymbolSignature],
-    black_counts: &[usize],
-) -> Option<(u32, i32, i32)> {
-    if target.width.abs_diff(reference.width) > 2 || target.height.abs_diff(reference.height) > 2 {
-        return None;
-    }
-    if !family_signatures_are_compatible(
-        signatures[target_index],
-        signatures[reference_index],
-        black_counts[target_index],
-        black_counts[reference_index],
-    ) {
-        return None;
-    }
-
-    let area = target
-        .width
-        .max(reference.width)
-        .saturating_mul(target.height.max(reference.height));
-    let max_err = ((area as f32 * 0.05).ceil() as u32).clamp(2, 16);
-    let result = comparator.compare_for_refine_family(target, reference, max_err, 2, 1)?;
-    Some((result.total_err, result.dx, result.dy))
-}
-
-fn lossy_family_match_details(
-    comparator: &mut Comparator,
-    target: &BitImage,
-    target_index: usize,
-    reference: &BitImage,
-    reference_index: usize,
-    signatures: &[SymbolSignature],
-    black_counts: &[usize],
-    max_err: u32,
-    max_dx: i32,
-    max_dy: i32,
-) -> Option<CompareResult> {
-    match lossy_family_probe(
-        comparator,
-        target,
-        target_index,
-        reference,
-        reference_index,
-        signatures,
-        black_counts,
-        max_err,
-        max_dx,
-        max_dy,
-    ) {
-        LossyFamilyProbe::Accept(result) => Some(result),
-        LossyFamilyProbe::Reject { .. } => None,
-    }
-}
-
-fn lossy_family_probe(
-    comparator: &mut Comparator,
-    target: &BitImage,
-    target_index: usize,
-    reference: &BitImage,
-    reference_index: usize,
-    signatures: &[SymbolSignature],
-    black_counts: &[usize],
-    max_err: u32,
-    max_dx: i32,
-    max_dy: i32,
-) -> LossyFamilyProbe {
-    if target.width.abs_diff(reference.width) > 1 || target.height.abs_diff(reference.height) > 1 {
-        return LossyFamilyProbe::Reject {
-            reason: "dim",
-            result: None,
-            limits: None,
-        };
-    }
-    if !family_signatures_are_compatible(
-        signatures[target_index],
-        signatures[reference_index],
-        black_counts[target_index],
-        black_counts[reference_index],
-    ) {
-        return LossyFamilyProbe::Reject {
-            reason: "signature",
-            result: None,
-            limits: None,
-        };
-    }
-
-    let Some(result) = comparator.compare_detailed(target, reference, max_err) else {
-        return LossyFamilyProbe::Reject {
-            reason: "overlap",
-            result: None,
-            limits: None,
-        };
-    };
-
-    if result.dx.abs() > max_dx || result.dy.abs() > max_dy {
-        return LossyFamilyProbe::Reject {
-            reason: "shift",
-            result: Some(result),
-            limits: None,
-        };
-    }
-
-    let limits = Comparator::collapse_compare_limits(&result);
-    if result.outside_ink_err > limits.outside_limit {
-        return LossyFamilyProbe::Reject {
-            reason: "outside",
-            result: Some(result),
-            limits: Some(limits),
-        };
-    }
-    if result.row_profile_err > limits.row_limit {
-        return LossyFamilyProbe::Reject {
-            reason: "row_profile",
-            result: Some(result),
-            limits: Some(limits),
-        };
-    }
-    if result.col_profile_err > limits.col_limit {
-        return LossyFamilyProbe::Reject {
-            reason: "col_profile",
-            result: Some(result),
-            limits: Some(limits),
-        };
-    }
-
-    LossyFamilyProbe::Accept(result)
-}
-
-fn format_collapse_probe_reject(
-    symbol_index: usize,
-    other_index: usize,
-    reason: &'static str,
-    result: Option<CompareResult>,
-    limits: Option<CollapseCompareLimits>,
-) -> String {
-    match (result, limits) {
-        (Some(result), Some(limits)) => format!(
-            "collapse pair reject[{reason}]: lhs={} rhs={} dx={} dy={} overlap={} outside={}/{} row={}/{} col={}/{} black_delta={} total={}",
-            symbol_index,
-            other_index,
-            result.dx,
-            result.dy,
-            result.overlap_err,
-            result.outside_ink_err,
-            limits.outside_limit,
-            result.row_profile_err,
-            limits.row_limit,
-            result.col_profile_err,
-            limits.col_limit,
-            result.black_delta,
-            result.total_err
-        ),
-        (Some(result), None) => format!(
-            "collapse pair reject[{reason}]: lhs={} rhs={} dx={} dy={} overlap={} outside={} row={} col={} black_delta={} total={}",
-            symbol_index,
-            other_index,
-            result.dx,
-            result.dy,
-            result.overlap_err,
-            result.outside_ink_err,
-            result.row_profile_err,
-            result.col_profile_err,
-            result.black_delta,
-            result.total_err
-        ),
-        (None, _) => format!(
-            "collapse pair reject[{reason}]: lhs={} rhs={}",
-            symbol_index, other_index
-        ),
-    }
-}
 
 fn family_refinement_gain(
     target: &BitImage,

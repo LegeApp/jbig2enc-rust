@@ -12,6 +12,7 @@
 //!                   example: BENCH_PAGES=1,5,10,20,50,100,all
 //!   BENCH_SOURCE  — dataset folder under repo root (default: "confed")
 //!   BENCH_WRITE   — set to "0" to disable writing JBIG2 fragments + decoded PBMs (default: write)
+//!   BENCH_MODES   — comma-separated modes to run: `generic`, `symbol`, `sym_collapse`, `sym_refine`
 //!   BENCH_COLLAPSE_MIN_FAMILY
 //!   BENCH_COLLAPSE_MIN_USAGE
 //!   BENCH_COLLAPSE_MIN_TOTAL_USAGE
@@ -23,7 +24,9 @@
 //!   BENCH_COLLAPSE_PROTO — `medoid`, `cleanup`, or `majority`
 
 use jbig2enc_rust::jbig2enc::{EncoderMetrics, Jbig2Encoder, PdfSplitOutput};
-use jbig2enc_rust::jbig2structs::{Jbig2Config, LossyCollapsePrototypeMode};
+use jbig2enc_rust::jbig2structs::{
+    Jbig2Config, LossyCollapsePrototypeMode, LossyCollapsePrototypeSelectorMode,
+};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -256,6 +259,20 @@ fn bench_source_dir() -> (String, PathBuf) {
     (source, path)
 }
 
+fn bench_modes_filter() -> Option<Vec<String>> {
+    std::env::var("BENCH_MODES").ok().map(|modes| {
+        modes
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+}
+
+fn mode_enabled(filter: Option<&[String]>, mode: &str) -> bool {
+    filter.is_none_or(|modes| modes.iter().any(|m| m == mode))
+}
+
 fn env_parse_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name)
         .ok()
@@ -271,7 +288,20 @@ fn collapse_proto_mode() -> LossyCollapsePrototypeMode {
     {
         "medoid" => LossyCollapsePrototypeMode::Medoid,
         "majority" => LossyCollapsePrototypeMode::MajorityVote,
+        "adaptive-majority" => LossyCollapsePrototypeMode::AdaptiveMajorityVote,
+        "adaptive-cleanup" => LossyCollapsePrototypeMode::MedoidWithAdaptiveCleanup,
         _ => LossyCollapsePrototypeMode::MedoidThenCleanup,
+    }
+}
+
+fn collapse_selector_mode() -> LossyCollapsePrototypeSelectorMode {
+    match std::env::var("BENCH_COLLAPSE_SELECTOR")
+        .unwrap_or_else(|_| "baseline".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "support" | "support-biased" => LossyCollapsePrototypeSelectorMode::SupportBiased,
+        _ => LossyCollapsePrototypeSelectorMode::Baseline,
     }
 }
 
@@ -309,6 +339,7 @@ fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig
     cfg_collapse.lossy_collapse_max_dy =
         env_parse_or("BENCH_COLLAPSE_MAX_DY", cfg_collapse.lossy_collapse_max_dy);
     cfg_collapse.lossy_collapse_prototype_mode = collapse_proto_mode();
+    cfg_collapse.lossy_collapse_prototype_selector_mode = collapse_selector_mode();
     cfgs.push(("sym_collapse", cfg_collapse));
 
     let _ = (count, total_pixels);
@@ -371,6 +402,7 @@ fn multi_page_compression_benchmark() {
 
     let page_counts = parse_page_counts(total_pages);
     let write_outputs = should_write_pdfs();
+    let mode_filter = bench_modes_filter();
 
     let ts = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -386,6 +418,9 @@ fn multi_page_compression_benchmark() {
     println!(
         "Source: {source_name}/ ({total_pages} pages)  |  Write fragments: {write_outputs}"
     );
+    if let Some(filter) = &mode_filter {
+        println!("Modes: {:?}", filter);
+    }
     println!("Page counts: {:?}\n", page_counts);
 
     // ── Warmup ───────────────────────────────────────────────────
@@ -421,96 +456,104 @@ fn multi_page_compression_benchmark() {
         let pages = &all_pages[..count];
         let total_pixels: u64 = pages.iter().map(|p| p.width as u64 * p.height as u64).sum();
         let total_pbm_bytes: u64 = pages.iter().map(|p| p.pbm_bytes).sum();
+        let run_generic = mode_enabled(mode_filter.as_deref(), "generic");
+        let mut gen_raw = 0usize;
 
         // ── Generic baseline ─────────────────────────────────────
-        let mut cfg_generic = Jbig2Config::lossless();
-        cfg_generic.want_full_headers = false;
-        let gen_result = run_encode(&cfg_generic, pages);
+        if run_generic {
+            let mut cfg_generic = Jbig2Config::lossless();
+            cfg_generic.want_full_headers = false;
+            let gen_result = run_encode(&cfg_generic, pages);
 
-        assert_eq!(
-            gen_result.split.page_streams.len(),
-            pages.len(),
-            "generic: wrong page stream count"
-        );
+            assert_eq!(
+                gen_result.split.page_streams.len(),
+                pages.len(),
+                "generic: wrong page stream count"
+            );
 
-        let (gen_raw, gen_globals, gen_page_kb) = raw_jbig2_stats(&gen_result.split);
-        if write_outputs {
-            write_fragments_and_decode(
-                &gen_result.split,
-                &out_dir.join(format!("generic_{count}p")),
-                &format!("generic_{count}p"),
-            )
-            .expect("write/decode generic fragments failed");
-            write_decision_log(
-                &out_dir.join(format!("generic_{count}p")),
-                &format!("generic_{count}p"),
-                &gen_result.decision_log,
-            )
-            .expect("write generic decision log failed");
+            let (raw, gen_globals, gen_page_kb) = raw_jbig2_stats(&gen_result.split);
+            gen_raw = raw;
+            if write_outputs {
+                write_fragments_and_decode(
+                    &gen_result.split,
+                    &out_dir.join(format!("generic_{count}p")),
+                    &format!("generic_{count}p"),
+                )
+                .expect("write/decode generic fragments failed");
+                write_decision_log(
+                    &out_dir.join(format!("generic_{count}p")),
+                    &format!("generic_{count}p"),
+                    &gen_result.decision_log,
+                )
+                .expect("write generic decision log failed");
+            }
+
+            let gen_avg_page = gen_page_kb.iter().sum::<f64>() / gen_page_kb.len() as f64;
+            let gen_min_page = gen_page_kb.iter().cloned().fold(f64::MAX, f64::min);
+            let gen_max_page = gen_page_kb.iter().cloned().fold(0.0_f64, f64::max);
+            let gen_ms = (gen_result.encode_secs * 1000.0) / count as f64;
+            let gen_mpix = (total_pixels as f64 / 1_000_000.0) / gen_result.encode_secs;
+            let gen_vs_pbm = (1.0 - gen_raw as f64 / total_pbm_bytes as f64) * 100.0;
+
+            let gen_row = BenchRow {
+                pages: count,
+                mode: "generic".into(),
+                encode_secs: gen_result.encode_secs,
+                ms_per_page: gen_ms,
+                mpix_per_s: gen_mpix,
+                raw_jbig2_bytes: gen_raw,
+                globals_bytes: gen_globals,
+                savings_vs_generic: 0.0,
+                savings_vs_pbm: gen_vs_pbm,
+                avg_page_kb: gen_avg_page,
+                min_page_kb: gen_min_page,
+                max_page_kb: gen_max_page,
+                cc_secs: gen_result.metrics.symbol_mode.cc_extraction.as_secs_f64(),
+                match_secs: gen_result.metrics.symbol_mode.matching_dedup.as_secs_f64(),
+                cluster_secs: gen_result.metrics.symbol_mode.clustering.as_secs_f64(),
+                planning_secs: gen_result.metrics.symbol_mode.planning.as_secs_f64(),
+                dict_secs: gen_result
+                    .metrics
+                    .symbol_mode
+                    .symbol_dict_encoding
+                    .as_secs_f64(),
+                text_secs: gen_result
+                    .metrics
+                    .symbol_mode
+                    .text_region_encoding
+                    .as_secs_f64(),
+                generic_secs: gen_result
+                    .metrics
+                    .symbol_mode
+                    .generic_region_encoding
+                    .as_secs_f64(),
+                symbols_discovered: gen_result.metrics.symbol_stats.symbols_discovered,
+                symbols_exported: gen_result.metrics.symbol_stats.symbols_exported,
+                avg_symbol_reuse: gen_result.metrics.symbol_stats.avg_symbol_reuse,
+                global_symbol_count: gen_result.metrics.symbol_stats.global_symbol_count,
+                local_symbol_count: gen_result.metrics.symbol_stats.local_symbol_count,
+            };
+
+            println!(
+                "{:<6} {:<10} {:>9.1} {:>9.1} {:>7}  {:>9.2} {:>7.1} {:>7.1} {:>7.1}%",
+                count,
+                "generic",
+                gen_raw as f64 / 1024.0,
+                gen_globals as f64 / 1024.0,
+                "—",
+                gen_result.encode_secs,
+                gen_ms,
+                gen_mpix,
+                gen_vs_pbm,
+            );
+            all_rows.push(gen_row);
         }
 
-        let gen_avg_page = gen_page_kb.iter().sum::<f64>() / gen_page_kb.len() as f64;
-        let gen_min_page = gen_page_kb.iter().cloned().fold(f64::MAX, f64::min);
-        let gen_max_page = gen_page_kb.iter().cloned().fold(0.0_f64, f64::max);
-        let gen_ms = (gen_result.encode_secs * 1000.0) / count as f64;
-        let gen_mpix = (total_pixels as f64 / 1_000_000.0) / gen_result.encode_secs;
-        let gen_vs_pbm = (1.0 - gen_raw as f64 / total_pbm_bytes as f64) * 100.0;
-
-        let gen_row = BenchRow {
-            pages: count,
-            mode: "generic".into(),
-            encode_secs: gen_result.encode_secs,
-            ms_per_page: gen_ms,
-            mpix_per_s: gen_mpix,
-            raw_jbig2_bytes: gen_raw,
-            globals_bytes: gen_globals,
-            savings_vs_generic: 0.0,
-            savings_vs_pbm: gen_vs_pbm,
-            avg_page_kb: gen_avg_page,
-            min_page_kb: gen_min_page,
-            max_page_kb: gen_max_page,
-            cc_secs: gen_result.metrics.symbol_mode.cc_extraction.as_secs_f64(),
-            match_secs: gen_result.metrics.symbol_mode.matching_dedup.as_secs_f64(),
-            cluster_secs: gen_result.metrics.symbol_mode.clustering.as_secs_f64(),
-            planning_secs: gen_result.metrics.symbol_mode.planning.as_secs_f64(),
-            dict_secs: gen_result
-                .metrics
-                .symbol_mode
-                .symbol_dict_encoding
-                .as_secs_f64(),
-            text_secs: gen_result
-                .metrics
-                .symbol_mode
-                .text_region_encoding
-                .as_secs_f64(),
-            generic_secs: gen_result
-                .metrics
-                .symbol_mode
-                .generic_region_encoding
-                .as_secs_f64(),
-            symbols_discovered: gen_result.metrics.symbol_stats.symbols_discovered,
-            symbols_exported: gen_result.metrics.symbol_stats.symbols_exported,
-            avg_symbol_reuse: gen_result.metrics.symbol_stats.avg_symbol_reuse,
-            global_symbol_count: gen_result.metrics.symbol_stats.global_symbol_count,
-            local_symbol_count: gen_result.metrics.symbol_stats.local_symbol_count,
-        };
-
-        println!(
-            "{:<6} {:<10} {:>9.1} {:>9.1} {:>7}  {:>9.2} {:>7.1} {:>7.1} {:>7.1}%",
-            count,
-            "generic",
-            gen_raw as f64 / 1024.0,
-            gen_globals as f64 / 1024.0,
-            "—",
-            gen_result.encode_secs,
-            gen_ms,
-            gen_mpix,
-            gen_vs_pbm,
-        );
-        all_rows.push(gen_row);
-
         // ── Symbol modes ─────────────────────────────────────────
-        let configs = configs_for_count(count, total_pixels);
+        let configs = configs_for_count(count, total_pixels)
+            .into_iter()
+            .filter(|(label, _)| mode_enabled(mode_filter.as_deref(), label))
+            .collect::<Vec<_>>();
         for (label, cfg) in &configs {
             let result = run_encode(cfg, pages);
 
@@ -536,7 +579,11 @@ fn multi_page_compression_benchmark() {
                 .unwrap_or_else(|e| panic!("write {label} decision log failed: {e}"));
             }
 
-            let savings_gen = (1.0 - raw_total as f64 / gen_raw as f64) * 100.0;
+            let savings_gen = if run_generic {
+                (1.0 - raw_total as f64 / gen_raw as f64) * 100.0
+            } else {
+                0.0
+            };
             let savings_pbm = (1.0 - raw_total as f64 / total_pbm_bytes as f64) * 100.0;
             let ms = (result.encode_secs * 1000.0) / count as f64;
             let mpix = (total_pixels as f64 / 1_000_000.0) / result.encode_secs;
@@ -550,7 +597,7 @@ fn multi_page_compression_benchmark() {
                 label,
                 raw_total as f64 / 1024.0,
                 globals_bytes as f64 / 1024.0,
-                savings_gen,
+                if run_generic { savings_gen } else { 0.0 },
                 result.encode_secs,
                 ms,
                 mpix,

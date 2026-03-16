@@ -62,6 +62,7 @@ pub struct Jbig2Config {
     pub lossy_collapse_max_dx: i32,
     pub lossy_collapse_max_dy: i32,
     pub lossy_collapse_prototype_mode: LossyCollapsePrototypeMode,
+    pub lossy_collapse_prototype_selector_mode: LossyCollapsePrototypeSelectorMode,
 }
 
 /// Configuration for halftone encoding
@@ -92,6 +93,14 @@ pub enum LossyCollapsePrototypeMode {
     Medoid,
     MajorityVote,
     MedoidThenCleanup,
+    AdaptiveMajorityVote,
+    MedoidWithAdaptiveCleanup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossyCollapsePrototypeSelectorMode {
+    Baseline,
+    SupportBiased,
 }
 
 impl Default for HalftoneConfig {
@@ -143,6 +152,7 @@ impl Default for Jbig2Config {
             lossy_collapse_max_dx: 1,
             lossy_collapse_max_dy: 1,
             lossy_collapse_prototype_mode: LossyCollapsePrototypeMode::MedoidThenCleanup,
+            lossy_collapse_prototype_selector_mode: LossyCollapsePrototypeSelectorMode::Baseline,
         }
     }
 }

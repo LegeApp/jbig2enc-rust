@@ -12,6 +12,10 @@
 //! ==========================================================
 
 use crate::jbig2sym::BitImage;
+use std::sync::OnceLock;
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 
 /// Maximum absolute shift (in pixels) that we search in x/y.
 const SEARCH_RADIUS: i32 = 5;
@@ -97,8 +101,7 @@ impl Comparator {
         b: &BitImage,
         max_err: u32,
     ) -> Option<(u32, i32, i32)> {
-        let result = self.compare_overlap_only(a, b, max_err)?;
-        Some((result.total_err, result.dx, result.dy))
+        self.best_alignment_result(a, b, max_err)
     }
 
     pub fn compare_overlap_only(
@@ -173,11 +176,38 @@ impl Comparator {
         max_dx: i32,
         max_dy: i32,
     ) -> Option<CompareResult> {
-        let result = self.compare_overlap_only(a, b, max_err)?;
+        let (overlap_err, dx, dy) = self.best_alignment_result(a, b, max_err)?;
+        let result = CompareResult {
+            total_err: overlap_err,
+            overlap_err,
+            dx,
+            dy,
+            ..Default::default()
+        };
         if result.dx.abs() > max_dx || result.dy.abs() > max_dy {
             return None;
         }
         Some(result)
+    }
+
+    #[inline]
+    fn best_alignment_result(
+        &mut self,
+        a: &BitImage,
+        b: &BitImage,
+        max_err: u32,
+    ) -> Option<(u32, i32, i32)> {
+        if a == b {
+            return Some((0, 0, 0));
+        }
+
+        if a.width.abs_diff(b.width) > MAX_DIMENSION_DELTA
+            || a.height.abs_diff(b.height) > MAX_DIMENSION_DELTA
+        {
+            return None;
+        }
+
+        self.best_alignment_by_xor(a, b, max_err)
     }
 
     pub fn compare_for_collapse_family(
@@ -235,6 +265,8 @@ impl Comparator {
         let mut best_err = max_err + 1;
         let mut best_dx = 0;
         let mut best_dy = 0;
+        let has_popcnt = popcnt_available();
+        let has_avx2 = avx2_popcnt_enabled();
 
         for dy in -SEARCH_RADIUS..=SEARCH_RADIUS {
             let top_i = dy.max(0);
@@ -256,54 +288,31 @@ impl Comparator {
 
                 let overlap_width = (right_i - left_i) as usize;
                 let cols_words = (overlap_width + 31) >> 5;
-                let bit_shift = (dx & 31) as usize;
-                let word_shift = dx >> 5;
+                let bit_shift = (dx & 31) as u32;
+                let word_shift = (dx >> 5) as isize;
                 let mut err = 0u32;
                 let mut early_break = false;
 
                 for row in 0..overlap_height {
-                    let a_slice = &a_words[(top + row) * awpr..(top + row + 1) * awpr];
-                    let b_slice =
-                        &b_words[(b_row_start + row) * bwpr..(b_row_start + row + 1) * bwpr];
+                    let a_row = unsafe { a_words.as_ptr().add((top + row) * awpr) };
+                    let b_row = unsafe { b_words.as_ptr().add((b_row_start + row) * bwpr) };
 
-                    if bit_shift == 0 {
-                        for w in 0..cols_words {
-                            let a_idx = w as i32 + word_shift;
-                            let aw = if a_idx < 0 {
-                                0
-                            } else {
-                                a_slice.get(a_idx as usize).copied().unwrap_or(0)
-                            };
-                            err += (aw ^ b_slice[w]).count_ones();
-                            if err >= best_err || err > max_err {
-                                early_break = true;
-                                break;
-                            }
+                    let (new_err, broke) = unsafe {
+                        if bit_shift == 0 {
+                            row_kernel_noshift(
+                                a_row, awpr, b_row, cols_words, word_shift, err, best_err, max_err,
+                                has_popcnt, has_avx2,
+                            )
+                        } else {
+                            row_kernel_shift(
+                                a_row, awpr, b_row, cols_words, word_shift, bit_shift, err,
+                                best_err, max_err, has_popcnt, has_avx2,
+                            )
                         }
-                    } else {
-                        let bit_shift = bit_shift as u32;
-                        for w in 0..cols_words {
-                            let a_idx = w as i32 + word_shift;
-                            let aw = if a_idx < 0 {
-                                0
-                            } else {
-                                a_slice.get(a_idx as usize).copied().unwrap_or(0)
-                            };
-                            let aw_next = if a_idx + 1 < 0 {
-                                0
-                            } else {
-                                a_slice.get((a_idx + 1) as usize).copied().unwrap_or(0)
-                            };
-                            let aligned_a = (aw << bit_shift) | (aw_next >> (32 - bit_shift));
-                            err += (aligned_a ^ b_slice[w]).count_ones();
-                            if err >= best_err || err > max_err {
-                                early_break = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if early_break {
+                    };
+                    err = new_err;
+                    if broke {
+                        early_break = true;
                         break;
                     }
                 }
@@ -426,5 +435,304 @@ impl Comparator {
             dx,
             dy,
         }
+    }
+}
+
+#[inline]
+fn popcnt_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("popcnt")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[inline]
+fn avx2_popcnt_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2") && is_x86_feature_detected!("popcnt")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+#[inline]
+fn avx2_popcnt_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        avx2_popcnt_available() && std::env::var("JBIG2_USE_AVX2").is_ok_and(|v| v == "1")
+    })
+}
+
+#[inline(always)]
+unsafe fn load_word_or_zero(base: *const u32, idx: isize, len: usize) -> u32 {
+    if idx < 0 || (idx as usize) >= len {
+        0
+    } else {
+        unsafe { *base.add(idx as usize) }
+    }
+}
+
+#[inline(always)]
+unsafe fn row_kernel_noshift(
+    a_row: *const u32,
+    a_len: usize,
+    b_row: *const u32,
+    cols_words: usize,
+    word_shift: isize,
+    err: u32,
+    best_err: u32,
+    max_err: u32,
+    has_popcnt: bool,
+    has_avx2: bool,
+) -> (u32, bool) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2 && cols_words >= 16 && word_shift >= 0 {
+            return unsafe {
+                row_kernel_noshift_avx2(
+                    a_row, a_len, b_row, cols_words, word_shift, err, best_err, max_err,
+                )
+            };
+        }
+        if has_popcnt {
+            return unsafe {
+                row_kernel_noshift_scalar_popcnt(
+                    a_row, a_len, b_row, cols_words, word_shift, err, best_err, max_err,
+                )
+            };
+        }
+    }
+
+    unsafe { row_kernel_noshift_scalar(a_row, a_len, b_row, cols_words, word_shift, err, best_err, max_err) }
+}
+
+#[inline(always)]
+unsafe fn row_kernel_shift(
+    a_row: *const u32,
+    a_len: usize,
+    b_row: *const u32,
+    cols_words: usize,
+    word_shift: isize,
+    bit_shift: u32,
+    err: u32,
+    best_err: u32,
+    max_err: u32,
+    has_popcnt: bool,
+    has_avx2: bool,
+) -> (u32, bool) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_popcnt {
+            return unsafe {
+                row_kernel_shift_scalar_popcnt(
+                    a_row, a_len, b_row, cols_words, word_shift, bit_shift, err, best_err,
+                    max_err,
+                )
+            };
+        }
+    }
+
+    unsafe {
+        row_kernel_shift_scalar(
+            a_row, a_len, b_row, cols_words, word_shift, bit_shift, err, best_err, max_err,
+        )
+    }
+}
+
+#[inline(always)]
+unsafe fn row_kernel_noshift_scalar(
+    a_row: *const u32,
+    a_len: usize,
+    b_row: *const u32,
+    cols_words: usize,
+    word_shift: isize,
+    mut err: u32,
+    best_err: u32,
+    max_err: u32,
+) -> (u32, bool) {
+    for w in 0..cols_words {
+        let a_idx = w as isize + word_shift;
+        let aw = unsafe { load_word_or_zero(a_row, a_idx, a_len) };
+        let bw = unsafe { *b_row.add(w) };
+        err += (aw ^ bw).count_ones();
+        if err >= best_err || err > max_err {
+            return (err, true);
+        }
+    }
+    (err, false)
+}
+
+#[inline(always)]
+unsafe fn row_kernel_shift_scalar(
+    a_row: *const u32,
+    a_len: usize,
+    b_row: *const u32,
+    cols_words: usize,
+    word_shift: isize,
+    bit_shift: u32,
+    mut err: u32,
+    best_err: u32,
+    max_err: u32,
+) -> (u32, bool) {
+    let rshift = 32 - bit_shift;
+    for w in 0..cols_words {
+        let a_idx = w as isize + word_shift;
+        let aw = unsafe { load_word_or_zero(a_row, a_idx, a_len) };
+        let aw_next = unsafe { load_word_or_zero(a_row, a_idx + 1, a_len) };
+        let aligned_a = (aw << bit_shift) | (aw_next >> rshift);
+        let bw = unsafe { *b_row.add(w) };
+        err += (aligned_a ^ bw).count_ones();
+        if err >= best_err || err > max_err {
+            return (err, true);
+        }
+    }
+    (err, false)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "popcnt")]
+unsafe fn row_kernel_noshift_scalar_popcnt(
+    a_row: *const u32,
+    a_len: usize,
+    b_row: *const u32,
+    cols_words: usize,
+    word_shift: isize,
+    err: u32,
+    best_err: u32,
+    max_err: u32,
+) -> (u32, bool) {
+    unsafe {
+        row_kernel_noshift_scalar(
+            a_row, a_len, b_row, cols_words, word_shift, err, best_err, max_err,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "popcnt")]
+unsafe fn row_kernel_shift_scalar_popcnt(
+    a_row: *const u32,
+    a_len: usize,
+    b_row: *const u32,
+    cols_words: usize,
+    word_shift: isize,
+    bit_shift: u32,
+    err: u32,
+    best_err: u32,
+    max_err: u32,
+) -> (u32, bool) {
+    unsafe {
+        row_kernel_shift_scalar(
+            a_row, a_len, b_row, cols_words, word_shift, bit_shift, err, best_err, max_err,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[target_feature(enable = "popcnt")]
+unsafe fn row_kernel_noshift_avx2(
+    a_row: *const u32,
+    a_len: usize,
+    b_row: *const u32,
+    cols_words: usize,
+    word_shift: isize,
+    mut err: u32,
+    best_err: u32,
+    max_err: u32,
+) -> (u32, bool) {
+    let mut w = 0usize;
+    while w < cols_words {
+        let a_idx = w as isize + word_shift;
+        if a_idx < 0 || (a_idx as usize + 8) > a_len || w + 8 > cols_words {
+            break;
+        }
+
+        let av = unsafe { _mm256_loadu_si256(a_row.add(a_idx as usize) as *const __m256i) };
+        let bv = unsafe { _mm256_loadu_si256(b_row.add(w) as *const __m256i) };
+        let xv = _mm256_xor_si256(av, bv);
+        let mut lanes = [0u64; 4];
+        unsafe { _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, xv) };
+        err = err.saturating_add(lanes.iter().map(|lane| lane.count_ones()).sum::<u32>());
+        if err >= best_err || err > max_err {
+            return (err, true);
+        }
+        w += 8;
+    }
+
+    unsafe {
+        row_kernel_noshift_scalar(
+            a_row,
+            a_len,
+            b_row.add(w),
+            cols_words - w,
+            word_shift + w as isize,
+            err,
+            best_err,
+            max_err,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[target_feature(enable = "popcnt")]
+unsafe fn row_kernel_shift_avx2(
+    a_row: *const u32,
+    a_len: usize,
+    b_row: *const u32,
+    cols_words: usize,
+    word_shift: isize,
+    bit_shift: u32,
+    mut err: u32,
+    best_err: u32,
+    max_err: u32,
+) -> (u32, bool) {
+    let rshift = 32 - bit_shift;
+    let lshift_vec = _mm256_set1_epi32(bit_shift as i32);
+    let rshift_vec = _mm256_set1_epi32(rshift as i32);
+    let mut w = 0usize;
+    while w < cols_words {
+        let a_idx = w as isize + word_shift;
+        if a_idx < 0 || (a_idx as usize + 9) > a_len || w + 8 > cols_words {
+            break;
+        }
+
+        let av = unsafe { _mm256_loadu_si256(a_row.add(a_idx as usize) as *const __m256i) };
+        let av_next = unsafe { _mm256_loadu_si256(a_row.add(a_idx as usize + 1) as *const __m256i) };
+        let aligned = _mm256_or_si256(
+            _mm256_sllv_epi32(av, lshift_vec),
+            _mm256_srlv_epi32(av_next, rshift_vec),
+        );
+        let bv = unsafe { _mm256_loadu_si256(b_row.add(w) as *const __m256i) };
+        let xv = _mm256_xor_si256(aligned, bv);
+        let mut lanes = [0u64; 4];
+        unsafe { _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, xv) };
+        err = err.saturating_add(lanes.iter().map(|lane| lane.count_ones()).sum::<u32>());
+        if err >= best_err || err > max_err {
+            return (err, true);
+        }
+        w += 8;
+    }
+
+    unsafe {
+        row_kernel_shift_scalar(
+            a_row,
+            a_len,
+            b_row.add(w),
+            cols_words - w,
+            word_shift + w as isize,
+            bit_shift,
+            err,
+            best_err,
+            max_err,
+        )
     }
 }
