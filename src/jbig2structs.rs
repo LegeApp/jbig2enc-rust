@@ -139,9 +139,9 @@ impl Default for Jbig2Config {
             lossy_collapse_min_total_usage: 0,
             lossy_collapse_min_prototype_usage: 0,
             lossy_collapse_min_page_span: 0,
-            lossy_collapse_max_err: 10,
+            lossy_collapse_max_err: 24,
             lossy_collapse_max_dx: 1,
-            lossy_collapse_max_dy: 0,
+            lossy_collapse_max_dy: 1,
             lossy_collapse_prototype_mode: LossyCollapsePrototypeMode::MedoidThenCleanup,
         }
     }

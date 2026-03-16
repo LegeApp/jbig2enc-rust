@@ -30,6 +30,13 @@ pub struct CompareResult {
     pub dy: i32,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CollapseCompareLimits {
+    pub outside_limit: u32,
+    pub row_limit: u32,
+    pub col_limit: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CompareWeights {
     pub overlap_err: u32,
@@ -49,11 +56,11 @@ impl CompareWeights {
     };
 
     pub const COLLAPSE: Self = Self {
-        overlap_err: 5,
-        outside_ink_err: 8,
-        row_profile_err: 5,
-        col_profile_err: 5,
-        black_delta: 2,
+        overlap_err: 6,
+        outside_ink_err: 3,
+        row_profile_err: 2,
+        col_profile_err: 2,
+        black_delta: 1,
     };
 
     pub const REFINE: Self = Self {
@@ -90,8 +97,40 @@ impl Comparator {
         b: &BitImage,
         max_err: u32,
     ) -> Option<(u32, i32, i32)> {
-        let result = self.compare_detailed(a, b, max_err)?;
+        let result = self.compare_overlap_only(a, b, max_err)?;
         Some((result.total_err, result.dx, result.dy))
+    }
+
+    pub fn compare_overlap_only(
+        &mut self,
+        a: &BitImage,
+        b: &BitImage,
+        max_err: u32,
+    ) -> Option<CompareResult> {
+        if a == b {
+            return Some(CompareResult {
+                dx: 0,
+                dy: 0,
+                black_delta: 0,
+                ..Default::default()
+            });
+        }
+
+        if a.width.abs_diff(b.width) > MAX_DIMENSION_DELTA
+            || a.height.abs_diff(b.height) > MAX_DIMENSION_DELTA
+        {
+            return None;
+        }
+
+        let (overlap_err, dx, dy) = self.best_alignment_by_xor(a, b, max_err)?;
+        Some(CompareResult {
+            total_err: overlap_err,
+            overlap_err,
+            black_delta: a.count_ones().abs_diff(b.count_ones()) as u32,
+            dx,
+            dy,
+            ..Default::default()
+        })
     }
 
     pub fn compare_detailed(
@@ -123,6 +162,57 @@ impl Comparator {
             Some(result)
         } else {
             None
+        }
+    }
+
+    pub fn compare_for_refine_family(
+        &mut self,
+        a: &BitImage,
+        b: &BitImage,
+        max_err: u32,
+        max_dx: i32,
+        max_dy: i32,
+    ) -> Option<CompareResult> {
+        let result = self.compare_overlap_only(a, b, max_err)?;
+        if result.dx.abs() > max_dx || result.dy.abs() > max_dy {
+            return None;
+        }
+        Some(result)
+    }
+
+    pub fn compare_for_collapse_family(
+        &mut self,
+        a: &BitImage,
+        b: &BitImage,
+        max_err: u32,
+        max_dx: i32,
+        max_dy: i32,
+    ) -> Option<CompareResult> {
+        let result = self.compare_detailed(a, b, max_err)?;
+        if result.dx.abs() > max_dx || result.dy.abs() > max_dy {
+            return None;
+        }
+
+        let limits = Self::collapse_compare_limits(&result);
+
+        if result.outside_ink_err > limits.outside_limit
+            || result.row_profile_err > limits.row_limit
+            || result.col_profile_err > limits.col_limit
+        {
+            return None;
+        }
+
+        Some(result)
+    }
+
+    pub fn collapse_compare_limits(result: &CompareResult) -> CollapseCompareLimits {
+        let shift_slack = (result.dx.abs() + result.dy.abs()) as u32;
+        CollapseCompareLimits {
+            outside_limit: (result.overlap_err / 2).max(2)
+                + result.black_delta.min(4)
+                + shift_slack,
+            row_limit: result.overlap_err.saturating_mul(6).saturating_add(24),
+            col_limit: result.overlap_err.saturating_mul(6).saturating_add(24),
         }
     }
 

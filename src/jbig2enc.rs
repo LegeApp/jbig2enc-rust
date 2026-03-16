@@ -1,6 +1,8 @@
 //! This module contains the main JBIG2 encoder logic.
 use crate::jbig2arith::{IntProc, Jbig2ArithCoder};
-use crate::jbig2comparator::{Comparator, CompareResult, CompareWeights, MAX_DIMENSION_DELTA};
+use crate::jbig2comparator::{
+    CollapseCompareLimits, Comparator, CompareResult, MAX_DIMENSION_DELTA,
+};
 // Symbol extraction using CC analysis
 #[cfg(feature = "cc-analysis")]
 use crate::jbig2cc::analyze_page;
@@ -321,6 +323,16 @@ struct LossyFamily {
     members: Vec<LossyFamilyMatch>,
     total_usage: usize,
     page_span: usize,
+}
+
+#[derive(Debug, Clone)]
+enum LossyFamilyProbe {
+    Accept(CompareResult),
+    Reject {
+        reason: &'static str,
+        result: Option<CompareResult>,
+        limits: Option<CollapseCompareLimits>,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -785,7 +797,7 @@ impl<'a> Jbig2Encoder<'a> {
                     self.config.lossy_collapse_max_dy,
                 ) {
                     Some(result) => {
-                        score += CompareWeights::COLLAPSE.score(&result) as u64 * weight;
+                        score += collapse_compare_score(&result) as u64 * weight;
                     }
                     None => score += 1_000_000 * weight,
                 }
@@ -890,7 +902,7 @@ impl<'a> Jbig2Encoder<'a> {
         out
     }
 
-    fn build_lossy_symbol_families(&self) -> Vec<LossyFamily> {
+    fn build_lossy_symbol_families(&mut self) -> Vec<LossyFamily> {
         if !self.config.lossy_symbol_collapse || self.global_symbols.len() <= 1 {
             return Vec::new();
         }
@@ -908,6 +920,12 @@ impl<'a> Jbig2Encoder<'a> {
         let mut comparator = Comparator::default();
         let mut parent: Vec<usize> = (0..self.global_symbols.len()).collect();
         let mut rank = vec![0u32; self.global_symbols.len()];
+        let mut accepted_pair_count = 0usize;
+        let mut rejected_pair_count = 0usize;
+        let mut accepted_samples = Vec::new();
+        let mut rejected_samples = Vec::new();
+        let mut reject_reason_counts: HashMap<&'static str, usize> = HashMap::new();
+        let mut reject_reason_sample_counts: HashMap<&'static str, usize> = HashMap::new();
 
         for &symbol_index in &all_indices {
             let key = family_bucket_key_for_symbol(
@@ -923,7 +941,7 @@ impl<'a> Jbig2Encoder<'a> {
                     if other_index >= symbol_index {
                         continue;
                     }
-                    if lossy_family_match_details(
+                    match lossy_family_probe(
                         &mut comparator,
                         &self.global_symbols[symbol_index],
                         symbol_index,
@@ -934,10 +952,45 @@ impl<'a> Jbig2Encoder<'a> {
                         self.config.lossy_collapse_max_err,
                         self.config.lossy_collapse_max_dx,
                         self.config.lossy_collapse_max_dy,
-                    )
-                    .is_some()
-                    {
-                        uf_union(&mut parent, &mut rank, symbol_index, other_index);
+                    ) {
+                        LossyFamilyProbe::Accept(result) => {
+                            accepted_pair_count += 1;
+                            if accepted_samples.len() < 48 {
+                                accepted_samples.push(format!(
+                                    "collapse pair accept: lhs={} rhs={} dx={} dy={} overlap={} outside={} row={} col={} black_delta={} total={}",
+                                    symbol_index,
+                                    other_index,
+                                    result.dx,
+                                    result.dy,
+                                    result.overlap_err,
+                                    result.outside_ink_err,
+                                    result.row_profile_err,
+                                    result.col_profile_err,
+                                    result.black_delta,
+                                    result.total_err
+                                ));
+                            }
+                            uf_union(&mut parent, &mut rank, symbol_index, other_index);
+                        }
+                        LossyFamilyProbe::Reject {
+                            reason,
+                            result,
+                            limits,
+                        } => {
+                            rejected_pair_count += 1;
+                            *reject_reason_counts.entry(reason).or_insert(0) += 1;
+                            let sample_count = reject_reason_sample_counts.entry(reason).or_insert(0);
+                            if *sample_count < 12 {
+                                *sample_count += 1;
+                                rejected_samples.push(format_collapse_probe_reject(
+                                    symbol_index,
+                                    other_index,
+                                    reason,
+                                    result,
+                                    limits,
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -1037,6 +1090,20 @@ impl<'a> Jbig2Encoder<'a> {
         for line in skipped_samples {
             trace!("{line}");
         }
+
+        self.state.decision_debug_lines.push(format!(
+            "collapse pair probes: accepted={} rejected={}",
+            accepted_pair_count, rejected_pair_count
+        ));
+        let mut reject_summary: Vec<_> = reject_reason_counts.into_iter().collect();
+        reject_summary.sort_by(|lhs, rhs| rhs.1.cmp(&lhs.1).then_with(|| lhs.0.cmp(rhs.0)));
+        for (reason, count) in reject_summary {
+            self.state
+                .decision_debug_lines
+                .push(format!("collapse pair rejects[{reason}]={count}"));
+        }
+        self.state.decision_debug_lines.extend(accepted_samples);
+        self.state.decision_debug_lines.extend(rejected_samples);
 
         families
     }
@@ -3094,11 +3161,13 @@ fn build_refinement_family_layout(
             );
 
             match maybe_match {
-                Some(result)
+                Some((err, dx, dy))
                     if family_should_refine(
                         symbols[member_input_index],
                         symbols[prototype_input_index],
-                        &result,
+                        err,
+                        dx,
+                        dy,
                         usage_weights
                             .and_then(|weights| weights.get(member_input_index).copied())
                             .unwrap_or(1),
@@ -3106,18 +3175,18 @@ fn build_refinement_family_layout(
                 {
                     refinements[member_input_index] = Some(RefinementPlan {
                         prototype_input_index,
-                        refinement_dx: result.dx,
-                        refinement_dy: result.dy,
+                        refinement_dx: dx,
+                        refinement_dy: dy,
                     });
                     diagnostics.refined_member_count += 1;
                     if diagnostics.sample_lines.len() < 128 {
                         diagnostics.sample_lines.push(format!(
-                            "  refine member={} -> prototype={} dx={} dy={} score={} usage={}",
+                            "  refine member={} -> prototype={} dx={} dy={} err={} usage={}",
                             member_input_index,
                             prototype_input_index,
-                            result.dx,
-                            result.dy,
-                            CompareWeights::REFINE.score(&result),
+                            dx,
+                            dy,
+                            err,
                             usage_weights
                                 .and_then(|weights| weights.get(member_input_index).copied())
                                 .unwrap_or(1)
@@ -3268,6 +3337,19 @@ fn family_signatures_are_compatible(
         && lhs.right_mass.abs_diff(rhs.right_mass) <= mass_tol
 }
 
+#[inline]
+fn collapse_compare_score(result: &CompareResult) -> u32 {
+    result
+        .overlap_err
+        .saturating_add(result.outside_ink_err.saturating_mul(2))
+        .saturating_add(result.black_delta)
+}
+
+#[inline]
+fn refine_compare_score(err: u32, dx: i32, dy: i32) -> u32 {
+    err.saturating_add(((dx.abs() + dy.abs()) as u32).saturating_mul(2))
+}
+
 fn family_match_details(
     comparator: &mut Comparator,
     target: &BitImage,
@@ -3276,7 +3358,7 @@ fn family_match_details(
     reference_index: usize,
     signatures: &[SymbolSignature],
     black_counts: &[usize],
-) -> Option<CompareResult> {
+) -> Option<(u32, i32, i32)> {
     if target.width.abs_diff(reference.width) > 2 || target.height.abs_diff(reference.height) > 2 {
         return None;
     }
@@ -3294,15 +3376,8 @@ fn family_match_details(
         .max(reference.width)
         .saturating_mul(target.height.max(reference.height));
     let max_err = ((area as f32 * 0.05).ceil() as u32).clamp(2, 16);
-    let result = comparator.compare_detailed(target, reference, max_err)?;
-    if result.dx.abs() > 2 || result.dy.abs() > 1 {
-        return None;
-    }
-    if CompareWeights::REFINE.score(&result) > 120 {
-        return None;
-    }
-
-    Some(result)
+    let result = comparator.compare_for_refine_family(target, reference, max_err, 2, 1)?;
+    Some((result.total_err, result.dx, result.dy))
 }
 
 fn lossy_family_match_details(
@@ -3317,8 +3392,41 @@ fn lossy_family_match_details(
     max_dx: i32,
     max_dy: i32,
 ) -> Option<CompareResult> {
+    match lossy_family_probe(
+        comparator,
+        target,
+        target_index,
+        reference,
+        reference_index,
+        signatures,
+        black_counts,
+        max_err,
+        max_dx,
+        max_dy,
+    ) {
+        LossyFamilyProbe::Accept(result) => Some(result),
+        LossyFamilyProbe::Reject { .. } => None,
+    }
+}
+
+fn lossy_family_probe(
+    comparator: &mut Comparator,
+    target: &BitImage,
+    target_index: usize,
+    reference: &BitImage,
+    reference_index: usize,
+    signatures: &[SymbolSignature],
+    black_counts: &[usize],
+    max_err: u32,
+    max_dx: i32,
+    max_dy: i32,
+) -> LossyFamilyProbe {
     if target.width.abs_diff(reference.width) > 1 || target.height.abs_diff(reference.height) > 1 {
-        return None;
+        return LossyFamilyProbe::Reject {
+            reason: "dim",
+            result: None,
+            limits: None,
+        };
     }
     if !family_signatures_are_compatible(
         signatures[target_index],
@@ -3326,30 +3434,110 @@ fn lossy_family_match_details(
         black_counts[target_index],
         black_counts[reference_index],
     ) {
-        return None;
+        return LossyFamilyProbe::Reject {
+            reason: "signature",
+            result: None,
+            limits: None,
+        };
     }
 
-    let result = comparator.compare_detailed(target, reference, max_err)?;
+    let Some(result) = comparator.compare_detailed(target, reference, max_err) else {
+        return LossyFamilyProbe::Reject {
+            reason: "overlap",
+            result: None,
+            limits: None,
+        };
+    };
+
     if result.dx.abs() > max_dx || result.dy.abs() > max_dy {
-        return None;
-    }
-    if CompareWeights::COLLAPSE.score(&result) > 140 {
-        return None;
+        return LossyFamilyProbe::Reject {
+            reason: "shift",
+            result: Some(result),
+            limits: None,
+        };
     }
 
-    Some(result)
+    let limits = Comparator::collapse_compare_limits(&result);
+    if result.outside_ink_err > limits.outside_limit {
+        return LossyFamilyProbe::Reject {
+            reason: "outside",
+            result: Some(result),
+            limits: Some(limits),
+        };
+    }
+    if result.row_profile_err > limits.row_limit {
+        return LossyFamilyProbe::Reject {
+            reason: "row_profile",
+            result: Some(result),
+            limits: Some(limits),
+        };
+    }
+    if result.col_profile_err > limits.col_limit {
+        return LossyFamilyProbe::Reject {
+            reason: "col_profile",
+            result: Some(result),
+            limits: Some(limits),
+        };
+    }
+
+    LossyFamilyProbe::Accept(result)
+}
+
+fn format_collapse_probe_reject(
+    symbol_index: usize,
+    other_index: usize,
+    reason: &'static str,
+    result: Option<CompareResult>,
+    limits: Option<CollapseCompareLimits>,
+) -> String {
+    match (result, limits) {
+        (Some(result), Some(limits)) => format!(
+            "collapse pair reject[{reason}]: lhs={} rhs={} dx={} dy={} overlap={} outside={}/{} row={}/{} col={}/{} black_delta={} total={}",
+            symbol_index,
+            other_index,
+            result.dx,
+            result.dy,
+            result.overlap_err,
+            result.outside_ink_err,
+            limits.outside_limit,
+            result.row_profile_err,
+            limits.row_limit,
+            result.col_profile_err,
+            limits.col_limit,
+            result.black_delta,
+            result.total_err
+        ),
+        (Some(result), None) => format!(
+            "collapse pair reject[{reason}]: lhs={} rhs={} dx={} dy={} overlap={} outside={} row={} col={} black_delta={} total={}",
+            symbol_index,
+            other_index,
+            result.dx,
+            result.dy,
+            result.overlap_err,
+            result.outside_ink_err,
+            result.row_profile_err,
+            result.col_profile_err,
+            result.black_delta,
+            result.total_err
+        ),
+        (None, _) => format!(
+            "collapse pair reject[{reason}]: lhs={} rhs={}",
+            symbol_index, other_index
+        ),
+    }
 }
 
 fn family_refinement_gain(
     target: &BitImage,
     reference: &BitImage,
-    result: &CompareResult,
+    err: u32,
+    dx: i32,
+    dy: i32,
 ) -> i64 {
     let plain_cost = ((target.width.saturating_mul(target.height) + 7) / 8) as i64 + 14;
     let refine_cost = 10
-        + result.total_err as i64
-        + ((result.dx.abs() + result.dy.abs()) as i64 * 3)
-        + result.outside_ink_err as i64 * 2
+        + err as i64
+        + ((dx.abs() + dy.abs()) as i64 * 3)
         + (target.width.abs_diff(reference.width) + target.height.abs_diff(reference.height))
             as i64
             * 2;
@@ -3359,13 +3547,15 @@ fn family_refinement_gain(
 fn family_should_refine(
     target: &BitImage,
     reference: &BitImage,
-    result: &CompareResult,
+    err: u32,
+    dx: i32,
+    dy: i32,
     usage_count: usize,
 ) -> bool {
     if usage_count > 1 {
         return false;
     }
-    let export_gain = family_refinement_gain(target, reference, result);
+    let export_gain = family_refinement_gain(target, reference, err, dx, dy);
     export_gain > 12
 }
 
@@ -3404,8 +3594,9 @@ fn choose_family_prototype(
                 signatures,
                 black_counts,
             ) {
-                Some(result) => {
-                    total_cost += (CompareWeights::REFINE.score(&result) as u64 + 4) * weight;
+                Some((err, dx, dy)) => {
+                    total_cost +=
+                        (refine_compare_score(err, dx, dy) as u64 + 4) * weight;
                 }
                 None => total_cost += 1_000_000 * weight,
             }
