@@ -46,7 +46,7 @@ pub struct LossyFamily {
     pub prototype_score: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum LossyFamilyProbe {
     Accept(CompareResult),
     Reject {
@@ -91,6 +91,7 @@ pub struct PrototypeBuildInputs<'a> {
     pub symbol_page_count: &'a [usize],
     pub symbol_signatures: &'a [SymbolSignature],
     pub symbol_pixel_counts: &'a [usize],
+    pub collect_stats: bool,
 }
 
 pub fn compute_symbol_signature(img: &BitImage) -> SymbolSignature {
@@ -218,8 +219,31 @@ fn pair_cache_key(lhs: usize, rhs: usize) -> u64 {
     ((lhs as u64) << 32) | rhs as u64
 }
 
-fn lossy_family_probe_cached<'a>(
-    probe_cache: &'a mut FxHashMap<u64, LossyFamilyProbe>,
+#[inline]
+fn reverse_compare_result(mut result: CompareResult) -> CompareResult {
+    result.dx = -result.dx;
+    result.dy = -result.dy;
+    result
+}
+
+#[inline]
+fn reverse_lossy_family_probe(probe: LossyFamilyProbe) -> LossyFamilyProbe {
+    match probe {
+        LossyFamilyProbe::Accept(result) => LossyFamilyProbe::Accept(reverse_compare_result(result)),
+        LossyFamilyProbe::Reject {
+            reason,
+            result,
+            limits,
+        } => LossyFamilyProbe::Reject {
+            reason,
+            result: result.map(reverse_compare_result),
+            limits,
+        },
+    }
+}
+
+fn lossy_family_probe_cached(
+    probe_cache: &mut FxHashMap<u64, LossyFamilyProbe>,
     comparator: &mut Comparator,
     target: &BitImage,
     target_index: usize,
@@ -230,24 +254,35 @@ fn lossy_family_probe_cached<'a>(
     max_err: u32,
     max_dx: i32,
     max_dy: i32,
-) -> &'a LossyFamilyProbe {
+) -> LossyFamilyProbe {
     use std::collections::hash_map::Entry;
 
-    let key = pair_cache_key(target_index, reference_index);
-    match probe_cache.entry(key) {
-        Entry::Occupied(entry) => entry.into_mut(),
-        Entry::Vacant(entry) => entry.insert(lossy_family_probe(
+    let (lhs_index, lhs_image, rhs_index, rhs_image, reverse) = if target_index <= reference_index
+    {
+        (target_index, target, reference_index, reference, false)
+    } else {
+        (reference_index, reference, target_index, target, true)
+    };
+    let key = pair_cache_key(lhs_index, rhs_index);
+    let probe = match probe_cache.entry(key) {
+        Entry::Occupied(entry) => *entry.get(),
+        Entry::Vacant(entry) => *entry.insert(lossy_family_probe(
             comparator,
-            target,
-            target_index,
-            reference,
-            reference_index,
+            lhs_image,
+            lhs_index,
+            rhs_image,
+            rhs_index,
             signatures,
             black_counts,
             max_err,
             max_dx,
             max_dy,
         )),
+    };
+    if reverse {
+        reverse_lossy_family_probe(probe)
+    } else {
+        probe
     }
 }
 
@@ -376,21 +411,19 @@ pub fn lossy_family_probe(
         };
     }
 
-    let Some(result) = comparator.compare_detailed(target, reference, max_err) else {
+    let Some(result) = comparator.compare_detailed_with_limits(
+        target,
+        reference,
+        max_err,
+        max_dx,
+        max_dy,
+    ) else {
         return LossyFamilyProbe::Reject {
             reason: "overlap",
             result: None,
             limits: None,
         };
     };
-
-    if result.dx.abs() > max_dx || result.dy.abs() > max_dy {
-        return LossyFamilyProbe::Reject {
-            reason: "shift",
-            result: Some(result),
-            limits: None,
-        };
-    }
 
     let limits = Comparator::collapse_compare_limits(&result);
     if result.outside_ink_err > limits.outside_limit {
@@ -477,11 +510,22 @@ pub fn choose_lossy_family_prototype(
         return (members[0], 0);
     }
 
+    let mut candidate_order = members.to_vec();
+    candidate_order.sort_unstable_by(|&lhs, &rhs| {
+        let lhs_support = (page_counts[lhs] as u64 * 12) + usage[lhs] as u64 * 2;
+        let rhs_support = (page_counts[rhs] as u64 * 12) + usage[rhs] as u64 * 2;
+        rhs_support
+            .cmp(&lhs_support)
+            .then_with(|| usage[rhs].cmp(&usage[lhs]))
+            .then_with(|| black_counts[rhs].cmp(&black_counts[lhs]))
+            .then_with(|| lhs.cmp(&rhs))
+    });
+
     let mut best_idx = members[0];
     let mut best_score = u64::MAX;
     let mut best_support = 0u64;
 
-    for &candidate in members {
+    for &candidate in &candidate_order {
         let mut score = 0u64;
         let score_slack = match config.lossy_collapse_prototype_selector_mode {
             LossyCollapsePrototypeSelectorMode::Baseline => best_score / 50,
@@ -630,8 +674,8 @@ pub fn build_lossy_symbol_families(
                                 symbol_index,
                                 other_index,
                                 reason,
-                                *result,
-                                *limits,
+                                result,
+                                limits,
                             ));
                         }
                     }
@@ -824,22 +868,28 @@ pub fn build_lossy_prototype(inputs: PrototypeBuildInputs<'_>) -> (BitImage, Pro
         }
     };
 
-    let (kept_pixels, removed_pixels, added_pixels) = bitmap_transition_stats(&medoid, &prototype);
-    let mut comparator = Comparator::default();
-    let max_diag_err = inputs.config.lossy_collapse_max_err.saturating_add(16);
+    let (kept_pixels, removed_pixels, added_pixels) = if inputs.collect_stats {
+        bitmap_transition_stats(&medoid, &prototype)
+    } else {
+        (0, 0, 0)
+    };
     let mut before_score = 0u64;
     let mut after_score = 0u64;
     let mut before_count = 0usize;
     let mut after_count = 0usize;
-    for member in &inputs.family.members {
-        let member_bitmap = &inputs.global_symbols[member.member_index];
-        if let Some(result) = comparator.compare_detailed(member_bitmap, &medoid, max_diag_err) {
-            before_score += collapse_compare_score(&result) as u64;
-            before_count += 1;
-        }
-        if let Some(result) = comparator.compare_detailed(member_bitmap, &prototype, max_diag_err) {
-            after_score += collapse_compare_score(&result) as u64;
-            after_count += 1;
+    if inputs.collect_stats {
+        let mut comparator = Comparator::default();
+        let max_diag_err = inputs.config.lossy_collapse_max_err.saturating_add(16);
+        for member in &inputs.family.members {
+            let member_bitmap = &inputs.global_symbols[member.member_index];
+            if let Some(result) = comparator.compare_detailed(member_bitmap, &medoid, max_diag_err) {
+                before_score += collapse_compare_score(&result) as u64;
+                before_count += 1;
+            }
+            if let Some(result) = comparator.compare_detailed(member_bitmap, &prototype, max_diag_err) {
+                after_score += collapse_compare_score(&result) as u64;
+                after_count += 1;
+            }
         }
     }
 

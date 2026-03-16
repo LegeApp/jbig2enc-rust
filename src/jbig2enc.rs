@@ -61,6 +61,8 @@ use rayon::prelude::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HashKey(u64);
 
+const RECENT_SYMBOL_CACHE_CAP: usize = 64;
+
 #[derive(Debug)]
 struct RecentSymbolCache {
     recent: VecDeque<usize>,
@@ -91,6 +93,18 @@ impl RecentSymbolCache {
 
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.recent.iter().copied()
+    }
+
+    fn copy_into(&self, out: &mut [usize]) -> usize {
+        let mut len = 0usize;
+        for idx in self.recent.iter().copied() {
+            if len >= out.len() {
+                break;
+            }
+            out[len] = idx;
+            len += 1;
+        }
+        len
     }
 }
 
@@ -470,6 +484,7 @@ impl<'a> Jbig2Encoder<'a> {
         !(0.01..=0.90).contains(&density)
     }
 
+    #[inline(always)]
     fn should_accept_match(
         &self,
         err: u32,
@@ -496,6 +511,7 @@ impl<'a> Jbig2Encoder<'a> {
         (false, false)
     }
 
+    #[inline(always)]
     fn evaluate_symbol_match(
         &mut self,
         candidate: &BitImage,
@@ -523,7 +539,15 @@ impl<'a> Jbig2Encoder<'a> {
         }
 
         self.metrics.symbol_stats.comparator_calls += 1;
-        let (err, dx, dy) = comparator.distance(candidate, proto, max_err)?;
+        let (err, dx, dy) = if self.config.text_refine {
+            comparator
+                .compare_for_refine_family(candidate, proto, max_err, 1, 1)
+                .map(|r| (r.total_err, r.dx, r.dy))?
+        } else {
+            comparator
+                .compare_for_refine_family(candidate, proto, max_err, 1, 0)
+                .map(|r| (r.total_err, r.dx, r.dy))?
+        };
         self.metrics.symbol_stats.comparator_hits += 1;
 
         let exact_dims = candidate.width == proto.width && candidate.height == proto.height;
@@ -589,8 +613,17 @@ impl<'a> Jbig2Encoder<'a> {
                     .max((area / self.config.match_tolerance.max(1) as usize) as u32)
                     .clamp(3, 20);
 
-                match comparator.distance(other_symbol, candidate_symbol, max_err) {
-                    Some((err, dx, dy)) => {
+                match comparator.compare_for_refine_family(
+                    other_symbol,
+                    candidate_symbol,
+                    max_err,
+                    2,
+                    1,
+                ) {
+                    Some(result) => {
+                        let err = result.total_err;
+                        let dx = result.dx;
+                        let dy = result.dy;
                         let refinement_penalty = err as u64 + ((dx.abs() + dy.abs()) as u64 * 2);
                         total_cost += refinement_penalty * self.symbol_usage[other] as u64;
                     }
@@ -692,6 +725,7 @@ impl<'a> Jbig2Encoder<'a> {
     fn make_lossy_prototype(
         &self,
         family: &crate::jbig2collapse::LossyFamily,
+        collect_stats: bool,
     ) -> (BitImage, crate::jbig2collapse::PrototypeBuildStats) {
         build_lossy_prototype(PrototypeBuildInputs {
             config: self.config,
@@ -701,6 +735,7 @@ impl<'a> Jbig2Encoder<'a> {
             symbol_page_count: &self.symbol_page_count,
             symbol_signatures: &self.symbol_signatures,
             symbol_pixel_counts: &self.symbol_pixel_counts,
+            collect_stats,
         })
     }
 
@@ -837,13 +872,20 @@ impl<'a> Jbig2Encoder<'a> {
                             {
                                 continue;
                             }
-                            let Some((err, dx, dy)) = comparator.distance(
+                            let max_dx = if text_refine { 1 } else { 1 };
+                            let max_dy = if text_refine { 1 } else { 0 };
+                            let Some(result) = comparator.compare_for_refine_family(
                                 local_symbol,
                                 &self.global_symbols[global_symbol_index],
                                 max_err,
+                                max_dx,
+                                max_dy,
                             ) else {
                                 continue;
                             };
+                            let err = result.total_err;
+                            let dx = result.dx;
+                            let dy = result.dy;
                             let exact_dims = local_symbol.width
                                 == self.global_symbols[global_symbol_index].width
                                 && local_symbol.height
@@ -964,26 +1006,29 @@ impl<'a> Jbig2Encoder<'a> {
             }
         }
 
-        for family in &families {
+        for (family_index, family) in families.iter().enumerate() {
             let prototype_usage = self.symbol_usage[family.prototype_index];
             let prototype_page_span = self.symbol_page_count[family.prototype_index];
-            let (prototype, stats) = self.make_lossy_prototype(family);
-            self.state.decision_debug_lines.push(format!(
-                "collapse prototype: prototype={} members={} total_usage={} proto_usage={} proto_pages={} mode={} medoid_black={} output_black={} kept={} removed={} added={} avg_before={:.2} avg_after={:.2}",
-                family.prototype_index,
-                family.members.len() + 1,
-                family.total_usage,
-                prototype_usage,
-                prototype_page_span,
-                stats.mode,
-                stats.medoid_black_pixels,
-                stats.output_black_pixels,
-                stats.pixels_kept,
-                stats.pixels_removed,
-                stats.pixels_added,
-                stats.avg_member_score_before,
-                stats.avg_member_score_after
-            ));
+            let collect_stats = family_index < 64;
+            let (prototype, stats) = self.make_lossy_prototype(family, collect_stats);
+            if collect_stats {
+                self.state.decision_debug_lines.push(format!(
+                    "collapse prototype: prototype={} members={} total_usage={} proto_usage={} proto_pages={} mode={} medoid_black={} output_black={} kept={} removed={} added={} avg_before={:.2} avg_after={:.2}",
+                    family.prototype_index,
+                    family.members.len() + 1,
+                    family.total_usage,
+                    prototype_usage,
+                    prototype_page_span,
+                    stats.mode,
+                    stats.medoid_black_pixels,
+                    stats.output_black_pixels,
+                    stats.pixels_kept,
+                    stats.pixels_removed,
+                    stats.pixels_added,
+                    stats.avg_member_score_before,
+                    stats.avg_member_score_after
+                ));
+            }
             self.global_symbols[family.prototype_index] = prototype;
         }
 
@@ -1054,7 +1099,8 @@ impl<'a> Jbig2Encoder<'a> {
 
                 if should_use_symbols {
                     let matching_start = Instant::now();
-                    let mut recent_cache = RecentSymbolCache::new(64);
+                    let mut recent_cache = RecentSymbolCache::new(RECENT_SYMBOL_CACHE_CAP);
+                    let mut recent_candidates = [0usize; RECENT_SYMBOL_CACHE_CAP];
                     let mut last_y = 0u32;
 
                     for shape in extracted {
@@ -1094,7 +1140,6 @@ impl<'a> Jbig2Encoder<'a> {
                         }
                         last_y = rect.y;
 
-                        let key = hash_key(&trimmed);
                         let trimmed_sig = Self::compute_symbol_signature(&trimmed);
                         let mut matched = false;
                         let mut instance_bitmap = Some(symbol);
@@ -1107,9 +1152,9 @@ impl<'a> Jbig2Encoder<'a> {
                             ((area as f32 * 0.05) as u32).max(2)
                         };
 
-                        if !no_reuse {
-                            let recent_candidates: Vec<usize> = recent_cache.iter().collect();
-                            'recent_search: for idx in recent_candidates {
+                        if !matched && !no_reuse {
+                            let recent_len = recent_cache.copy_into(&mut recent_candidates);
+                            'recent_search: for &idx in &recent_candidates[..recent_len] {
                                 if let Some((err, dx, dy, needs_refinement)) = self
                                     .evaluate_symbol_match(
                                         &trimmed,
@@ -1262,6 +1307,7 @@ impl<'a> Jbig2Encoder<'a> {
                                     idx, self.global_symbols[idx].width, self.global_symbols[idx].height
                                 ));
                             }
+                            let key = hash_key(&self.global_symbols[idx]);
                             self.hash_map.entry(key).or_default().push(idx);
                             symbol_instances.push(SymbolInstance {
                                 symbol_index: idx,
@@ -2125,8 +2171,12 @@ impl<'a> Jbig2Encoder<'a> {
                 return;
             }
 
-            if let Some((_, dx, dy)) = comparator.distance(a_sym, b_sym, max_err) {
-                let dy_limit = if self.config.text_refine { 1 } else { 0 };
+            let dy_limit = if self.config.text_refine { 1 } else { 0 };
+            if let Some(result) =
+                comparator.compare_for_refine_family(a_sym, b_sym, max_err, dim_limit, dy_limit)
+            {
+                let dx = result.dx;
+                let dy = result.dy;
                 if dx.abs() <= dim_limit && dy.abs() <= dy_limit {
                     uf_union(&mut parent, &mut uf_rank, a_idx, b_idx);
                 }
@@ -4475,6 +4525,7 @@ pub fn hash_key(img: &BitImage) -> HashKey {
     let w = img.width as u64;
     HashKey(h * 10_000 + w)
 }
+
 
 /// Helper function to find the first black pixel in the BitImage
 /// Returns (x, y) coordinates of the first black pixel, or None if no black pixels

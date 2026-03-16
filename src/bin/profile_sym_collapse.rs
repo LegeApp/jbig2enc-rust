@@ -19,6 +19,8 @@ struct Args {
     repeat: usize,
     #[arg(long, default_value_t = 499)]
     frequency: i32,
+    #[arg(long, default_value = "sym_collapse")]
+    mode: String,
     #[arg(long, default_value = "cleanup")]
     prototype: String,
 }
@@ -132,17 +134,34 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
 
-    let mut cfg = Jbig2Config::text_lossy_collapse();
+    let mut cfg = match args.mode.as_str() {
+        "symbol" => {
+            let mut cfg = Jbig2Config::text();
+            cfg.text_refine = false;
+            cfg.refine = false;
+            cfg
+        }
+        "sym_refine" => {
+            let mut cfg = Jbig2Config::text();
+            cfg.text_refine = true;
+            cfg.refine = true;
+            cfg
+        }
+        _ => {
+            let mut cfg = Jbig2Config::text_lossy_collapse();
+            cfg.lossy_collapse_prototype_mode = collapse_proto_mode(&args.prototype);
+            cfg
+        }
+    };
     cfg.auto_thresh = false;
     cfg.want_full_headers = false;
-    cfg.lossy_collapse_prototype_mode = collapse_proto_mode(&args.prototype);
 
     let ts = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_secs();
     let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("test_output_fragments")
-        .join(format!("profile_sym_collapse_{ts}"));
+        .join(format!("profile_{}_{}", args.mode, ts));
     std::fs::create_dir_all(&out_dir)?;
 
     let guard = ProfilerGuardBuilder::default()
@@ -170,9 +189,9 @@ fn main() -> anyhow::Result<()> {
     let elapsed = started.elapsed();
 
     let report = guard.report().build()?;
-    let flamegraph_path = out_dir.join("sym_collapse_flamegraph.svg");
-    let report_path = out_dir.join("sym_collapse_profile.txt");
-    let decision_log_path = out_dir.join("sym_collapse_decision_debug.log");
+    let flamegraph_path = out_dir.join(format!("{}_flamegraph.svg", args.mode));
+    let report_path = out_dir.join(format!("{}_profile.txt", args.mode));
+    let decision_log_path = out_dir.join(format!("{}_decision_debug.log", args.mode));
 
     {
         let flamegraph = File::create(&flamegraph_path)?;
@@ -183,10 +202,15 @@ fn main() -> anyhow::Result<()> {
     let metrics = final_metrics.expect("profiling run did not produce metrics");
 
     let mut text = String::new();
-    text.push_str("sym_collapse profile\n");
+    text.push_str(&format!("{} profile\n", args.mode));
     text.push_str(&format!(
-        "source={} pages={} repeat={} frequency={} prototype={:?}\n",
-        args.source, args.pages, args.repeat, args.frequency, cfg.lossy_collapse_prototype_mode
+        "source={} pages={} repeat={} frequency={} mode={} prototype={:?}\n",
+        args.source,
+        args.pages,
+        args.repeat,
+        args.frequency,
+        args.mode,
+        cfg.lossy_collapse_prototype_mode
     ));
     text.push_str(&format!(
         "elapsed_secs={:.3} raw_jbig2_kb={:.1}\n",
