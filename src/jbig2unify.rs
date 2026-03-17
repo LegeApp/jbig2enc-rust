@@ -1,9 +1,9 @@
-use crate::jbig2collapse::{
-    CollapseScaleProfile, FamilyBucketKey, SymbolSignature, estimate_collapse_scale_profile,
-    family_bucket_key_for_symbol, family_signatures_are_compatible, for_each_family_bucket_neighbor,
-    symbol_looks_like_fragile_mark,
+use crate::jbig2classify::{
+    FamilyBucketKey, SymbolScaleProfile, SymbolSignature, estimate_symbol_scale_profile,
+    family_bucket_key_for_symbol, family_match_details, family_signatures_are_compatible,
+    for_each_family_bucket_neighbor, refine_compare_score, symbol_looks_like_fragile_mark,
 };
-use crate::jbig2collapse_context::{CollapseContextModel, ContextDecision};
+use crate::jbig2context::{ContextDecision, SymbolContextModel};
 use crate::jbig2comparator::{Comparator, CompareResult};
 use crate::jbig2structs::Jbig2Config;
 use crate::jbig2sym::BitImage;
@@ -18,10 +18,21 @@ pub struct UnifiedClassMember {
 }
 
 #[derive(Debug, Clone)]
+pub struct UnifiedRefinementSubcluster {
+    pub prototype_index: usize,
+    pub refined_members: Vec<UnifiedClassMember>,
+    pub total_usage: usize,
+    pub page_span: usize,
+    pub prototype_score: u64,
+    pub estimated_gain: i32,
+}
+
+#[derive(Debug, Clone)]
 pub struct UnifiedClass {
     pub representative_index: usize,
     pub core_members: Vec<UnifiedClassMember>,
     pub border_members: Vec<UnifiedClassMember>,
+    pub refinement_subclusters: Vec<UnifiedRefinementSubcluster>,
     pub class_size: usize,
     pub dense_core_size: usize,
     pub total_usage: usize,
@@ -46,7 +57,7 @@ pub struct SymbolUnifyInputs<'a> {
     pub symbol_page_count: &'a [usize],
     pub symbol_signatures: &'a [SymbolSignature],
     pub symbol_pixel_counts: &'a [usize],
-    pub context_model: Option<&'a CollapseContextModel>,
+    pub context_model: Option<&'a SymbolContextModel>,
     pub collect_diagnostics: bool,
 }
 
@@ -59,10 +70,9 @@ struct PairObservation {
 
 #[derive(Debug, Clone, Default)]
 struct ClassTriage {
-    candidate_subclusters: usize,
     border_members: Vec<UnifiedClassMember>,
-    retained_border_members: usize,
-    retained_outlier_members: usize,
+    recurring_components: Vec<Vec<usize>>,
+    outlier_components: Vec<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,7 +169,7 @@ fn prescreen_pair(
 #[inline]
 fn fragile_mark_indices(
     config: &Jbig2Config,
-    scale_profile: CollapseScaleProfile,
+    scale_profile: SymbolScaleProfile,
     symbols: &[BitImage],
     signatures: &[SymbolSignature],
 ) -> Vec<bool> {
@@ -331,8 +341,8 @@ fn triage_non_core_members(
     black_counts: &[usize],
     usage: &[usize],
     page_counts: &[usize],
-    context_model: Option<&CollapseContextModel>,
-    context_mode: crate::jbig2structs::LossyCollapseContextMode,
+    context_model: Option<&SymbolContextModel>,
+    context_mode: crate::jbig2structs::SymbolContextMode,
     max_err: u32,
     max_dx: i32,
     max_dy: i32,
@@ -414,14 +424,191 @@ fn triage_non_core_members(
             && component_usage >= min_class_usage
             && component_page_span >= min_page_span
         {
-            triage.candidate_subclusters += 1;
-            triage.retained_border_members += retained_component.len();
+            triage.recurring_components.push(retained_component);
         } else {
-            triage.retained_outlier_members += retained_component.len();
+            triage.outlier_components.push(retained_component);
         }
     }
 
     triage
+}
+
+#[inline]
+fn estimated_refinement_member_gain(
+    target: &BitImage,
+    reference: &BitImage,
+    err: u32,
+    dx: i32,
+    dy: i32,
+    usage_count: usize,
+    page_span: usize,
+) -> i32 {
+    let export_savings = (((target.width.saturating_mul(target.height) + 7) / 8) as i32 + 10)
+        + (usage_count.min(12) as i32) * 3
+        + (page_span.min(6) as i32) * 4;
+    let refine_cost = 10
+        + err as i32
+        + ((dx.abs() + dy.abs()) as i32 * 3)
+        + (target.width.abs_diff(reference.width) + target.height.abs_diff(reference.height))
+            as i32
+            * 2
+        + usage_count.min(12) as i32;
+    export_savings - refine_cost
+}
+
+fn select_refinement_subcluster_prototype(
+    members: &[usize],
+    symbols: &[BitImage],
+    signatures: &[SymbolSignature],
+    black_counts: &[usize],
+    usage: &[usize],
+    page_counts: &[usize],
+) -> Option<(usize, u64)> {
+    if members.is_empty() {
+        return None;
+    }
+    if members.len() == 1 {
+        return Some((members[0], 0));
+    }
+
+    let mut comparator = Comparator::default();
+    let mut best_idx = members[0];
+    let mut best_cost = u64::MAX;
+    let mut best_support = 0u64;
+
+    for &candidate in members {
+        let mut total_cost = 0u64;
+        for &other in members {
+            if candidate == other {
+                continue;
+            }
+            let weight = ((page_counts[other].max(1) * 4) + usage[other].max(1)) as u64;
+            match family_match_details(
+                &mut comparator,
+                &symbols[other],
+                other,
+                &symbols[candidate],
+                candidate,
+                signatures,
+                black_counts,
+            ) {
+                Some((err, dx, dy)) => {
+                    total_cost += (refine_compare_score(err, dx, dy) as u64 + 4) * weight;
+                }
+                None => total_cost += 1_000_000 * weight,
+            }
+        }
+
+        let candidate_support =
+            ((page_counts[candidate].max(1) * 8) + usage[candidate].max(1)) as u64;
+        if total_cost < best_cost
+            || (total_cost == best_cost && candidate_support > best_support)
+            || (total_cost == best_cost
+                && candidate_support == best_support
+                && candidate < best_idx)
+        {
+            best_cost = total_cost;
+            best_idx = candidate;
+            best_support = candidate_support;
+        }
+    }
+
+    Some((best_idx, best_cost))
+}
+
+fn build_refinement_subcluster(
+    component: &[usize],
+    symbols: &[BitImage],
+    signatures: &[SymbolSignature],
+    black_counts: &[usize],
+    usage: &[usize],
+    page_counts: &[usize],
+    config: &Jbig2Config,
+) -> (Option<UnifiedRefinementSubcluster>, usize) {
+    if component.len() < config.sym_unify_refine_min_subcluster_size.max(2) {
+        return (None, component.len());
+    }
+
+    let total_usage: usize = component.iter().map(|&idx| usage[idx]).sum();
+    let page_span = component
+        .iter()
+        .map(|&idx| page_counts[idx])
+        .max()
+        .unwrap_or(0);
+    if total_usage < config.sym_unify_refine_min_usage
+        || page_span < config.sym_unify_refine_min_page_span
+    {
+        return (None, component.len());
+    }
+
+    let Some((prototype_index, prototype_score)) = select_refinement_subcluster_prototype(
+        component,
+        symbols,
+        signatures,
+        black_counts,
+        usage,
+        page_counts,
+    ) else {
+        return (None, component.len());
+    };
+
+    let mut comparator = Comparator::default();
+    let mut refined_members = Vec::new();
+    let mut estimated_gain = 0i32;
+    let mut leftover_members = 0usize;
+    for &member in component {
+        if member == prototype_index {
+            continue;
+        }
+        let Some((err, dx, dy)) = family_match_details(
+            &mut comparator,
+            &symbols[member],
+            member,
+            &symbols[prototype_index],
+            prototype_index,
+            signatures,
+            black_counts,
+        ) else {
+            leftover_members += 1;
+            continue;
+        };
+        let score = refine_compare_score(err, dx, dy);
+        if score > config.sym_unify_refine_max_score {
+            leftover_members += 1;
+            continue;
+        }
+        estimated_gain += estimated_refinement_member_gain(
+            &symbols[member],
+            &symbols[prototype_index],
+            err,
+            dx,
+            dy,
+            usage[member],
+            page_counts[member],
+        );
+        refined_members.push(UnifiedClassMember {
+            member_index: member,
+            dx,
+            dy,
+            score,
+        });
+    }
+
+    if refined_members.is_empty() || estimated_gain < config.sym_unify_refine_min_gain {
+        return (None, component.len());
+    }
+
+    (
+        Some(UnifiedRefinementSubcluster {
+            prototype_index,
+            refined_members,
+            total_usage,
+            page_span,
+            prototype_score,
+            estimated_gain,
+        }),
+        leftover_members,
+    )
 }
 
 fn estimate_class_gain(
@@ -431,11 +618,12 @@ fn estimate_class_gain(
     representative_index: usize,
     unified_members: &[UnifiedClassMember],
     border_members: &[UnifiedClassMember],
+    refinement_subclusters: &[UnifiedRefinementSubcluster],
     retained_border_members: usize,
     retained_outlier_members: usize,
     representative_score: u64,
 ) -> GainBreakdown {
-    if unified_members.is_empty() && border_members.is_empty() {
+    if unified_members.is_empty() && border_members.is_empty() && refinement_subclusters.is_empty() {
         return GainBreakdown {
             bitmap_savings: 0,
             id_savings: 0,
@@ -452,7 +640,15 @@ fn estimate_class_gain(
             let symbol = &symbols[member.member_index];
             ((symbol.width.saturating_mul(symbol.height) + 7) / 8) as i32 + 10
         })
-        .sum();
+        .sum::<i32>()
+        + refinement_subclusters
+            .iter()
+            .flat_map(|subcluster| subcluster.refined_members.iter())
+            .map(|member| {
+                let symbol = &symbols[member.member_index];
+                ((symbol.width.saturating_mul(symbol.height) + 7) / 8) as i32 + 10
+            })
+            .sum::<i32>();
     let id_savings: i32 = unified_members
         .iter()
         .chain(border_members.iter())
@@ -461,7 +657,16 @@ fn estimate_class_gain(
                 + (page_counts[member.member_index].min(6) as i32) * 4
                 + 6
         })
-        .sum();
+        .sum::<i32>()
+        + refinement_subclusters
+            .iter()
+            .flat_map(|subcluster| subcluster.refined_members.iter())
+            .map(|member| {
+                (usage[member.member_index].min(12) as i32) * 2
+                    + (page_counts[member.member_index].min(6) as i32) * 3
+                    + 4
+            })
+            .sum::<i32>();
 
     let representative_penalty = {
         let symbol = &symbols[representative_index];
@@ -470,7 +675,8 @@ fn estimate_class_gain(
     };
     let retained_penalty = retained_border_members as i32 * 8
         + retained_outlier_members as i32 * 5
-        + border_members.len() as i32 * 2;
+        + border_members.len() as i32 * 2
+        + refinement_subclusters.len() as i32 * 6;
 
     GainBreakdown {
         bitmap_savings,
@@ -579,7 +785,7 @@ pub fn build_symbol_unify_classes(
     let border_accept_limit = class_accept_limit
         .saturating_add(inputs.config.sym_unify_border_score_slack);
 
-    let scale_profile = estimate_collapse_scale_profile(
+    let scale_profile = estimate_symbol_scale_profile(
         inputs.global_symbols,
         inputs.symbol_signatures,
         inputs.symbol_usage,
@@ -883,7 +1089,32 @@ pub fn build_symbol_unify_classes(
             inputs.config.sym_unify_min_class_usage,
             inputs.config.sym_unify_min_page_span,
         );
-        let candidate_subclusters = core_subcluster_count + triage.candidate_subclusters;
+        let mut refinement_subclusters = Vec::new();
+        let mut retained_border_members = 0usize;
+        for component in &triage.recurring_components {
+            let (maybe_subcluster, leftover_members) = build_refinement_subcluster(
+                component,
+                inputs.global_symbols,
+                inputs.symbol_signatures,
+                inputs.symbol_pixel_counts,
+                inputs.symbol_usage,
+                inputs.symbol_page_count,
+                inputs.config,
+            );
+            if let Some(subcluster) = maybe_subcluster {
+                refinement_subclusters.push(subcluster);
+                retained_border_members += leftover_members;
+            } else {
+                retained_border_members += component.len();
+            }
+        }
+        let retained_outlier_members: usize = triage
+            .outlier_components
+            .iter()
+            .map(Vec::len)
+            .sum();
+        let candidate_subclusters =
+            core_subcluster_count + triage.recurring_components.len();
         let total_usage: usize = non_fragile_members
             .iter()
             .map(|&index| inputs.symbol_usage[index])
@@ -900,15 +1131,16 @@ pub fn build_symbol_unify_classes(
             representative_index,
             &core_members,
             &triage.border_members,
-            triage.retained_border_members,
-            triage.retained_outlier_members,
+            &refinement_subclusters,
+            retained_border_members,
+            retained_outlier_members,
             representative_score,
         );
         if gain.net_gain < inputs.config.sym_unify_min_estimated_gain {
             rejected_low_gain += 1;
             if inputs.collect_diagnostics {
                 diagnostics.lines.push(format!(
-                    "sym_unify skip low-gain: representative={} class_size={} core_size={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} border_unified={} retained_border={} retained_outliers={} split_fragile={}",
+                    "sym_unify skip low-gain: representative={} class_size={} core_size={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} border_unified={} refined_subclusters={} refined_members={} retained_border={} retained_outliers={} split_fragile={}",
                     representative_index,
                     non_fragile_members.len(),
                     dense_core.len(),
@@ -918,8 +1150,13 @@ pub fn build_symbol_unify_classes(
                     gain.representative_penalty,
                     gain.retained_penalty,
                     triage.border_members.len(),
-                    triage.retained_border_members,
-                    triage.retained_outlier_members,
+                    refinement_subclusters.len(),
+                    refinement_subclusters
+                        .iter()
+                        .map(|subcluster| subcluster.refined_members.len())
+                        .sum::<usize>(),
+                    retained_border_members,
+                    retained_outlier_members,
                     split_fragile_members
                 ));
             }
@@ -927,15 +1164,32 @@ pub fn build_symbol_unify_classes(
         }
 
         if inputs.collect_diagnostics {
+            for subcluster in refinement_subclusters.iter().take(8) {
+                diagnostics.lines.push(format!(
+                    "  sym_unify refine-subcluster: representative={} prototype={} refined_members={} usage={} page_span={} prototype_score={} gain={}",
+                    representative_index,
+                    subcluster.prototype_index,
+                    subcluster.refined_members.len(),
+                    subcluster.total_usage,
+                    subcluster.page_span,
+                    subcluster.prototype_score,
+                    subcluster.estimated_gain
+                ));
+            }
             diagnostics.lines.push(format!(
-                "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} retained_border={} retained_outliers={} split_fragile={} total_usage={} page_span={} rep_usage={} rep_pages={} rep_score={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} subclusters={}",
+                "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} refined_subclusters={} refined_members={} retained_border={} retained_outliers={} split_fragile={} total_usage={} page_span={} rep_usage={} rep_pages={} rep_score={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} subclusters={}",
                 representative_index,
                 non_fragile_members.len(),
                 dense_core.len(),
                 core_members.len(),
                 triage.border_members.len(),
-                triage.retained_border_members,
-                triage.retained_outlier_members,
+                refinement_subclusters.len(),
+                refinement_subclusters
+                    .iter()
+                    .map(|subcluster| subcluster.refined_members.len())
+                    .sum::<usize>(),
+                retained_border_members,
+                retained_outlier_members,
                 split_fragile_members,
                 total_usage,
                 page_span,
@@ -955,13 +1209,14 @@ pub fn build_symbol_unify_classes(
             representative_index,
             core_members,
             border_members: triage.border_members,
+            refinement_subclusters,
             class_size: non_fragile_members.len(),
             dense_core_size: dense_core.len(),
             total_usage,
             page_span,
             representative_score,
-            retained_border_members: triage.retained_border_members,
-            retained_outlier_members: triage.retained_outlier_members,
+            retained_border_members,
+            retained_outlier_members,
             candidate_subclusters,
             split_fragile_members,
             estimated_gain: gain.net_gain,
@@ -970,12 +1225,18 @@ pub fn build_symbol_unify_classes(
 
     let unified_members: usize = classes.iter().map(|class| class.core_members.len()).sum();
     let border_unified_members: usize = classes.iter().map(|class| class.border_members.len()).sum();
+    let refined_members: usize = classes
+        .iter()
+        .flat_map(|class| class.refinement_subclusters.iter())
+        .map(|subcluster| subcluster.refined_members.len())
+        .sum();
     if inputs.collect_diagnostics {
         diagnostics.lines.push(format!(
-            "sym_unify summary: classes={} unified_members={} border_unified_members={} retained_border_members={} retained_outlier_members={} rejected_weak_core={} rejected_low_gain={} classes_with_fragile_members={}",
+            "sym_unify summary: classes={} unified_members={} border_unified_members={} refined_members={} retained_border_members={} retained_outlier_members={} rejected_weak_core={} rejected_low_gain={} classes_with_fragile_members={}",
             classes.len(),
             unified_members,
             border_unified_members,
+            refined_members,
             classes
                 .iter()
                 .map(|class| class.retained_border_members)

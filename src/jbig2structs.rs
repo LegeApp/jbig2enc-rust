@@ -53,20 +53,9 @@ pub struct Jbig2Config {
     /// Typical range: 4 (aggressive) to 10 (conservative). Default: 7.
     pub match_tolerance: u32,
     pub lossy_symbol_mode: LossySymbolMode,
-    pub lossy_collapse_min_family_size: usize,
-    pub lossy_collapse_min_usage: usize,
-    pub lossy_collapse_min_total_usage: usize,
-    pub lossy_collapse_min_prototype_usage: usize,
-    pub lossy_collapse_min_page_span: usize,
-    pub lossy_collapse_max_err: u32,
-    pub lossy_collapse_max_dx: i32,
-    pub lossy_collapse_max_dy: i32,
-    pub lossy_collapse_min_width_ratio_permille: u16,
-    pub lossy_collapse_min_height_ratio_permille: u16,
-    pub lossy_collapse_min_black_ratio_permille: u16,
-    pub lossy_collapse_context_mode: LossyCollapseContextMode,
-    pub lossy_collapse_prototype_mode: LossyCollapsePrototypeMode,
-    pub lossy_collapse_prototype_selector_mode: LossyCollapsePrototypeSelectorMode,
+    pub fragile_mark_min_width_ratio_permille: u16,
+    pub fragile_mark_min_height_ratio_permille: u16,
+    pub fragile_mark_min_black_ratio_permille: u16,
     pub sym_unify_min_class_size: usize,
     pub sym_unify_max_err: u32,
     pub sym_unify_max_dx: i32,
@@ -77,15 +66,19 @@ pub struct Jbig2Config {
     pub sym_unify_min_class_usage: usize,
     pub sym_unify_min_page_span: usize,
     pub sym_unify_min_estimated_gain: i32,
-    pub sym_unify_context_mode: LossyCollapseContextMode,
+    pub sym_unify_context_mode: SymbolContextMode,
     pub sym_unify_border_score_slack: u32,
     pub sym_unify_max_border_outside_ink: u32,
+    pub sym_unify_refine_min_subcluster_size: usize,
+    pub sym_unify_refine_min_usage: usize,
+    pub sym_unify_refine_min_page_span: usize,
+    pub sym_unify_refine_max_score: u32,
+    pub sym_unify_refine_min_gain: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LossySymbolMode {
     Off,
-    LegacyCollapse,
     SymbolUnify,
 }
 
@@ -113,24 +106,7 @@ pub struct HalftoneConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LossyCollapsePrototypeMode {
-    Medoid,
-    MajorityVote,
-    MedoidThenCleanup,
-    AdaptiveMajorityVote,
-    MedoidWithAdaptiveCleanup,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LossyCollapsePrototypeSelectorMode {
-    Baseline,
-    SupportBiased,
-    DenseCenter,
-    DenseTrimmed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LossyCollapseContextMode {
+pub enum SymbolContextMode {
     WeightedJaccard,
     Cosine,
     Hybrid,
@@ -176,20 +152,9 @@ impl Default for Jbig2Config {
             default_pixel: false,
             match_tolerance: 7,
             lossy_symbol_mode: LossySymbolMode::Off,
-            lossy_collapse_min_family_size: 2,
-            lossy_collapse_min_usage: 1,
-            lossy_collapse_min_total_usage: 0,
-            lossy_collapse_min_prototype_usage: 0,
-            lossy_collapse_min_page_span: 0,
-            lossy_collapse_max_err: 24,
-            lossy_collapse_max_dx: 1,
-            lossy_collapse_max_dy: 1,
-            lossy_collapse_min_width_ratio_permille: 450,
-            lossy_collapse_min_height_ratio_permille: 550,
-            lossy_collapse_min_black_ratio_permille: 300,
-            lossy_collapse_context_mode: LossyCollapseContextMode::Hybrid,
-            lossy_collapse_prototype_mode: LossyCollapsePrototypeMode::MedoidThenCleanup,
-            lossy_collapse_prototype_selector_mode: LossyCollapsePrototypeSelectorMode::Baseline,
+            fragile_mark_min_width_ratio_permille: 450,
+            fragile_mark_min_height_ratio_permille: 550,
+            fragile_mark_min_black_ratio_permille: 300,
             sym_unify_min_class_size: 2,
             sym_unify_max_err: 12,
             sym_unify_max_dx: 1,
@@ -200,9 +165,14 @@ impl Default for Jbig2Config {
             sym_unify_min_class_usage: 2,
             sym_unify_min_page_span: 1,
             sym_unify_min_estimated_gain: 0,
-            sym_unify_context_mode: LossyCollapseContextMode::Hybrid,
+            sym_unify_context_mode: SymbolContextMode::Hybrid,
             sym_unify_border_score_slack: 4,
             sym_unify_max_border_outside_ink: 1,
+            sym_unify_refine_min_subcluster_size: 2,
+            sym_unify_refine_min_usage: 12,
+            sym_unify_refine_min_page_span: 3,
+            sym_unify_refine_max_score: 8,
+            sym_unify_refine_min_gain: 20,
         }
     }
 }
@@ -225,14 +195,6 @@ impl Jbig2Config {
         cfg
     }
 
-    pub fn text_lossy_collapse() -> Self {
-        let mut cfg = Self::text();
-        cfg.lossy_symbol_mode = LossySymbolMode::LegacyCollapse;
-        cfg.refine = false;
-        cfg.text_refine = false;
-        cfg
-    }
-
     pub fn text_symbol_unify() -> Self {
         let mut cfg = Self::text();
         cfg.lossy_symbol_mode = LossySymbolMode::SymbolUnify;
@@ -248,15 +210,15 @@ impl Jbig2Config {
         cfg.sym_unify_min_class_usage = 2;
         cfg.sym_unify_min_page_span = 1;
         cfg.sym_unify_min_estimated_gain = 0;
-        cfg.sym_unify_context_mode = LossyCollapseContextMode::Hybrid;
+        cfg.sym_unify_context_mode = SymbolContextMode::Hybrid;
         cfg.sym_unify_border_score_slack = 4;
         cfg.sym_unify_max_border_outside_ink = 1;
+        cfg.sym_unify_refine_min_subcluster_size = 2;
+        cfg.sym_unify_refine_min_usage = 12;
+        cfg.sym_unify_refine_min_page_span = 3;
+        cfg.sym_unify_refine_max_score = 8;
+        cfg.sym_unify_refine_min_gain = 20;
         cfg
-    }
-
-    #[inline]
-    pub fn uses_legacy_collapse(&self) -> bool {
-        self.lossy_symbol_mode == LossySymbolMode::LegacyCollapse
     }
 
     #[inline]

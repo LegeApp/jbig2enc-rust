@@ -1,11 +1,11 @@
-use crate::jbig2collapse::{FamilyBucketKey, SymbolSignature, family_bucket_key_for_symbol};
+use crate::jbig2classify::{FamilyBucketKey, SymbolSignature, family_bucket_key_for_symbol};
 use crate::jbig2enc::PageData;
-use crate::jbig2structs::LossyCollapseContextMode;
+use crate::jbig2structs::SymbolContextMode;
 use crate::jbig2sym::Rect;
 use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Default)]
-pub struct CollapseContextModel {
+pub struct SymbolContextModel {
     symbol_contexts: Vec<SymbolContextStats>,
 }
 
@@ -69,11 +69,11 @@ impl LineGroup {
     }
 }
 
-pub fn build_collapse_context_model(
+pub fn build_symbol_context_model(
     pages: &[PageData],
     symbols: &[crate::jbig2sym::BitImage],
     signatures: &[SymbolSignature],
-) -> CollapseContextModel {
+) -> SymbolContextModel {
     let bucket_keys: Vec<FamilyBucketKey> = symbols
         .iter()
         .zip(signatures.iter())
@@ -144,10 +144,10 @@ pub fn build_collapse_context_model(
         }
     }
 
-    CollapseContextModel { symbol_contexts }
+    SymbolContextModel { symbol_contexts }
 }
 
-impl CollapseContextModel {
+impl SymbolContextModel {
     pub fn similarity(&self, lhs: usize, rhs: usize) -> Option<ContextSimilarity> {
         let lhs_stats = self.symbol_contexts.get(lhs)?;
         let rhs_stats = self.symbol_contexts.get(rhs)?;
@@ -184,7 +184,7 @@ impl CollapseContextModel {
         &self,
         lhs: usize,
         rhs: usize,
-        mode: LossyCollapseContextMode,
+        mode: SymbolContextMode,
     ) -> ContextDecision {
         let Some(lhs_stats) = self.symbol_contexts.get(lhs) else {
             return ContextDecision::Unknown;
@@ -219,7 +219,7 @@ impl CollapseContextModel {
         let edge_delta = similarity.start_delta.max(similarity.end_delta);
 
         match mode {
-            LossyCollapseContextMode::WeightedJaccard => {
+            SymbolContextMode::WeightedJaccard => {
                 if combined_jaccard >= 0.55
                     && similarity.left_jaccard >= 0.40
                     && similarity.right_jaccard >= 0.40
@@ -234,7 +234,7 @@ impl CollapseContextModel {
                     ContextDecision::Unknown
                 }
             }
-            LossyCollapseContextMode::Cosine => {
+            SymbolContextMode::Cosine => {
                 if combined_cosine >= 0.82
                     && similarity.left_cosine >= 0.70
                     && similarity.right_cosine >= 0.70
@@ -249,7 +249,7 @@ impl CollapseContextModel {
                     ContextDecision::Unknown
                 }
             }
-            LossyCollapseContextMode::Hybrid => {
+            SymbolContextMode::Hybrid => {
                 if combined_jaccard >= 0.42
                     && combined_cosine >= 0.72
                     && max_jsd <= 0.45
@@ -258,8 +258,8 @@ impl CollapseContextModel {
                     ContextDecision::Allow
                 } else if similarity.evidence >= 6
                     && (combined_jaccard <= 0.12
-                        || max_jsd >= 0.82
-                        || (combined_cosine <= 0.30 && combined_jaccard <= 0.20)
+                        || combined_cosine <= 0.35
+                        || max_jsd >= 0.75
                         || edge_delta >= 0.75)
                 {
                     ContextDecision::Reject
@@ -269,11 +269,6 @@ impl CollapseContextModel {
             }
         }
     }
-}
-
-fn bump_token(map: &mut FxHashMap<u64, u16>, token: u64) {
-    let entry = map.entry(token).or_insert(0);
-    *entry = entry.saturating_add(1);
 }
 
 fn line_instance(symbol_index: usize, rect: Rect) -> LineInstance {
@@ -286,6 +281,13 @@ fn line_instance(symbol_index: usize, rect: Rect) -> LineInstance {
     }
 }
 
+#[inline]
+fn bump_token(map: &mut FxHashMap<u64, u16>, token: u64) {
+    let entry = map.entry(token).or_insert(0);
+    *entry = entry.saturating_add(1);
+}
+
+#[inline]
 fn context_token(is_left: bool, key: FamilyBucketKey, spacing_bin: u8) -> u64 {
     let dir = if is_left { 1u64 } else { 2u64 };
     (dir << 56)
@@ -295,9 +297,10 @@ fn context_token(is_left: bool, key: FamilyBucketKey, spacing_bin: u8) -> u64 {
         | ((key.aspect_bin as u64) << 12)
         | ((key.centroid_y_bin as u64) << 8)
         | ((key.lr_balance_bin as u64) << 4)
-        | spacing_bin as u64
+        | (spacing_bin as u64)
 }
 
+#[inline]
 fn spacing_bin(curr: LineInstance, neighbor: LineInstance, is_left: bool) -> u8 {
     let gap = if is_left {
         curr.x - (neighbor.x + neighbor.width)
@@ -316,33 +319,32 @@ fn spacing_bin(curr: LineInstance, neighbor: LineInstance, is_left: bool) -> u8 
     }
 }
 
+#[inline]
 fn word_gap_threshold(instance: LineInstance) -> i32 {
-    (instance.width / 2).max(4)
-}
-
-fn ratio_delta(lhs_num: usize, lhs_den: usize, rhs_num: usize, rhs_den: usize) -> f32 {
-    let lhs = lhs_num as f32 / lhs_den.max(1) as f32;
-    let rhs = rhs_num as f32 / rhs_den.max(1) as f32;
-    (lhs - rhs).abs()
+    (instance.width.max(instance.height) / 2).clamp(3, 8)
 }
 
 fn weighted_jaccard(a: &FxHashMap<u64, u16>, b: &FxHashMap<u64, u16>) -> f32 {
     let mut min_sum = 0u32;
     let mut max_sum = 0u32;
+    let mut seen = rustc_hash::FxHashSet::default();
 
-    for (&token, &av) in a {
-        let bv = b.get(&token).copied().unwrap_or(0);
+    for (&k, &av) in a {
+        let bv = b.get(&k).copied().unwrap_or(0);
         min_sum += av.min(bv) as u32;
         max_sum += av.max(bv) as u32;
+        seen.insert(k);
     }
-    for (&token, &bv) in b {
-        if !a.contains_key(&token) {
-            max_sum += bv as u32;
+
+    for (&k, &bv) in b {
+        if seen.contains(&k) {
+            continue;
         }
+        max_sum += bv as u32;
     }
 
     if max_sum == 0 {
-        0.0
+        1.0
     } else {
         min_sum as f32 / max_sum as f32
     }
@@ -361,9 +363,9 @@ fn cosine_similarity(a: &FxHashMap<u64, u16>, b: &FxHashMap<u64, u16>) -> f32 {
         let bv = bv as f32;
         norm_b += bv * bv;
     }
-    for (&token, &av) in a {
-        if let Some(&bv) = b.get(&token) {
-            dot += av as f32 * bv as f32;
+    for (&k, &av) in a {
+        if let Some(&bv) = b.get(&k) {
+            dot += (av as f32) * (bv as f32);
         }
     }
 
@@ -375,33 +377,42 @@ fn cosine_similarity(a: &FxHashMap<u64, u16>, b: &FxHashMap<u64, u16>) -> f32 {
 }
 
 fn jensen_shannon_divergence(a: &FxHashMap<u64, u16>, b: &FxHashMap<u64, u16>) -> f32 {
-    let key_count = a.len() + b.keys().filter(|k| !a.contains_key(*k)).count();
-    if key_count == 0 {
-        return 0.0;
+    let mut keys = rustc_hash::FxHashSet::default();
+    for &k in a.keys() {
+        keys.insert(k);
+    }
+    for &k in b.keys() {
+        keys.insert(k);
     }
 
-    let total_a: f32 = a.values().map(|&v| v as f32).sum::<f32>() + key_count as f32;
-    let total_b: f32 = b.values().map(|&v| v as f32).sum::<f32>() + key_count as f32;
+    let total_a: f32 = a.values().map(|&v| v as f32).sum::<f32>() + keys.len() as f32;
+    let total_b: f32 = b.values().map(|&v| v as f32).sum::<f32>() + keys.len() as f32;
 
-    let mut jsd = 0.0f32;
+    let mut js = 0.0f32;
 
-    for &token in a.keys() {
-        let pa = (a.get(&token).copied().unwrap_or(0) as f32 + 1.0) / total_a;
-        let pb = (b.get(&token).copied().unwrap_or(0) as f32 + 1.0) / total_b;
-        let mean = 0.5 * (pa + pb);
-        jsd += 0.5 * pa * (pa / mean).ln();
-        jsd += 0.5 * pb * (pb / mean).ln();
-    }
-    for &token in b.keys() {
-        if a.contains_key(&token) {
-            continue;
-        }
-        let pa = 1.0 / total_a;
-        let pb = (b.get(&token).copied().unwrap_or(0) as f32 + 1.0) / total_b;
-        let mean = 0.5 * (pa + pb);
-        jsd += 0.5 * pa * (pa / mean).ln();
-        jsd += 0.5 * pb * (pb / mean).ln();
+    for &k in &keys {
+        let pa = (a.get(&k).copied().unwrap_or(0) as f32 + 1.0) / total_a;
+        let pb = (b.get(&k).copied().unwrap_or(0) as f32 + 1.0) / total_b;
+        let m = 0.5 * (pa + pb);
+
+        js += 0.5 * pa * (pa / m).ln();
+        js += 0.5 * pb * (pb / m).ln();
     }
 
-    jsd
+    js
+}
+
+#[inline]
+fn ratio_delta(lhs_hits: usize, lhs_total: usize, rhs_hits: usize, rhs_total: usize) -> f32 {
+    let lhs_ratio = if lhs_total == 0 {
+        0.0
+    } else {
+        lhs_hits as f32 / lhs_total as f32
+    };
+    let rhs_ratio = if rhs_total == 0 {
+        0.0
+    } else {
+        rhs_hits as f32 / rhs_total as f32
+    };
+    (lhs_ratio - rhs_ratio).abs()
 }

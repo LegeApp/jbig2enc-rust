@@ -1,17 +1,15 @@
 //! This module contains the main JBIG2 encoder logic.
 use crate::jbig2arith::{IntProc, Jbig2ArithCoder};
-use crate::jbig2collapse::{
-    CollapseFamilyBuildInputs, FamilyBucketKey, PrototypeBuildInputs, SymbolSignature,
-    build_lossy_prototype, build_lossy_symbol_families,
+use crate::jbig2classify::{
+    FamilyBucketKey, SymbolScaleProfile, SymbolSignature,
     compute_symbol_signature as compute_symbol_signature_shared,
-    estimate_collapse_scale_profile, symbol_looks_like_fragile_mark,
     family_bucket_key_for_symbol, family_bucket_neighbors, family_match_details,
-    family_signatures_are_compatible, refine_compare_score,
+    family_signatures_are_compatible, refine_compare_score, symbol_looks_like_fragile_mark,
 };
 use crate::jbig2comparator::{
     Comparator, MAX_DIMENSION_DELTA,
 };
-use crate::jbig2collapse_context::build_collapse_context_model;
+use crate::jbig2context::build_symbol_context_model;
 use crate::jbig2unify::{SymbolUnifyInputs, UnifiedClass};
 // Symbol extraction using CC analysis
 #[cfg(feature = "cc-analysis")]
@@ -65,6 +63,10 @@ use rayon::prelude::*;
 pub struct HashKey(u64);
 
 const RECENT_SYMBOL_CACHE_CAP: usize = 64;
+const SYM_UNIFY_EXACT_ANCHOR_BUDGET: usize = 32;
+const SYM_UNIFY_NEIGHBOR_ANCHOR_BUDGET: usize = 16;
+const SYM_UNIFY_STRONG_ANCHOR_MIN_USAGE: usize = 8;
+const SYM_UNIFY_STRONG_ANCHOR_MIN_PAGE_SPAN: usize = 4;
 
 fn encoder_diagnostics_enabled() -> bool {
     std::env::var("JBIG2_DIAGNOSTICS").is_ok_and(|value| value != "0" && !value.is_empty())
@@ -556,7 +558,7 @@ impl<'a> Jbig2Encoder<'a> {
     fn symbol_index_is_fragile_mark(
         &self,
         symbol_index: usize,
-        scale_profile: crate::jbig2collapse::CollapseScaleProfile,
+        scale_profile: SymbolScaleProfile,
     ) -> bool {
         symbol_looks_like_fragile_mark(
             self.config,
@@ -608,7 +610,7 @@ impl<'a> Jbig2Encoder<'a> {
         &self,
         symbol_index: usize,
         page_num: usize,
-        scale_profile: crate::jbig2collapse::CollapseScaleProfile,
+        scale_profile: SymbolScaleProfile,
     ) -> bool {
         if self.symbol_usage[symbol_index] < 2
             || self.symbol_pixel_counts[symbol_index] <= 1
@@ -631,7 +633,7 @@ impl<'a> Jbig2Encoder<'a> {
     fn build_sym_unify_anchor_map(
         &self,
         page_num: usize,
-        scale_profile: crate::jbig2collapse::CollapseScaleProfile,
+        scale_profile: SymbolScaleProfile,
     ) -> FxHashMap<FamilyBucketKey, Vec<usize>> {
         let mut anchors: FxHashMap<FamilyBucketKey, Vec<usize>> = FxHashMap::default();
         for symbol_index in 0..self.global_symbols.len() {
@@ -644,6 +646,15 @@ impl<'a> Jbig2Encoder<'a> {
             );
             anchors.entry(key).or_default().push(symbol_index);
         }
+        for bucket in anchors.values_mut() {
+            bucket.sort_unstable_by(|&lhs, &rhs| {
+                self.symbol_page_count[rhs]
+                    .cmp(&self.symbol_page_count[lhs])
+                    .then_with(|| self.symbol_usage[rhs].cmp(&self.symbol_usage[lhs]))
+                    .then_with(|| self.symbol_pixel_counts[rhs].cmp(&self.symbol_pixel_counts[lhs]))
+                    .then_with(|| lhs.cmp(&rhs))
+            });
+        }
         anchors
     }
 
@@ -652,7 +663,7 @@ impl<'a> Jbig2Encoder<'a> {
         anchors: &mut FxHashMap<FamilyBucketKey, Vec<usize>>,
         symbol_index: usize,
         page_num: usize,
-        scale_profile: crate::jbig2collapse::CollapseScaleProfile,
+        scale_profile: SymbolScaleProfile,
     ) {
         if !self.sym_unify_anchor_ready(symbol_index, page_num, scale_profile) {
             return;
@@ -664,6 +675,13 @@ impl<'a> Jbig2Encoder<'a> {
         let bucket = anchors.entry(key).or_default();
         if !bucket.contains(&symbol_index) {
             bucket.push(symbol_index);
+            bucket.sort_unstable_by(|&lhs, &rhs| {
+                self.symbol_page_count[rhs]
+                    .cmp(&self.symbol_page_count[lhs])
+                    .then_with(|| self.symbol_usage[rhs].cmp(&self.symbol_usage[lhs]))
+                    .then_with(|| self.symbol_pixel_counts[rhs].cmp(&self.symbol_pixel_counts[lhs]))
+                    .then_with(|| lhs.cmp(&rhs))
+            });
         }
     }
 
@@ -691,8 +709,8 @@ impl<'a> Jbig2Encoder<'a> {
             return SymUnifyAnchorDecision::RejectDim;
         }
 
-        let strong_anchor =
-            self.symbol_usage[anchor_index] >= 16 || self.symbol_page_count[anchor_index] >= 6;
+        let strong_anchor = self.symbol_usage[anchor_index] >= SYM_UNIFY_STRONG_ANCHOR_MIN_USAGE
+            || self.symbol_page_count[anchor_index] >= SYM_UNIFY_STRONG_ANCHOR_MIN_PAGE_SPAN;
         let area = candidate
             .width
             .max(proto.width)
@@ -836,8 +854,8 @@ impl<'a> Jbig2Encoder<'a> {
             .width
             .max(proto.width)
             .saturating_mul(candidate.height.max(proto.height));
-        let strong_anchor =
-            self.symbol_usage[symbol_index] >= 16 || self.symbol_page_count[symbol_index] >= 6;
+        let strong_anchor = self.symbol_usage[symbol_index] >= SYM_UNIFY_STRONG_ANCHOR_MIN_USAGE
+            || self.symbol_page_count[symbol_index] >= SYM_UNIFY_STRONG_ANCHOR_MIN_PAGE_SPAN;
         let pixel_delta_limit = (area / 10).clamp(4, 16) + usize::from(strong_anchor);
         if self.symbol_pixel_counts[symbol_index].abs_diff(candidate_pixels) > pixel_delta_limit {
             return SymUnifyAnchorDecision::RejectPixelDelta;
@@ -928,6 +946,11 @@ impl<'a> Jbig2Encoder<'a> {
         let id_savings = ((uses - page_span).max(0)) * 2;
         let reuse_value = (uses * (area / 12).max(2)) + (page_span * 3);
         reuse_value + id_savings - dict_cost
+    }
+
+    fn should_keep_text_local_symbol(&self, page: &PageData, symbol_index: usize) -> bool {
+        let _ = (page, symbol_index);
+        false
     }
 
     fn choose_cluster_prototype(&self, members: &[usize]) -> usize {
@@ -1060,30 +1083,10 @@ impl<'a> Jbig2Encoder<'a> {
         }
     }
 
-    fn build_lossy_symbol_families(&mut self) -> Vec<crate::jbig2collapse::LossyFamily> {
-        let diagnostics_enabled = encoder_diagnostics_enabled();
-        let context_model =
-            build_collapse_context_model(&self.pages, &self.global_symbols, &self.symbol_signatures);
-        let (families, diagnostics) = build_lossy_symbol_families(CollapseFamilyBuildInputs {
-            config: self.config,
-            global_symbols: &self.global_symbols,
-            symbol_usage: &self.symbol_usage,
-            symbol_page_count: &self.symbol_page_count,
-            symbol_signatures: &self.symbol_signatures,
-            symbol_pixel_counts: &self.symbol_pixel_counts,
-            page_symbol_indices: &self.page_symbol_indices,
-            context_model: Some(&context_model),
-        });
-        if diagnostics_enabled {
-            self.state.decision_debug_lines.extend(diagnostics.lines);
-        }
-        families
-    }
-
     fn build_symbol_unify_classes(&mut self) -> Vec<UnifiedClass> {
         let diagnostics_enabled = encoder_diagnostics_enabled();
         let context_model =
-            build_collapse_context_model(&self.pages, &self.global_symbols, &self.symbol_signatures);
+            build_symbol_context_model(&self.pages, &self.global_symbols, &self.symbol_signatures);
         let (classes, diagnostics) = crate::jbig2unify::build_symbol_unify_classes(SymbolUnifyInputs {
             config: self.config,
             global_symbols: &self.global_symbols,
@@ -1098,25 +1101,6 @@ impl<'a> Jbig2Encoder<'a> {
             self.state.decision_debug_lines.extend(diagnostics.lines);
         }
         classes
-    }
-
-    fn make_lossy_prototype(
-        &self,
-        family: &crate::jbig2collapse::LossyFamily,
-        scale_profile: crate::jbig2collapse::CollapseScaleProfile,
-        collect_stats: bool,
-    ) -> (BitImage, crate::jbig2collapse::PrototypeBuildStats) {
-        build_lossy_prototype(PrototypeBuildInputs {
-            config: self.config,
-            family,
-            scale_profile,
-            global_symbols: &self.global_symbols,
-            symbol_usage: &self.symbol_usage,
-            symbol_page_count: &self.symbol_page_count,
-            symbol_signatures: &self.symbol_signatures,
-            symbol_pixel_counts: &self.symbol_pixel_counts,
-            collect_stats,
-        })
     }
 
     fn compact_symbol_table_after_remap(&mut self) {
@@ -1157,7 +1141,6 @@ impl<'a> Jbig2Encoder<'a> {
         }
         let text_refine = self.config.text_refine;
         let refine_enabled = self.config.refine;
-        let legacy_collapse = self.config.uses_legacy_collapse();
         let global_indices: Vec<usize> = self
             .global_symbols
             .iter()
@@ -1199,15 +1182,10 @@ impl<'a> Jbig2Encoder<'a> {
                 let area = (local_symbol.width * local_symbol.height) as u32;
                 let max_err = if self.config.text_refine {
                     (area / self.config.match_tolerance.max(1)).max(3)
-                } else if legacy_collapse {
-                    self.config.lossy_collapse_max_err.max(2)
                 } else {
                     ((area as f32 * 0.05) as u32).max(2)
                 };
-                let dim_range: u64 = if self.config.text_refine
-                    || self.config.refine
-                    || legacy_collapse
-                {
+                let dim_range: u64 = if self.config.text_refine || self.config.refine {
                     2
                 } else {
                     0
@@ -1296,7 +1274,7 @@ impl<'a> Jbig2Encoder<'a> {
                                 err,
                                 dx,
                                 dy,
-                                needs_refinement && !legacy_collapse && (text_refine || refine_enabled),
+                                needs_refinement && (text_refine || refine_enabled),
                             ));
                             if err == 0 && dx == 0 && dy == 0 {
                                 break 'bucket_search;
@@ -1348,106 +1326,6 @@ impl<'a> Jbig2Encoder<'a> {
         Ok(())
     }
 
-    fn apply_lossy_symbol_collapse(&mut self) -> Result<()> {
-        if !self.config.uses_legacy_collapse() || self.state.lossy_symbol_mode_applied {
-            return Ok(());
-        }
-
-        let before_exported = self.global_symbols.len();
-        let families = self.build_lossy_symbol_families();
-        let diagnostics_enabled = encoder_diagnostics_enabled();
-        if families.is_empty() {
-            if diagnostics_enabled {
-                self.state
-                    .decision_debug_lines
-                    .push("collapse: no eligible families".to_string());
-            }
-            self.state.lossy_symbol_mode_applied = true;
-            return Ok(());
-        }
-
-        if diagnostics_enabled {
-            self.state.decision_debug_lines.push(format!(
-                "collapse: {} families eligible across {} symbols",
-                families.len(),
-                self.global_symbols.len()
-            ));
-            for family in families.iter().take(64) {
-                self.state.decision_debug_lines.push(format!(
-                    "collapse family: prototype={} members={} usage={} total_usage={} page_span={} mode={:?} selector={:?} family_score={}",
-                    family.prototype_index,
-                    family.members.len() + 1,
-                    self.symbol_usage[family.prototype_index],
-                    family.total_usage,
-                    family.page_span,
-                    self.config.lossy_collapse_prototype_mode,
-                    self.config.lossy_collapse_prototype_selector_mode,
-                    family.prototype_score
-                ));
-            }
-        }
-
-        let mut remap: Vec<usize> = (0..self.global_symbols.len()).collect();
-        for family in &families {
-            let prototype = family.prototype_index;
-            for member in &family.members {
-                remap[member.member_index] = prototype;
-            }
-        }
-
-        let scale_profile = estimate_collapse_scale_profile(
-            &self.global_symbols,
-            &self.symbol_signatures,
-            &self.symbol_usage,
-        );
-        for (family_index, family) in families.iter().enumerate() {
-            let prototype_usage = self.symbol_usage[family.prototype_index];
-            let prototype_page_span = self.symbol_page_count[family.prototype_index];
-            let collect_stats = family_index < 64;
-            let (prototype, stats) = self.make_lossy_prototype(family, scale_profile, collect_stats);
-            if diagnostics_enabled && collect_stats {
-                self.state.decision_debug_lines.push(format!(
-                    "collapse prototype: prototype={} members={} total_usage={} proto_usage={} proto_pages={} mode={} medoid_black={} output_black={} kept={} removed={} added={} avg_before={:.2} avg_after={:.2}",
-                    family.prototype_index,
-                    family.members.len() + 1,
-                    family.total_usage,
-                    prototype_usage,
-                    prototype_page_span,
-                    stats.mode,
-                    stats.medoid_black_pixels,
-                    stats.output_black_pixels,
-                    stats.pixels_kept,
-                    stats.pixels_removed,
-                    stats.pixels_added,
-                    stats.avg_member_score_before,
-                    stats.avg_member_score_after
-                ));
-            }
-            self.global_symbols[family.prototype_index] = prototype;
-        }
-
-        for page in &mut self.pages {
-            for instance in &mut page.symbol_instances {
-                instance.symbol_index = remap[instance.symbol_index];
-                instance.needs_refinement = false;
-                instance.refinement_dx = 0;
-                instance.refinement_dy = 0;
-            }
-        }
-
-        self.compact_symbol_table_after_remap();
-        if diagnostics_enabled {
-            self.state.decision_debug_lines.push(format!(
-                "collapse export summary: before={} after={} removed={}",
-                before_exported,
-                self.global_symbols.len(),
-                before_exported.saturating_sub(self.global_symbols.len())
-            ));
-        }
-        self.state.lossy_symbol_mode_applied = true;
-        Ok(())
-    }
-
     fn apply_symbol_unify(&mut self) -> Result<()> {
         if !self.config.uses_symbol_unify() || self.state.lossy_symbol_mode_applied {
             return Ok(());
@@ -1467,8 +1345,11 @@ impl<'a> Jbig2Encoder<'a> {
         }
 
         let mut remap: Vec<usize> = (0..self.global_symbols.len()).collect();
+        let mut refinement_remap: Vec<Option<RefinementPlan>> = vec![None; self.global_symbols.len()];
         let mut unified_members = 0usize;
         let mut border_unified_members = 0usize;
+        let mut refined_members = 0usize;
+        let mut refinement_subclusters = 0usize;
         let mut retained_border_members = 0usize;
         let mut retained_outlier_members = 0usize;
 
@@ -1481,12 +1362,17 @@ impl<'a> Jbig2Encoder<'a> {
 
             for class in classes.iter().take(64) {
                 self.state.decision_debug_lines.push(format!(
-                    "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} retained_border={} retained_outliers={} split_fragile={} total_usage={} page_span={} representative_score={} estimated_gain={} subclusters={}",
+                    "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} refined_subclusters={} refined_members={} retained_border={} retained_outliers={} split_fragile={} total_usage={} page_span={} representative_score={} estimated_gain={} subclusters={}",
                     class.representative_index,
                     class.class_size,
                     class.dense_core_size,
                     class.core_members.len(),
                     class.border_members.len(),
+                    class.refinement_subclusters.len(),
+                    class.refinement_subclusters
+                        .iter()
+                        .map(|subcluster| subcluster.refined_members.len())
+                        .sum::<usize>(),
                     class.retained_border_members,
                     class.retained_outlier_members,
                     class.split_fragile_members,
@@ -1510,26 +1396,47 @@ impl<'a> Jbig2Encoder<'a> {
                 remap[member.member_index] = class.representative_index;
                 border_unified_members += 1;
             }
+            refinement_subclusters += class.refinement_subclusters.len();
+            for subcluster in &class.refinement_subclusters {
+                for member in &subcluster.refined_members {
+                    refinement_remap[member.member_index] = Some(RefinementPlan {
+                        prototype_input_index: subcluster.prototype_index,
+                        refinement_dx: member.dx,
+                        refinement_dy: member.dy,
+                    });
+                    refined_members += 1;
+                }
+            }
         }
 
         for page in &mut self.pages {
             for instance in &mut page.symbol_instances {
-                instance.symbol_index = remap[instance.symbol_index];
-                instance.needs_refinement = false;
-                instance.refinement_dx = 0;
-                instance.refinement_dy = 0;
+                let original_index = instance.symbol_index;
+                if let Some(refinement) = refinement_remap[original_index] {
+                    instance.symbol_index = refinement.prototype_input_index;
+                    instance.needs_refinement = true;
+                    instance.refinement_dx = refinement.refinement_dx;
+                    instance.refinement_dy = refinement.refinement_dy;
+                } else {
+                    instance.symbol_index = remap[original_index];
+                    instance.needs_refinement = false;
+                    instance.refinement_dx = 0;
+                    instance.refinement_dy = 0;
+                }
             }
         }
 
         self.compact_symbol_table_after_remap();
         if diagnostics_enabled {
             self.state.decision_debug_lines.push(format!(
-                "sym_unify export summary: before={} after={} removed={} unified_members={} border_unified_members={} retained_border_members={} retained_outlier_members={}",
+                "sym_unify export summary: before={} after={} removed={} unified_members={} border_unified_members={} refined_members={} refinement_subclusters={} retained_border_members={} retained_outlier_members={}",
                 before_exported,
                 self.global_symbols.len(),
                 before_exported.saturating_sub(self.global_symbols.len()),
                 unified_members,
                 border_unified_members,
+                refined_members,
+                refinement_subclusters,
                 retained_border_members,
                 retained_outlier_members
             ));
@@ -1561,7 +1468,7 @@ impl<'a> Jbig2Encoder<'a> {
         let sym_unify_scale_profile = if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify
             && !self.global_symbols.is_empty()
         {
-            Some(estimate_collapse_scale_profile(
+            Some(crate::jbig2classify::estimate_symbol_scale_profile(
                 &self.global_symbols,
                 &self.symbol_signatures,
                 &self.symbol_usage,
@@ -1734,11 +1641,13 @@ impl<'a> Jbig2Encoder<'a> {
                             if let Some(anchor_map) = sym_unify_anchor_map.as_mut() {
                                 let anchor_key = family_bucket_key_for_symbol(&trimmed, &trimmed_sig);
                                 let mut visited = FxHashSet::default();
-                                'anchor_search: for neighbor in family_bucket_neighbors(anchor_key) {
-                                    let Some(bucket) = anchor_map.get(&neighbor) else {
-                                        continue;
-                                    };
-                                    for &idx in bucket {
+                                let mut exact_examined = 0usize;
+                                if let Some(bucket) = anchor_map.get(&anchor_key) {
+                                    'anchor_search_exact: for &idx in bucket {
+                                        if exact_examined >= SYM_UNIFY_EXACT_ANCHOR_BUDGET {
+                                            break 'anchor_search_exact;
+                                        }
+                                        exact_examined += 1;
                                         if !visited.insert(idx) {
                                             continue;
                                         }
@@ -1812,7 +1721,99 @@ impl<'a> Jbig2Encoder<'a> {
                                         recent_cache.touch(idx);
                                         sym_unify_anchor_hits += 1;
                                         matched = true;
-                                        break 'anchor_search;
+                                        break;
+                                    }
+                                }
+
+                                if !matched {
+                                    let mut neighbor_examined = 0usize;
+                                    'anchor_search_neighbors: for neighbor in family_bucket_neighbors(anchor_key) {
+                                        if neighbor == anchor_key {
+                                            continue;
+                                        }
+                                        let Some(bucket) = anchor_map.get(&neighbor) else {
+                                            continue;
+                                        };
+                                        for &idx in bucket {
+                                            if neighbor_examined >= SYM_UNIFY_NEIGHBOR_ANCHOR_BUDGET {
+                                                break 'anchor_search_neighbors;
+                                            }
+                                            neighbor_examined += 1;
+                                            if !visited.insert(idx) {
+                                                continue;
+                                            }
+                                            let decision = self
+                                                .evaluate_symbol_unify_anchor_match(
+                                                    &trimmed,
+                                                    trimmed_sig,
+                                                    pixel_count,
+                                                    idx,
+                                                    &mut comparator,
+                                                );
+                                            let (score, dx, dy) = match decision {
+                                                SymUnifyAnchorDecision::Accept { score, dx, dy } => {
+                                                    (score, dx, dy)
+                                                }
+                                                SymUnifyAnchorDecision::RejectScore => {
+                                                    sym_unify_anchor_score_rejects += 1;
+                                                    continue;
+                                                }
+                                                SymUnifyAnchorDecision::RejectOutsideInk => {
+                                                    sym_unify_anchor_outside_rejects += 1;
+                                                    continue;
+                                                }
+                                                SymUnifyAnchorDecision::RejectCompare => {
+                                                    sym_unify_anchor_compare_rejects += 1;
+                                                    continue;
+                                                }
+                                                SymUnifyAnchorDecision::RejectOverlap => {
+                                                    sym_unify_anchor_overlap_rejects += 1;
+                                                    continue;
+                                                }
+                                                _ => continue,
+                                            };
+
+                                            if debug_matching {
+                                                let proto = &self.global_symbols[idx];
+                                                debug_lines.push(format!(
+                                                    "CC#{:04} UNIFY  pos=({},{}) {}x{} → proto#{} {}x{} score={} dx={} dy={} [anchor]",
+                                                    cc_index,
+                                                    rect.x,
+                                                    rect.y,
+                                                    rect.width,
+                                                    rect.height,
+                                                    idx,
+                                                    proto.width,
+                                                    proto.height,
+                                                    score,
+                                                    dx,
+                                                    dy
+                                                ));
+                                            }
+
+                                            self.symbol_usage[idx] += 1;
+                                            self.note_symbol_page(idx, page_num);
+                                            if let Some(scale_profile) = sym_unify_scale_profile {
+                                                self.maybe_add_sym_unify_anchor(
+                                                    anchor_map,
+                                                    idx,
+                                                    page_num,
+                                                    scale_profile,
+                                                );
+                                            }
+                                            symbol_instances.push(SymbolInstance {
+                                                symbol_index: idx,
+                                                position: rect,
+                                                instance_bitmap: instance_bitmap.take().unwrap(),
+                                                needs_refinement: false,
+                                                refinement_dx: 0,
+                                                refinement_dy: 0,
+                                            });
+                                            recent_cache.touch(idx);
+                                            sym_unify_anchor_hits += 1;
+                                            matched = true;
+                                            break 'anchor_search_neighbors;
+                                        }
                                     }
                                 }
                             }
@@ -2031,7 +2032,6 @@ impl<'a> Jbig2Encoder<'a> {
         let include_header = self.state.full_headers_remaining;
         self.state.decision_debug_lines.clear();
         match self.config.lossy_symbol_mode {
-            LossySymbolMode::LegacyCollapse => self.apply_lossy_symbol_collapse()?,
             LossySymbolMode::SymbolUnify => self.apply_symbol_unify()?,
             LossySymbolMode::Off => {}
         }
@@ -2047,7 +2047,6 @@ impl<'a> Jbig2Encoder<'a> {
         self.state.pdf_mode = true;
         self.state.decision_debug_lines.clear();
         match self.config.lossy_symbol_mode {
-            LossySymbolMode::LegacyCollapse => self.apply_lossy_symbol_collapse()?,
             LossySymbolMode::SymbolUnify => self.apply_symbol_unify()?,
             LossySymbolMode::Off => {}
         }
@@ -2141,7 +2140,7 @@ impl<'a> Jbig2Encoder<'a> {
         let mut page_residual_symbols = vec![Vec::new(); self.pages.len()];
         let mut page_residual_anchor_remaps: Vec<FxHashMap<usize, usize>> =
             (0..self.pages.len()).map(|_| FxHashMap::default()).collect();
-        let scale_profile = estimate_collapse_scale_profile(
+        let scale_profile = crate::jbig2classify::estimate_symbol_scale_profile(
             &self.global_symbols,
             &self.symbol_signatures,
             &self.symbol_usage,
@@ -2166,6 +2165,8 @@ impl<'a> Jbig2Encoder<'a> {
         let mut planning_anchor_comparator = Comparator::default();
         let mut planning_anchor_attach_count = 0usize;
         let mut planning_anchor_attach_sample = Vec::new();
+        let mut planning_local_rescue_count = 0usize;
+        let mut planning_local_rescue_sample = Vec::new();
         let mut page_uses_generic_region = vec![false; self.pages.len()];
         for (page_num, page) in self.pages.iter().enumerate() {
             if self.config.uses_lossy_symbol_dictionary()
@@ -2183,6 +2184,19 @@ impl<'a> Jbig2Encoder<'a> {
                     if local_use_counts.get(&symbol_index).copied().unwrap_or(0) <= 1
                         && !is_fragile_mark
                     {
+                        if self.should_keep_text_local_symbol(page, symbol_index) {
+                            kept_local_symbols.push(symbol_index);
+                            planning_local_rescue_count += 1;
+                            if planning_local_rescue_sample.len() < 16 {
+                                planning_local_rescue_sample.push((
+                                    page_num + 1,
+                                    symbol_index,
+                                    self.global_symbols[symbol_index].width,
+                                    self.global_symbols[symbol_index].height,
+                                ));
+                            }
+                            continue;
+                        }
                         let mut attached_anchor = None;
                         if let Some(anchor_map) = &sym_unify_global_anchor_map {
                             let bucket = family_bucket_key_for_symbol(
@@ -2271,9 +2285,16 @@ impl<'a> Jbig2Encoder<'a> {
             ));
             if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify {
                 self.state.decision_debug_lines.push(format!(
-                    "sym_unify planning anchor remaps: count={}",
+                    "sym_unify planning symbol rescues: local_kept={} anchor_remaps={}",
+                    planning_local_rescue_count,
                     planning_anchor_attach_count
                 ));
+                if !planning_local_rescue_sample.is_empty() {
+                    self.state.decision_debug_lines.push(format!(
+                        "sym_unify planning local rescue sample: {:?}",
+                        planning_local_rescue_sample
+                    ));
+                }
                 if !planning_anchor_attach_sample.is_empty() {
                     self.state.decision_debug_lines.push(format!(
                         "sym_unify planning anchor sample: {:?}",
@@ -2291,7 +2312,7 @@ impl<'a> Jbig2Encoder<'a> {
             for residuals in &page_residual_symbols {
                 residual_unique.extend(residuals.iter().copied());
             }
-            let anchor_scale_profile = estimate_collapse_scale_profile(
+            let anchor_scale_profile = crate::jbig2classify::estimate_symbol_scale_profile(
                 &self.global_symbols,
                 &self.symbol_signatures,
                 &self.symbol_usage,
@@ -2853,8 +2874,13 @@ impl<'a> Jbig2Encoder<'a> {
 
             if !planned_instances.is_empty() {
                 let text_start = Instant::now();
-                let use_refinement_text_region = !self.config.uses_lossy_symbol_dictionary()
-                    && (self.config.text_refine || self.config.refine || needs_family_refinement);
+                let has_instance_refinement =
+                    planned_instances.iter().any(|instance| instance.needs_refinement);
+                let use_refinement_text_region = has_instance_refinement
+                    || (!self.config.uses_lossy_symbol_dictionary()
+                        && (self.config.text_refine
+                            || self.config.refine
+                            || needs_family_refinement));
                 let region_payload = if use_refinement_text_region {
                     encode_text_region_with_refinement(
                         &planned_instances,
@@ -3709,23 +3735,16 @@ fn plan_symbol_dictionary_layout(
         ));
     }
 
-    if !config.refine || canonical_order.len() <= 1 {
-        return Ok(SymbolDictLayout {
-            export_input_indices: canonical_order,
-            refinements: vec![None; symbols.len()],
-            diagnostics: SymbolDictDiagnostics {
-                singleton_family_count: symbols.len(),
-                exported_member_count: symbols.len(),
-                ..Default::default()
-            },
-        });
-    }
-
-    Ok(build_refinement_family_layout(
-        symbols,
-        &canonical_order,
-        usage_weights,
-    ))
+    let _ = (config, usage_weights);
+    Ok(SymbolDictLayout {
+        export_input_indices: canonical_order,
+        refinements: vec![None; symbols.len()],
+        diagnostics: SymbolDictDiagnostics {
+            singleton_family_count: symbols.len(),
+            exported_member_count: symbols.len(),
+            ..Default::default()
+        },
+    })
 }
 
 fn build_refinement_family_layout(

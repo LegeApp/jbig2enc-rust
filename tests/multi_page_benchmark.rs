@@ -5,22 +5,14 @@
 //! Separates encode time from fragment writing / decode verification and disk I/O.
 //!
 //! Run with:
-//!   cargo test --test multi_page_benchmark --features "symboldict refine" -- --nocapture
+//!   cargo test --test multi_page_benchmark --features "symboldict" -- --nocapture
 //!
 //! Environment variables:
 //!   BENCH_PAGES   — comma-separated page counts (default: "10,20,50")
 //!                   example: BENCH_PAGES=1,5,10,20,50,100,all
 //!   BENCH_SOURCE  — dataset folder under repo root (default: "confed")
 //!   BENCH_WRITE   — set to "0" to disable writing JBIG2 fragments + decoded PBMs (default: write)
-//!   BENCH_MODES   — comma-separated modes to run: `generic`, `symbol`, `sym_collapse`, `sym_unify`
-//!   BENCH_COLLAPSE_MIN_FAMILY
-//!   BENCH_COLLAPSE_MIN_USAGE
-//!   BENCH_COLLAPSE_MIN_TOTAL_USAGE
-//!   BENCH_COLLAPSE_MIN_PROTO_USAGE
-//!   BENCH_COLLAPSE_MIN_PAGE_SPAN
-//!   BENCH_COLLAPSE_MAX_ERR
-//!   BENCH_COLLAPSE_MAX_DX
-//!   BENCH_COLLAPSE_MAX_DY
+//!   BENCH_MODES   — comma-separated modes to run: `generic`, `symbol`, `sym_unify`
 //!   BENCH_UNIFY_MIN_CLASS
 //!   BENCH_UNIFY_MAX_ERR
 //!   BENCH_UNIFY_MAX_DX
@@ -33,17 +25,10 @@
 //!   BENCH_UNIFY_MIN_GAIN
 //!   BENCH_UNIFY_BORDER_SLACK
 //!   BENCH_UNIFY_MAX_BORDER_OUTSIDE
-//!   BENCH_COLLAPSE_MIN_WIDTH_RATIO
-//!   BENCH_COLLAPSE_MIN_HEIGHT_RATIO
-//!   BENCH_COLLAPSE_MIN_BLACK_RATIO
-//!   BENCH_COLLAPSE_CONTEXT — `jaccard`, `cosine`, or `hybrid`
-//!   BENCH_COLLAPSE_PROTO — `medoid`, `cleanup`, or `majority`
+//!   BENCH_UNIFY_CONTEXT_MODE — `jaccard`, `cosine`, or `hybrid`
 
 use jbig2enc_rust::jbig2enc::{EncoderMetrics, Jbig2Encoder, PdfSplitOutput};
-use jbig2enc_rust::jbig2structs::{
-    Jbig2Config, LossyCollapseContextMode, LossyCollapsePrototypeMode,
-    LossyCollapsePrototypeSelectorMode,
-};
+use jbig2enc_rust::jbig2structs::{Jbig2Config, SymbolContextMode};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -317,9 +302,7 @@ fn bench_modes_filter() -> Option<Vec<String>> {
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| !s.is_empty())
             .collect();
-        let needs_symbol_control = selected
-            .iter()
-            .any(|mode| mode == "sym_unify" || mode == "sym_collapse");
+        let needs_symbol_control = selected.iter().any(|mode| mode == "sym_unify");
         if needs_symbol_control && !selected.iter().any(|mode| mode == "symbol") {
             selected.insert(0, "symbol".to_string());
         }
@@ -338,55 +321,16 @@ fn env_parse_or<T: std::str::FromStr>(name: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-fn collapse_proto_mode() -> LossyCollapsePrototypeMode {
-    match std::env::var("BENCH_COLLAPSE_PROTO")
-        .unwrap_or_else(|_| "cleanup".to_string())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "medoid" => LossyCollapsePrototypeMode::Medoid,
-        "majority" => LossyCollapsePrototypeMode::MajorityVote,
-        "adaptive-majority" => LossyCollapsePrototypeMode::AdaptiveMajorityVote,
-        "adaptive-cleanup" => LossyCollapsePrototypeMode::MedoidWithAdaptiveCleanup,
-        _ => LossyCollapsePrototypeMode::MedoidThenCleanup,
-    }
-}
-
-fn collapse_selector_mode() -> LossyCollapsePrototypeSelectorMode {
-    match std::env::var("BENCH_COLLAPSE_SELECTOR")
-        .unwrap_or_else(|_| "baseline".to_string())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "support" | "support-biased" => LossyCollapsePrototypeSelectorMode::SupportBiased,
-        "dense" | "dense-center" => LossyCollapsePrototypeSelectorMode::DenseCenter,
-        "dense-trim" | "dense-trimmed" => LossyCollapsePrototypeSelectorMode::DenseTrimmed,
-        _ => LossyCollapsePrototypeSelectorMode::Baseline,
-    }
-}
-
-fn collapse_context_mode() -> LossyCollapseContextMode {
-    match std::env::var("BENCH_COLLAPSE_CONTEXT")
-        .unwrap_or_else(|_| "hybrid".to_string())
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "jaccard" | "weighted-jaccard" => LossyCollapseContextMode::WeightedJaccard,
-        "cosine" => LossyCollapseContextMode::Cosine,
-        _ => LossyCollapseContextMode::Hybrid,
-    }
-}
-
-fn unify_context_mode() -> LossyCollapseContextMode {
+fn unify_context_mode() -> SymbolContextMode {
     std::env::var("BENCH_UNIFY_CONTEXT_MODE")
         .ok()
         .and_then(|value| match value.to_ascii_lowercase().as_str() {
-            "jaccard" => Some(LossyCollapseContextMode::WeightedJaccard),
-            "cosine" => Some(LossyCollapseContextMode::Cosine),
-            "hybrid" => Some(LossyCollapseContextMode::Hybrid),
+            "jaccard" => Some(SymbolContextMode::WeightedJaccard),
+            "cosine" => Some(SymbolContextMode::Cosine),
+            "hybrid" => Some(SymbolContextMode::Hybrid),
             _ => None,
         })
-        .unwrap_or(LossyCollapseContextMode::Hybrid)
+        .unwrap_or(SymbolContextMode::Hybrid)
 }
 
 fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig2Config)> {
@@ -396,48 +340,6 @@ fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig
     cfg_symbol.auto_thresh = false;
     cfg_symbol.want_full_headers = false;
     cfgs.push(("symbol", cfg_symbol));
-
-    let mut cfg_collapse = Jbig2Config::text_lossy_collapse();
-    cfg_collapse.auto_thresh = false;
-    cfg_collapse.want_full_headers = false;
-    cfg_collapse.lossy_collapse_min_family_size =
-        env_parse_or("BENCH_COLLAPSE_MIN_FAMILY", cfg_collapse.lossy_collapse_min_family_size);
-    cfg_collapse.lossy_collapse_min_usage =
-        env_parse_or("BENCH_COLLAPSE_MIN_USAGE", cfg_collapse.lossy_collapse_min_usage);
-    cfg_collapse.lossy_collapse_min_total_usage = env_parse_or(
-        "BENCH_COLLAPSE_MIN_TOTAL_USAGE",
-        cfg_collapse.lossy_collapse_min_total_usage,
-    );
-    cfg_collapse.lossy_collapse_min_prototype_usage = env_parse_or(
-        "BENCH_COLLAPSE_MIN_PROTO_USAGE",
-        cfg_collapse.lossy_collapse_min_prototype_usage,
-    );
-    cfg_collapse.lossy_collapse_min_page_span = env_parse_or(
-        "BENCH_COLLAPSE_MIN_PAGE_SPAN",
-        cfg_collapse.lossy_collapse_min_page_span,
-    );
-    cfg_collapse.lossy_collapse_max_err =
-        env_parse_or("BENCH_COLLAPSE_MAX_ERR", cfg_collapse.lossy_collapse_max_err);
-    cfg_collapse.lossy_collapse_max_dx =
-        env_parse_or("BENCH_COLLAPSE_MAX_DX", cfg_collapse.lossy_collapse_max_dx);
-    cfg_collapse.lossy_collapse_max_dy =
-        env_parse_or("BENCH_COLLAPSE_MAX_DY", cfg_collapse.lossy_collapse_max_dy);
-    cfg_collapse.lossy_collapse_min_width_ratio_permille = env_parse_or(
-        "BENCH_COLLAPSE_MIN_WIDTH_RATIO",
-        cfg_collapse.lossy_collapse_min_width_ratio_permille,
-    );
-    cfg_collapse.lossy_collapse_min_height_ratio_permille = env_parse_or(
-        "BENCH_COLLAPSE_MIN_HEIGHT_RATIO",
-        cfg_collapse.lossy_collapse_min_height_ratio_permille,
-    );
-    cfg_collapse.lossy_collapse_min_black_ratio_permille = env_parse_or(
-        "BENCH_COLLAPSE_MIN_BLACK_RATIO",
-        cfg_collapse.lossy_collapse_min_black_ratio_permille,
-    );
-    cfg_collapse.lossy_collapse_context_mode = collapse_context_mode();
-    cfg_collapse.lossy_collapse_prototype_mode = collapse_proto_mode();
-    cfg_collapse.lossy_collapse_prototype_selector_mode = collapse_selector_mode();
-    cfgs.push(("sym_collapse", cfg_collapse));
 
     let mut cfg_unify = Jbig2Config::text_symbol_unify();
     cfg_unify.auto_thresh = false;
