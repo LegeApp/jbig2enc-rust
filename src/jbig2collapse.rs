@@ -324,7 +324,7 @@ pub fn estimate_collapse_scale_profile(
 }
 
 #[inline]
-fn collapse_shape_is_fragile(
+pub fn symbol_is_fragile_relative_to_scale(
     config: &Jbig2Config,
     scale_profile: CollapseScaleProfile,
     symbol: &BitImage,
@@ -343,6 +343,46 @@ fn collapse_shape_is_fragile(
 }
 
 #[inline]
+pub fn symbol_looks_like_fragile_mark(
+    config: &Jbig2Config,
+    scale_profile: CollapseScaleProfile,
+    symbol: &BitImage,
+    sig: &SymbolSignature,
+) -> bool {
+    if !symbol_is_fragile_relative_to_scale(config, scale_profile, symbol, sig) {
+        return false;
+    }
+
+    let small_black = sig.black.saturating_mul(1000)
+        < scale_profile
+            .ref_black
+            .max(1)
+            .saturating_mul(config.lossy_collapse_min_black_ratio_permille as u32);
+    let small_width = symbol.width.saturating_mul(1000)
+        < scale_profile
+            .ref_width
+            .max(1)
+            .saturating_mul(config.lossy_collapse_min_width_ratio_permille as usize);
+    let small_height = symbol.height.saturating_mul(1000)
+        < scale_profile
+            .ref_height
+            .max(1)
+            .saturating_mul(config.lossy_collapse_min_height_ratio_permille as usize);
+
+    let punctuation_like = symbol.width <= 4 && symbol.height <= 6 && sig.black <= 18;
+    let tittle_like = symbol.width <= 5
+        && symbol.height <= 5
+        && sig.black <= 16
+        && sig.top_mass >= sig.bottom_mass;
+    let apostrophe_like = symbol.width <= 4 && symbol.height <= 9 && sig.black <= 20;
+
+    punctuation_like
+        || tittle_like
+        || apostrophe_like
+        || (small_black && (small_width || small_height))
+}
+
+#[inline]
 fn should_cleanup_prototype(
     config: &Jbig2Config,
     scale_profile: CollapseScaleProfile,
@@ -350,7 +390,7 @@ fn should_cleanup_prototype(
     sig: &SymbolSignature,
     family_total_usage: usize,
 ) -> bool {
-    !collapse_shape_is_fragile(config, scale_profile, symbol, sig)
+    !symbol_is_fragile_relative_to_scale(config, scale_profile, symbol, sig)
         && family_total_usage >= 6
         && symbol.width >= 5
         && symbol.height >= 8
@@ -1035,7 +1075,7 @@ pub fn build_lossy_symbol_families(
             .copied()
             .filter(|&index| {
                 inputs.symbol_usage[index] >= inputs.config.lossy_collapse_min_usage
-                    && !collapse_shape_is_fragile(
+                    && !symbol_is_fragile_relative_to_scale(
                         inputs.config,
                         scale_profile,
                         &inputs.global_symbols[index],
@@ -1049,7 +1089,7 @@ pub fn build_lossy_symbol_families(
             if skipped_samples.len() < 64 {
                 for &index in members.iter().filter(|&&index| {
                     inputs.symbol_usage[index] >= inputs.config.lossy_collapse_min_usage
-                        && collapse_shape_is_fragile(
+                        && symbol_is_fragile_relative_to_scale(
                             inputs.config,
                             scale_profile,
                             &inputs.global_symbols[index],

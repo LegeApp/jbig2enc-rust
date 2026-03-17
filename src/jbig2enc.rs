@@ -4,7 +4,7 @@ use crate::jbig2collapse::{
     CollapseFamilyBuildInputs, FamilyBucketKey, PrototypeBuildInputs, SymbolSignature,
     build_lossy_prototype, build_lossy_symbol_families,
     compute_symbol_signature as compute_symbol_signature_shared,
-    estimate_collapse_scale_profile,
+    estimate_collapse_scale_profile, symbol_looks_like_fragile_mark,
     family_bucket_key_for_symbol, family_bucket_neighbors, family_match_details,
     refine_compare_score,
 };
@@ -484,7 +484,25 @@ impl<'a> Jbig2Encoder<'a> {
 
         let area = width.saturating_mul(height).max(1);
         let density = black_pixels as f32 / area as f32;
+        let dense_tiny_mark = width <= 6 && height <= 10 && black_pixels <= 24;
+        if dense_tiny_mark {
+            return density < 0.01;
+        }
         !(0.01..=0.90).contains(&density)
+    }
+
+    #[inline]
+    fn symbol_index_is_fragile_mark(
+        &self,
+        symbol_index: usize,
+        scale_profile: crate::jbig2collapse::CollapseScaleProfile,
+    ) -> bool {
+        symbol_looks_like_fragile_mark(
+            self.config,
+            scale_profile,
+            &self.global_symbols[symbol_index],
+            &self.symbol_signatures[symbol_index],
+        )
     }
 
     #[inline(always)]
@@ -1177,7 +1195,13 @@ impl<'a> Jbig2Encoder<'a> {
             #[cfg(feature = "cc-analysis")]
             {
                 let dpi = 300; // Default DPI
-                let losslevel = if self.config.is_lossless { 0 } else { 1 };
+                let losslevel = if self.config.symbol_mode || self.config.uses_lossy_symbol_dictionary() {
+                    0
+                } else if self.config.is_lossless {
+                    0
+                } else {
+                    1
+                };
                 let cc_start = Instant::now();
                 let cc_image = analyze_page(&bitimage, dpi, losslevel);
                 let extracted = cc_image.extract_shape_refs();
@@ -1534,6 +1558,11 @@ impl<'a> Jbig2Encoder<'a> {
             })
             .collect();
         let mut page_residual_symbols = vec![Vec::new(); self.pages.len()];
+        let scale_profile = estimate_collapse_scale_profile(
+            &self.global_symbols,
+            &self.symbol_signatures,
+            &self.symbol_usage,
+        );
 
         let global_set: HashSet<usize> = global_symbol_indices.iter().copied().collect();
         let mut page_uses_generic_region = vec![false; self.pages.len()];
@@ -1548,7 +1577,11 @@ impl<'a> Jbig2Encoder<'a> {
                 }
                 let mut kept_local_symbols = Vec::with_capacity(page_local_symbols[page_num].len());
                 for &symbol_index in &page_local_symbols[page_num] {
-                    if local_use_counts.get(&symbol_index).copied().unwrap_or(0) <= 1 {
+                    let is_fragile_mark =
+                        self.symbol_index_is_fragile_mark(symbol_index, scale_profile);
+                    if local_use_counts.get(&symbol_index).copied().unwrap_or(0) <= 1
+                        && !is_fragile_mark
+                    {
                         page_residual_symbols[page_num].push(symbol_index);
                     } else {
                         kept_local_symbols.push(symbol_index);

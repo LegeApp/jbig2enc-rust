@@ -9,13 +9,7 @@
 //! 1. **Runs** compress horizontal spans into (y, x1, x2) triples — a typical
 //!    document page might have ~50 000 runs vs millions of pixels.
 //! 2. **Union-find** with path compression gives near-O(n) labeling.
-//! 3. **merge_and_split_ccs** handles the two pathological cases that cause
-//!    "too many symbols":
-//!    - Tiny fragments (noise, serifs, diacritical marks that got disconnected)
-//!      are **merged** into grid cells.
-//!    - Huge components (touching characters, rules, decorative borders) are
-//!      **split** along grid lines.
-//! 4. **Reading-order sort** groups components into text lines, which is
+//! 3. **Reading-order sort** groups components into text lines, which is
 //!    critical for efficient dictionary encoding (similar shapes appear near
 //!    each other).
 //!
@@ -758,21 +752,14 @@ impl CCImage {
     ///
     /// 1. `make_ccids_by_analysis()` — union-find labeling
     /// 2. `make_ccs_from_ccids()` — build descriptors
-    /// 3. `erase_tiny_ccs()` — remove noise (only if losslevel > 0)
-    /// 4. `merge_and_split_ccs()` — grid-based merge/split
-    /// 5. `sort_in_reading_order()` — reading-order sort
+    /// 3. `sort_in_reading_order()` — reading-order sort
     ///
     /// After this, iterate `0..self.ccs.len()` and call
     /// `get_bitmap_for_cc(i)` to extract symbol bitmaps.
     pub fn analyze(&mut self, losslevel: i32) {
+        let _ = losslevel;
         self.make_ccids_by_analysis();
         self.make_ccs_from_ccids();
-
-        if losslevel > 0 {
-            self.erase_tiny_ccs();
-        }
-
-        self.merge_and_split_ccs();
         self.sort_in_reading_order();
     }
 

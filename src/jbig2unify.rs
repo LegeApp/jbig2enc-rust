@@ -1,6 +1,7 @@
 use crate::jbig2collapse::{
-    FamilyBucketKey, SymbolSignature, family_bucket_key_for_symbol, family_signatures_are_compatible,
-    for_each_family_bucket_neighbor,
+    CollapseScaleProfile, FamilyBucketKey, SymbolSignature, estimate_collapse_scale_profile,
+    family_bucket_key_for_symbol, family_signatures_are_compatible, for_each_family_bucket_neighbor,
+    symbol_looks_like_fragile_mark,
 };
 use crate::jbig2collapse_context::{CollapseContextModel, ContextDecision};
 use crate::jbig2comparator::{Comparator, CompareResult};
@@ -102,44 +103,49 @@ fn assignment_pair_score(result: &CompareResult) -> u32 {
         .saturating_add((result.row_profile_err + result.col_profile_err) / 24)
 }
 
-fn denoise_symbol(symbol: &BitImage) -> BitImage {
-    if symbol.width < 3 || symbol.height < 3 {
-        return symbol.clone();
+#[inline]
+fn prescreen_pair(
+    comparator: &mut Comparator,
+    lhs: &BitImage,
+    rhs: &BitImage,
+    lhs_black: usize,
+    rhs_black: usize,
+    max_err: u32,
+    max_dx: i32,
+    max_dy: i32,
+) -> bool {
+    if lhs.width.abs_diff(rhs.width) > 1 || lhs.height.abs_diff(rhs.height) > 1 {
+        return false;
     }
 
-    let mut cleaned = symbol.clone();
-    let mut updates = Vec::new();
-    for y in 0..symbol.height {
-        for x in 0..symbol.width {
-            if !symbol.get_usize(x, y) {
-                continue;
-            }
-            let mut neighbors = 0u8;
-            let x0 = x.saturating_sub(1);
-            let y0 = y.saturating_sub(1);
-            let x1 = (x + 1).min(symbol.width - 1);
-            let y1 = (y + 1).min(symbol.height - 1);
-            for ny in y0..=y1 {
-                for nx in x0..=x1 {
-                    if nx == x && ny == y {
-                        continue;
-                    }
-                    if symbol.get_usize(nx, ny) {
-                        neighbors += 1;
-                    }
-                }
-            }
-            if neighbors <= 1 {
-                updates.push((x, y, false));
-            }
-        }
+    let area = lhs.width.max(rhs.width).saturating_mul(lhs.height.max(rhs.height));
+    let pixel_delta_limit = (area / 10).clamp(4, 16);
+    if lhs_black.abs_diff(rhs_black) > pixel_delta_limit {
+        return false;
     }
 
-    for (x, y, value) in updates {
-        cleaned.set_usize(x, y, value);
-    }
-    let (_, trimmed) = cleaned.trim();
-    trimmed
+    let overlap_limit = max_err.saturating_add(2).min(14);
+    let Some(result) = comparator.compare_overlap_only(lhs, rhs, overlap_limit) else {
+        return false;
+    };
+    result.dx.abs() <= max_dx
+        && result.dy.abs() <= max_dy
+        && result.overlap_err <= overlap_limit
+        && result.black_delta <= pixel_delta_limit as u32
+}
+
+#[inline]
+fn fragile_mark_indices(
+    config: &Jbig2Config,
+    scale_profile: CollapseScaleProfile,
+    symbols: &[BitImage],
+    signatures: &[SymbolSignature],
+) -> Vec<bool> {
+    symbols
+        .iter()
+        .zip(signatures.iter())
+        .map(|(symbol, sig)| symbol_looks_like_fragile_mark(config, scale_profile, symbol, sig))
+        .collect()
 }
 
 fn find_root(parent: &mut [usize], index: usize) -> usize {
@@ -169,7 +175,7 @@ fn union(parent: &mut [usize], rank: &mut [u8], lhs: usize, rhs: usize) {
 fn get_or_compute_pair(
     pair_cache: &mut FxHashMap<u64, Option<PairObservation>>,
     comparator: &mut Comparator,
-    normalized_symbols: &[BitImage],
+    symbols: &[BitImage],
     signatures: &[SymbolSignature],
     black_counts: &[usize],
     lhs: usize,
@@ -185,15 +191,6 @@ fn get_or_compute_pair(
     let pair = if let Some(obs) = cached {
         obs
     } else {
-        if normalized_symbols[lo].width.abs_diff(normalized_symbols[hi].width) > 1
-            || normalized_symbols[lo]
-                .height
-                .abs_diff(normalized_symbols[hi].height)
-                > 1
-        {
-            pair_cache.insert(key, None);
-            return None;
-        }
         if !family_signatures_are_compatible(
             signatures[lo],
             signatures[hi],
@@ -203,10 +200,23 @@ fn get_or_compute_pair(
             pair_cache.insert(key, None);
             return None;
         }
+        if !prescreen_pair(
+            comparator,
+            &symbols[lo],
+            &symbols[hi],
+            black_counts[lo],
+            black_counts[hi],
+            max_err,
+            max_dx,
+            max_dy,
+        ) {
+            pair_cache.insert(key, None);
+            return None;
+        }
 
         let result = comparator.compare_for_symbol_unify(
-            &normalized_symbols[lo],
-            &normalized_symbols[hi],
+            &symbols[lo],
+            &symbols[hi],
             max_err,
             max_dx,
             max_dy,
@@ -278,7 +288,7 @@ fn select_dense_representative(
     core: &[usize],
     pair_cache: &mut FxHashMap<u64, Option<PairObservation>>,
     comparator: &mut Comparator,
-    normalized_symbols: &[BitImage],
+    symbols: &[BitImage],
     signatures: &[SymbolSignature],
     black_counts: &[usize],
     usage: &[usize],
@@ -307,7 +317,7 @@ fn select_dense_representative(
             let Some(obs) = get_or_compute_pair(
                 pair_cache,
                 comparator,
-                normalized_symbols,
+                symbols,
                 signatures,
                 black_counts,
                 candidate,
@@ -364,18 +374,21 @@ pub fn build_symbol_unify_classes(
     let class_accept_limit = class_max_err.saturating_add(4);
     let close_threshold = class_max_err.saturating_div(2).saturating_add(3);
 
-    let normalized_symbols: Vec<BitImage> = inputs
+    let scale_profile = estimate_collapse_scale_profile(
+        inputs.global_symbols,
+        inputs.symbol_signatures,
+        inputs.symbol_usage,
+    );
+    let fragile_marks = fragile_mark_indices(
+        inputs.config,
+        scale_profile,
+        inputs.global_symbols,
+        inputs.symbol_signatures,
+    );
+    let bucket_keys: Vec<FamilyBucketKey> = inputs
         .global_symbols
         .iter()
-        .map(denoise_symbol)
-        .collect();
-    let normalized_signatures: Vec<SymbolSignature> = normalized_symbols
-        .iter()
-        .map(crate::jbig2collapse::compute_symbol_signature)
-        .collect();
-    let bucket_keys: Vec<FamilyBucketKey> = normalized_symbols
-        .iter()
-        .zip(normalized_signatures.iter())
+        .zip(inputs.symbol_signatures.iter())
         .map(|(symbol, signature)| family_bucket_key_for_symbol(symbol, signature))
         .collect();
 
@@ -423,8 +436,8 @@ pub fn build_symbol_unify_classes(
                 let Some(obs) = get_or_compute_pair(
                     &mut pair_cache,
                     &mut comparator,
-                    &normalized_symbols,
-                    &normalized_signatures,
+                    inputs.global_symbols,
+                    inputs.symbol_signatures,
                     inputs.symbol_pixel_counts,
                     symbol_index,
                     other_index,
@@ -471,11 +484,23 @@ pub fn build_symbol_unify_classes(
         reject_reason_counts.get("score").copied().unwrap_or(0),
         reject_reason_counts.get("context").copied().unwrap_or(0)
     ));
+    diagnostics.lines.push(format!(
+        "sym_unify fragile marks: count={}",
+        fragile_marks.iter().filter(|&&mark| mark).count()
+    ));
 
     let mut grouped: Vec<Vec<usize>> = class_map.into_values().collect();
     grouped.sort_by(|lhs, rhs| rhs.len().cmp(&lhs.len()).then_with(|| lhs[0].cmp(&rhs[0])));
 
     for members in grouped {
+        if members.iter().any(|&index| fragile_marks[index]) {
+            diagnostics.lines.push(format!(
+                "sym_unify skip fragile-mark class: class_size={} sample={:?}",
+                members.len(),
+                &members[..members.len().min(8)]
+            ));
+            continue;
+        }
         if members.len() < inputs.config.lossy_collapse_min_family_size.max(2) {
             continue;
         }
@@ -494,8 +519,8 @@ pub fn build_symbol_unify_classes(
                         get_or_compute_pair(
                             &mut pair_cache,
                             &mut comparator,
-                            &normalized_symbols,
-                            &normalized_signatures,
+                            inputs.global_symbols,
+                            inputs.symbol_signatures,
                             inputs.symbol_pixel_counts,
                             member,
                             *neighbor,
@@ -524,8 +549,8 @@ pub fn build_symbol_unify_classes(
             &dense_core,
             &mut pair_cache,
             &mut comparator,
-            &normalized_symbols,
-            &normalized_signatures,
+            inputs.global_symbols,
+            inputs.symbol_signatures,
             inputs.symbol_pixel_counts,
             inputs.symbol_usage,
             inputs.symbol_page_count,
@@ -545,8 +570,8 @@ pub fn build_symbol_unify_classes(
             let Some(obs) = get_or_compute_pair(
                 &mut pair_cache,
                 &mut comparator,
-                &normalized_symbols,
-                &normalized_signatures,
+                inputs.global_symbols,
+                inputs.symbol_signatures,
                 inputs.symbol_pixel_counts,
                 member,
                 representative_index,
