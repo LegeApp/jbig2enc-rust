@@ -47,6 +47,7 @@ pub struct SymbolUnifyInputs<'a> {
     pub symbol_signatures: &'a [SymbolSignature],
     pub symbol_pixel_counts: &'a [usize],
     pub context_model: Option<&'a CollapseContextModel>,
+    pub collect_diagnostics: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -685,19 +686,21 @@ pub fn build_symbol_unify_classes(
 
     let mut classes = Vec::new();
     let mut diagnostics = UnifyBuildDiagnostics::default();
-    diagnostics.lines.push(format!(
-        "sym_unify class build: symbols={} accepted_edges={} compare_rejects={} score_rejects={} context_rejects={} fragile_pair_splits={}",
-        inputs.global_symbols.len(),
-        accepted_edge_count,
-        reject_reason_counts.get("compare").copied().unwrap_or(0),
-        reject_reason_counts.get("score").copied().unwrap_or(0),
-        reject_reason_counts.get("context").copied().unwrap_or(0),
-        skipped_fragile_pairs
-    ));
-    diagnostics.lines.push(format!(
-        "sym_unify fragile marks: count={}",
-        fragile_marks.iter().filter(|&&mark| mark).count()
-    ));
+    if inputs.collect_diagnostics {
+        diagnostics.lines.push(format!(
+            "sym_unify class build: symbols={} accepted_edges={} compare_rejects={} score_rejects={} context_rejects={} fragile_pair_splits={}",
+            inputs.global_symbols.len(),
+            accepted_edge_count,
+            reject_reason_counts.get("compare").copied().unwrap_or(0),
+            reject_reason_counts.get("score").copied().unwrap_or(0),
+            reject_reason_counts.get("context").copied().unwrap_or(0),
+            skipped_fragile_pairs
+        ));
+        diagnostics.lines.push(format!(
+            "sym_unify fragile marks: count={}",
+            fragile_marks.iter().filter(|&&mark| mark).count()
+        ));
+    }
 
     let mut grouped: Vec<Vec<usize>> = class_map.into_values().collect();
     grouped.sort_by(|lhs, rhs| rhs.len().cmp(&lhs.len()).then_with(|| lhs[0].cmp(&rhs[0])));
@@ -774,14 +777,16 @@ pub fn build_symbol_unify_classes(
             || core_ratio_permille < inputs.config.sym_unify_min_core_ratio_permille
         {
             rejected_weak_core += 1;
-            diagnostics.lines.push(format!(
-                "sym_unify skip weak-core: class_size={} non_fragile={} core_size={} core_ratio_permille={} sample={:?}",
-                members.len(),
-                non_fragile_members.len(),
-                dense_core.len(),
-                core_ratio_permille,
-                &non_fragile_members[..non_fragile_members.len().min(8)]
-            ));
+            if inputs.collect_diagnostics {
+                diagnostics.lines.push(format!(
+                    "sym_unify skip weak-core: class_size={} non_fragile={} core_size={} core_ratio_permille={} sample={:?}",
+                    members.len(),
+                    non_fragile_members.len(),
+                    dense_core.len(),
+                    core_ratio_permille,
+                    &non_fragile_members[..non_fragile_members.len().min(8)]
+                ));
+            }
             continue;
         }
 
@@ -838,12 +843,14 @@ pub fn build_symbol_unify_classes(
 
         if core_members.is_empty() {
             rejected_weak_core += 1;
-            diagnostics.lines.push(format!(
-                "sym_unify skip empty-remap: class_size={} core_size={} representative={}",
-                non_fragile_members.len(),
-                dense_core.len(),
-                representative_index
-            ));
+            if inputs.collect_diagnostics {
+                diagnostics.lines.push(format!(
+                    "sym_unify skip empty-remap: class_size={} core_size={} representative={}",
+                    non_fragile_members.len(),
+                    dense_core.len(),
+                    representative_index
+                ));
+            }
             continue;
         }
 
@@ -899,46 +906,50 @@ pub fn build_symbol_unify_classes(
         );
         if gain.net_gain < inputs.config.sym_unify_min_estimated_gain {
             rejected_low_gain += 1;
+            if inputs.collect_diagnostics {
+                diagnostics.lines.push(format!(
+                    "sym_unify skip low-gain: representative={} class_size={} core_size={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} border_unified={} retained_border={} retained_outliers={} split_fragile={}",
+                    representative_index,
+                    non_fragile_members.len(),
+                    dense_core.len(),
+                    gain.net_gain,
+                    gain.bitmap_savings,
+                    gain.id_savings,
+                    gain.representative_penalty,
+                    gain.retained_penalty,
+                    triage.border_members.len(),
+                    triage.retained_border_members,
+                    triage.retained_outlier_members,
+                    split_fragile_members
+                ));
+            }
+            continue;
+        }
+
+        if inputs.collect_diagnostics {
             diagnostics.lines.push(format!(
-                "sym_unify skip low-gain: representative={} class_size={} core_size={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} border_unified={} retained_border={} retained_outliers={} split_fragile={}",
+                "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} retained_border={} retained_outliers={} split_fragile={} total_usage={} page_span={} rep_usage={} rep_pages={} rep_score={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} subclusters={}",
                 representative_index,
                 non_fragile_members.len(),
                 dense_core.len(),
+                core_members.len(),
+                triage.border_members.len(),
+                triage.retained_border_members,
+                triage.retained_outlier_members,
+                split_fragile_members,
+                total_usage,
+                page_span,
+                inputs.symbol_usage[representative_index],
+                inputs.symbol_page_count[representative_index],
+                representative_score,
                 gain.net_gain,
                 gain.bitmap_savings,
                 gain.id_savings,
                 gain.representative_penalty,
                 gain.retained_penalty,
-                triage.border_members.len(),
-                triage.retained_border_members,
-                triage.retained_outlier_members,
-                split_fragile_members
+                candidate_subclusters
             ));
-            continue;
         }
-
-        diagnostics.lines.push(format!(
-            "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} retained_border={} retained_outliers={} split_fragile={} total_usage={} page_span={} rep_usage={} rep_pages={} rep_score={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} subclusters={}",
-            representative_index,
-            non_fragile_members.len(),
-            dense_core.len(),
-            core_members.len(),
-            triage.border_members.len(),
-            triage.retained_border_members,
-            triage.retained_outlier_members,
-            split_fragile_members,
-            total_usage,
-            page_span,
-            inputs.symbol_usage[representative_index],
-            inputs.symbol_page_count[representative_index],
-            representative_score,
-            gain.net_gain,
-            gain.bitmap_savings,
-            gain.id_savings,
-            gain.representative_penalty,
-            gain.retained_penalty,
-            candidate_subclusters
-        ));
 
         classes.push(UnifiedClass {
             representative_index,
@@ -959,23 +970,25 @@ pub fn build_symbol_unify_classes(
 
     let unified_members: usize = classes.iter().map(|class| class.core_members.len()).sum();
     let border_unified_members: usize = classes.iter().map(|class| class.border_members.len()).sum();
-    diagnostics.lines.push(format!(
-        "sym_unify summary: classes={} unified_members={} border_unified_members={} retained_border_members={} retained_outlier_members={} rejected_weak_core={} rejected_low_gain={} classes_with_fragile_members={}",
-        classes.len(),
-        unified_members,
-        border_unified_members,
-        classes
-            .iter()
-            .map(|class| class.retained_border_members)
-            .sum::<usize>(),
-        classes
-            .iter()
-            .map(|class| class.retained_outlier_members)
-            .sum::<usize>(),
-        rejected_weak_core,
-        rejected_low_gain,
-        classes_with_fragile_members
-    ));
+    if inputs.collect_diagnostics {
+        diagnostics.lines.push(format!(
+            "sym_unify summary: classes={} unified_members={} border_unified_members={} retained_border_members={} retained_outlier_members={} rejected_weak_core={} rejected_low_gain={} classes_with_fragile_members={}",
+            classes.len(),
+            unified_members,
+            border_unified_members,
+            classes
+                .iter()
+                .map(|class| class.retained_border_members)
+                .sum::<usize>(),
+            classes
+                .iter()
+                .map(|class| class.retained_outlier_members)
+                .sum::<usize>(),
+            rejected_weak_core,
+            rejected_low_gain,
+            classes_with_fragile_members
+        ));
+    }
 
     (classes, diagnostics)
 }

@@ -66,6 +66,10 @@ pub struct HashKey(u64);
 
 const RECENT_SYMBOL_CACHE_CAP: usize = 64;
 
+fn encoder_diagnostics_enabled() -> bool {
+    std::env::var("JBIG2_DIAGNOSTICS").is_ok_and(|value| value != "0" && !value.is_empty())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum SymUnifyAnchorDecision {
     Accept { score: u32, dx: i32, dy: i32 },
@@ -76,6 +80,34 @@ enum SymUnifyAnchorDecision {
     RejectCompare,
     RejectScore,
     RejectOutsideInk,
+}
+
+impl SymUnifyAnchorDecision {
+    fn label(self) -> &'static str {
+        match self {
+            SymUnifyAnchorDecision::Accept { .. } => "accept",
+            SymUnifyAnchorDecision::RejectDim => "dim",
+            SymUnifyAnchorDecision::RejectPixelDelta => "pixel_delta",
+            SymUnifyAnchorDecision::RejectSignature => "signature",
+            SymUnifyAnchorDecision::RejectOverlap => "overlap",
+            SymUnifyAnchorDecision::RejectCompare => "compare",
+            SymUnifyAnchorDecision::RejectScore => "score",
+            SymUnifyAnchorDecision::RejectOutsideInk => "outside_ink",
+        }
+    }
+
+    fn diagnostic_rank(self) -> u8 {
+        match self {
+            SymUnifyAnchorDecision::Accept { .. } => 255,
+            SymUnifyAnchorDecision::RejectScore => 7,
+            SymUnifyAnchorDecision::RejectOutsideInk => 6,
+            SymUnifyAnchorDecision::RejectCompare => 5,
+            SymUnifyAnchorDecision::RejectOverlap => 4,
+            SymUnifyAnchorDecision::RejectSignature => 3,
+            SymUnifyAnchorDecision::RejectPixelDelta => 2,
+            SymUnifyAnchorDecision::RejectDim => 1,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -280,6 +312,7 @@ struct PlannedPageLayout {
     end_of_page_segment_number: u32,
     local_symbols: Vec<usize>,
     residual_symbols: Vec<usize>,
+    residual_anchor_remaps: FxHashMap<usize, usize>,
     use_generic_region: bool,
 }
 
@@ -634,6 +667,103 @@ impl<'a> Jbig2Encoder<'a> {
         }
     }
 
+    fn residual_symbol_matches_anchor(
+        &self,
+        residual_index: usize,
+        anchor_index: usize,
+        comparator: &mut Comparator,
+    ) -> bool {
+        matches!(
+            self.residual_symbol_anchor_decision(residual_index, anchor_index, comparator),
+            SymUnifyAnchorDecision::Accept { .. }
+        )
+    }
+
+    fn residual_symbol_anchor_decision(
+        &self,
+        residual_index: usize,
+        anchor_index: usize,
+        comparator: &mut Comparator,
+    ) -> SymUnifyAnchorDecision {
+        let candidate = &self.global_symbols[residual_index];
+        let proto = &self.global_symbols[anchor_index];
+        if candidate.width.abs_diff(proto.width) > 1 || candidate.height.abs_diff(proto.height) > 1 {
+            return SymUnifyAnchorDecision::RejectDim;
+        }
+
+        let strong_anchor =
+            self.symbol_usage[anchor_index] >= 16 || self.symbol_page_count[anchor_index] >= 6;
+        let area = candidate
+            .width
+            .max(proto.width)
+            .saturating_mul(candidate.height.max(proto.height));
+        let pixel_delta_limit = (area / 10).clamp(4, 16) + usize::from(strong_anchor);
+        if self.symbol_pixel_counts[anchor_index].abs_diff(self.symbol_pixel_counts[residual_index])
+            > pixel_delta_limit
+        {
+            return SymUnifyAnchorDecision::RejectPixelDelta;
+        }
+        if !family_signatures_are_compatible(
+            self.symbol_signatures[residual_index],
+            self.symbol_signatures[anchor_index],
+            self.symbol_pixel_counts[residual_index],
+            self.symbol_pixel_counts[anchor_index],
+        ) {
+            return SymUnifyAnchorDecision::RejectSignature;
+        }
+
+        let overlap_limit = self
+            .config
+            .sym_unify_max_err
+            .max(4)
+            .saturating_add(2)
+            .saturating_add(u32::from(strong_anchor))
+            .min(15);
+        let Some(overlap) = comparator.compare_overlap_only(candidate, proto, overlap_limit) else {
+            return SymUnifyAnchorDecision::RejectOverlap;
+        };
+        if overlap.dx.abs() > self.config.sym_unify_max_dx.max(0)
+            || overlap.dy.abs() > self.config.sym_unify_max_dy.max(0)
+            || overlap.overlap_err > overlap_limit
+            || overlap.black_delta > pixel_delta_limit as u32
+        {
+            return SymUnifyAnchorDecision::RejectOverlap;
+        }
+
+        let compare_max_err = self
+            .config
+            .sym_unify_max_err
+            .max(4)
+            .saturating_add(u32::from(strong_anchor));
+        let Some(result) = comparator.compare_for_symbol_unify(
+            candidate,
+            proto,
+            compare_max_err,
+            self.config.sym_unify_max_dx.max(0),
+            self.config.sym_unify_max_dy.max(0),
+        ) else {
+            return SymUnifyAnchorDecision::RejectCompare;
+        };
+
+        let outside_limit =
+            self.config.sym_unify_max_border_outside_ink.min(1) + u32::from(strong_anchor);
+        if result.outside_ink_err > outside_limit {
+            return SymUnifyAnchorDecision::RejectOutsideInk;
+        }
+
+        let score = Self::symbol_unify_assignment_score(&result);
+        let score_limit = self.config.sym_unify_class_accept_limit + u32::from(strong_anchor);
+        if score > score_limit {
+            return SymUnifyAnchorDecision::RejectScore;
+        }
+
+        SymUnifyAnchorDecision::Accept {
+            score,
+            dx: result.dx,
+            dy: result.dy,
+        }
+    }
+
     #[inline(always)]
     fn evaluate_symbol_match(
         &mut self,
@@ -931,6 +1061,7 @@ impl<'a> Jbig2Encoder<'a> {
     }
 
     fn build_lossy_symbol_families(&mut self) -> Vec<crate::jbig2collapse::LossyFamily> {
+        let diagnostics_enabled = encoder_diagnostics_enabled();
         let context_model =
             build_collapse_context_model(&self.pages, &self.global_symbols, &self.symbol_signatures);
         let (families, diagnostics) = build_lossy_symbol_families(CollapseFamilyBuildInputs {
@@ -943,11 +1074,14 @@ impl<'a> Jbig2Encoder<'a> {
             page_symbol_indices: &self.page_symbol_indices,
             context_model: Some(&context_model),
         });
-        self.state.decision_debug_lines.extend(diagnostics.lines);
+        if diagnostics_enabled {
+            self.state.decision_debug_lines.extend(diagnostics.lines);
+        }
         families
     }
 
     fn build_symbol_unify_classes(&mut self) -> Vec<UnifiedClass> {
+        let diagnostics_enabled = encoder_diagnostics_enabled();
         let context_model =
             build_collapse_context_model(&self.pages, &self.global_symbols, &self.symbol_signatures);
         let (classes, diagnostics) = crate::jbig2unify::build_symbol_unify_classes(SymbolUnifyInputs {
@@ -958,8 +1092,11 @@ impl<'a> Jbig2Encoder<'a> {
             symbol_signatures: &self.symbol_signatures,
             symbol_pixel_counts: &self.symbol_pixel_counts,
             context_model: Some(&context_model),
+            collect_diagnostics: diagnostics_enabled,
         });
-        self.state.decision_debug_lines.extend(diagnostics.lines);
+        if diagnostics_enabled {
+            self.state.decision_debug_lines.extend(diagnostics.lines);
+        }
         classes
     }
 
@@ -1191,17 +1328,21 @@ impl<'a> Jbig2Encoder<'a> {
             }
         }
 
+        if encoder_diagnostics_enabled() {
+            if changed {
+                self.state.decision_debug_lines.push(format!(
+                    "alias pass: {} local symbols / {} instances remapped onto globals",
+                    aliased_symbols, aliased_instances
+                ));
+                self.state.decision_debug_lines.extend(alias_samples);
+            } else {
+                self.state
+                    .decision_debug_lines
+                    .push("alias pass: no local symbols remapped onto globals".to_string());
+            }
+        }
         if changed {
-            self.state.decision_debug_lines.push(format!(
-                "alias pass: {} local symbols / {} instances remapped onto globals",
-                aliased_symbols, aliased_instances
-            ));
-            self.state.decision_debug_lines.extend(alias_samples);
             self.compact_symbol_table_after_remap();
-        } else {
-            self.state
-                .decision_debug_lines
-                .push("alias pass: no local symbols remapped onto globals".to_string());
         }
 
         Ok(())
@@ -1214,31 +1355,36 @@ impl<'a> Jbig2Encoder<'a> {
 
         let before_exported = self.global_symbols.len();
         let families = self.build_lossy_symbol_families();
+        let diagnostics_enabled = encoder_diagnostics_enabled();
         if families.is_empty() {
-            self.state
-                .decision_debug_lines
-                .push("collapse: no eligible families".to_string());
+            if diagnostics_enabled {
+                self.state
+                    .decision_debug_lines
+                    .push("collapse: no eligible families".to_string());
+            }
             self.state.lossy_symbol_mode_applied = true;
             return Ok(());
         }
 
-        self.state.decision_debug_lines.push(format!(
-            "collapse: {} families eligible across {} symbols",
-            families.len(),
-            self.global_symbols.len()
-        ));
-        for family in families.iter().take(64) {
+        if diagnostics_enabled {
             self.state.decision_debug_lines.push(format!(
-                "collapse family: prototype={} members={} usage={} total_usage={} page_span={} mode={:?} selector={:?} family_score={}",
-                family.prototype_index,
-                family.members.len() + 1,
-                self.symbol_usage[family.prototype_index],
-                family.total_usage,
-                family.page_span,
-                self.config.lossy_collapse_prototype_mode,
-                self.config.lossy_collapse_prototype_selector_mode,
-                family.prototype_score
+                "collapse: {} families eligible across {} symbols",
+                families.len(),
+                self.global_symbols.len()
             ));
+            for family in families.iter().take(64) {
+                self.state.decision_debug_lines.push(format!(
+                    "collapse family: prototype={} members={} usage={} total_usage={} page_span={} mode={:?} selector={:?} family_score={}",
+                    family.prototype_index,
+                    family.members.len() + 1,
+                    self.symbol_usage[family.prototype_index],
+                    family.total_usage,
+                    family.page_span,
+                    self.config.lossy_collapse_prototype_mode,
+                    self.config.lossy_collapse_prototype_selector_mode,
+                    family.prototype_score
+                ));
+            }
         }
 
         let mut remap: Vec<usize> = (0..self.global_symbols.len()).collect();
@@ -1259,7 +1405,7 @@ impl<'a> Jbig2Encoder<'a> {
             let prototype_page_span = self.symbol_page_count[family.prototype_index];
             let collect_stats = family_index < 64;
             let (prototype, stats) = self.make_lossy_prototype(family, scale_profile, collect_stats);
-            if collect_stats {
+            if diagnostics_enabled && collect_stats {
                 self.state.decision_debug_lines.push(format!(
                     "collapse prototype: prototype={} members={} total_usage={} proto_usage={} proto_pages={} mode={} medoid_black={} output_black={} kept={} removed={} added={} avg_before={:.2} avg_after={:.2}",
                     family.prototype_index,
@@ -1290,12 +1436,14 @@ impl<'a> Jbig2Encoder<'a> {
         }
 
         self.compact_symbol_table_after_remap();
-        self.state.decision_debug_lines.push(format!(
-            "collapse export summary: before={} after={} removed={}",
-            before_exported,
-            self.global_symbols.len(),
-            before_exported.saturating_sub(self.global_symbols.len())
-        ));
+        if diagnostics_enabled {
+            self.state.decision_debug_lines.push(format!(
+                "collapse export summary: before={} after={} removed={}",
+                before_exported,
+                self.global_symbols.len(),
+                before_exported.saturating_sub(self.global_symbols.len())
+            ));
+        }
         self.state.lossy_symbol_mode_applied = true;
         Ok(())
     }
@@ -1305,12 +1453,15 @@ impl<'a> Jbig2Encoder<'a> {
             return Ok(());
         }
 
+        let diagnostics_enabled = encoder_diagnostics_enabled();
         let before_exported = self.global_symbols.len();
         let classes = self.build_symbol_unify_classes();
         if classes.is_empty() {
-            self.state
-                .decision_debug_lines
-                .push("sym_unify: no eligible classes".to_string());
+            if diagnostics_enabled {
+                self.state
+                    .decision_debug_lines
+                    .push("sym_unify: no eligible classes".to_string());
+            }
             self.state.lossy_symbol_mode_applied = true;
             return Ok(());
         }
@@ -1321,29 +1472,31 @@ impl<'a> Jbig2Encoder<'a> {
         let mut retained_border_members = 0usize;
         let mut retained_outlier_members = 0usize;
 
-        self.state.decision_debug_lines.push(format!(
-            "sym_unify: {} classes eligible across {} symbols",
-            classes.len(),
-            self.global_symbols.len()
-        ));
-
-        for class in classes.iter().take(64) {
+        if diagnostics_enabled {
             self.state.decision_debug_lines.push(format!(
-                "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} retained_border={} retained_outliers={} split_fragile={} total_usage={} page_span={} representative_score={} estimated_gain={} subclusters={}",
-                class.representative_index,
-                class.class_size,
-                class.dense_core_size,
-                class.core_members.len(),
-                class.border_members.len(),
-                class.retained_border_members,
-                class.retained_outlier_members,
-                class.split_fragile_members,
-                class.total_usage,
-                class.page_span,
-                class.representative_score,
-                class.estimated_gain,
-                class.candidate_subclusters
+                "sym_unify: {} classes eligible across {} symbols",
+                classes.len(),
+                self.global_symbols.len()
             ));
+
+            for class in classes.iter().take(64) {
+                self.state.decision_debug_lines.push(format!(
+                    "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} retained_border={} retained_outliers={} split_fragile={} total_usage={} page_span={} representative_score={} estimated_gain={} subclusters={}",
+                    class.representative_index,
+                    class.class_size,
+                    class.dense_core_size,
+                    class.core_members.len(),
+                    class.border_members.len(),
+                    class.retained_border_members,
+                    class.retained_outlier_members,
+                    class.split_fragile_members,
+                    class.total_usage,
+                    class.page_span,
+                    class.representative_score,
+                    class.estimated_gain,
+                    class.candidate_subclusters
+                ));
+            }
         }
 
         for class in &classes {
@@ -1369,16 +1522,18 @@ impl<'a> Jbig2Encoder<'a> {
         }
 
         self.compact_symbol_table_after_remap();
-        self.state.decision_debug_lines.push(format!(
-            "sym_unify export summary: before={} after={} removed={} unified_members={} border_unified_members={} retained_border_members={} retained_outlier_members={}",
-            before_exported,
-            self.global_symbols.len(),
-            before_exported.saturating_sub(self.global_symbols.len()),
-            unified_members,
-            border_unified_members,
-            retained_border_members,
-            retained_outlier_members
-        ));
+        if diagnostics_enabled {
+            self.state.decision_debug_lines.push(format!(
+                "sym_unify export summary: before={} after={} removed={} unified_members={} border_unified_members={} retained_border_members={} retained_outlier_members={}",
+                before_exported,
+                self.global_symbols.len(),
+                before_exported.saturating_sub(self.global_symbols.len()),
+                unified_members,
+                border_unified_members,
+                retained_border_members,
+                retained_outlier_members
+            ));
+        }
         self.state.lossy_symbol_mode_applied = true;
         Ok(())
     }
@@ -1825,7 +1980,7 @@ impl<'a> Jbig2Encoder<'a> {
             }
         }
 
-        if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify {
+        if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify && encoder_diagnostics_enabled() {
             let final_anchor_count = sym_unify_anchor_map
                 .as_ref()
                 .map(|anchors| anchors.values().map(Vec::len).sum::<usize>())
@@ -1917,6 +2072,7 @@ impl<'a> Jbig2Encoder<'a> {
 
     fn plan_document(&mut self, include_header: bool) -> Result<PlannedDocument> {
         debug!("Symbol stats before encoding: {}", self.get_symbol_stats());
+        let diagnostics_enabled = encoder_diagnostics_enabled();
         let planning_start = Instant::now();
 
         if self.config.auto_thresh {
@@ -1953,20 +2109,22 @@ impl<'a> Jbig2Encoder<'a> {
             .take(16)
             .collect();
         let multi_page_non_global = multi_page_candidates.len().saturating_sub(global_symbol_indices.len());
-        self.state.decision_debug_lines.push(format!(
-            "planning globals: selected={} multi_page_non_global={} low_value_candidates={}",
-            global_symbol_indices.len(),
-            multi_page_non_global,
-            low_value_global_candidates.len()
-        ));
-        for (symbol_index, usage, page_span, gain) in low_value_global_candidates {
+        if diagnostics_enabled {
             self.state.decision_debug_lines.push(format!(
-                "planning global candidate: symbol={} usage={} page_span={} estimated_global_gain={}",
-                symbol_index,
-                usage,
-                page_span,
-                gain
+                "planning globals: selected={} multi_page_non_global={} low_value_candidates={}",
+                global_symbol_indices.len(),
+                multi_page_non_global,
+                low_value_global_candidates.len()
             ));
+            for (symbol_index, usage, page_span, gain) in low_value_global_candidates {
+                self.state.decision_debug_lines.push(format!(
+                    "planning global candidate: symbol={} usage={} page_span={} estimated_global_gain={}",
+                    symbol_index,
+                    usage,
+                    page_span,
+                    gain
+                ));
+            }
         }
 
         let mut page_local_symbols: Vec<Vec<usize>> = self
@@ -1981,11 +2139,33 @@ impl<'a> Jbig2Encoder<'a> {
             })
             .collect();
         let mut page_residual_symbols = vec![Vec::new(); self.pages.len()];
+        let mut page_residual_anchor_remaps: Vec<FxHashMap<usize, usize>> =
+            (0..self.pages.len()).map(|_| FxHashMap::default()).collect();
         let scale_profile = estimate_collapse_scale_profile(
             &self.global_symbols,
             &self.symbol_signatures,
             &self.symbol_usage,
         );
+        let sym_unify_global_anchor_map = if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify
+        {
+            let mut anchors: FxHashMap<FamilyBucketKey, Vec<usize>> = FxHashMap::default();
+            for &symbol_index in &global_symbol_indices {
+                if !self.sym_unify_anchor_ready(symbol_index, self.pages.len(), scale_profile) {
+                    continue;
+                }
+                let key = family_bucket_key_for_symbol(
+                    &self.global_symbols[symbol_index],
+                    &self.symbol_signatures[symbol_index],
+                );
+                anchors.entry(key).or_default().push(symbol_index);
+            }
+            Some(anchors)
+        } else {
+            None
+        };
+        let mut planning_anchor_comparator = Comparator::default();
+        let mut planning_anchor_attach_count = 0usize;
+        let mut planning_anchor_attach_sample = Vec::new();
         let mut page_uses_generic_region = vec![false; self.pages.len()];
         for (page_num, page) in self.pages.iter().enumerate() {
             if self.config.uses_lossy_symbol_dictionary()
@@ -2003,7 +2183,41 @@ impl<'a> Jbig2Encoder<'a> {
                     if local_use_counts.get(&symbol_index).copied().unwrap_or(0) <= 1
                         && !is_fragile_mark
                     {
-                        page_residual_symbols[page_num].push(symbol_index);
+                        let mut attached_anchor = None;
+                        if let Some(anchor_map) = &sym_unify_global_anchor_map {
+                            let bucket = family_bucket_key_for_symbol(
+                                &self.global_symbols[symbol_index],
+                                &self.symbol_signatures[symbol_index],
+                            );
+                            let mut visited = FxHashSet::default();
+                            'anchor_search: for neighbor in family_bucket_neighbors(bucket) {
+                                let Some(candidates) = anchor_map.get(&neighbor) else {
+                                    continue;
+                                };
+                                for &anchor_index in candidates {
+                                    if anchor_index == symbol_index || !visited.insert(anchor_index) {
+                                        continue;
+                                    }
+                                    if self.residual_symbol_matches_anchor(
+                                        symbol_index,
+                                        anchor_index,
+                                        &mut planning_anchor_comparator,
+                                    ) {
+                                        attached_anchor = Some(anchor_index);
+                                        break 'anchor_search;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(anchor_index) = attached_anchor {
+                            page_residual_anchor_remaps[page_num].insert(symbol_index, anchor_index);
+                            planning_anchor_attach_count += 1;
+                            if planning_anchor_attach_sample.len() < 16 {
+                                planning_anchor_attach_sample.push((page_num + 1, symbol_index, anchor_index));
+                            }
+                        } else {
+                            page_residual_symbols[page_num].push(symbol_index);
+                        }
                     } else {
                         kept_local_symbols.push(symbol_index);
                     }
@@ -2021,6 +2235,7 @@ impl<'a> Jbig2Encoder<'a> {
                 .iter()
                 .all(|inst| {
                     !global_set.contains(&inst.symbol_index)
+                        && !page_residual_anchor_remaps[page_num].contains_key(&inst.symbol_index)
                         && !page_residual_symbols[page_num].contains(&inst.symbol_index)
                 });
             if uses_only_locals
@@ -2034,6 +2249,7 @@ impl<'a> Jbig2Encoder<'a> {
 
             let has_kept_symbol_instances = page.symbol_instances.iter().any(|inst| {
                 global_set.contains(&inst.symbol_index)
+                    || page_residual_anchor_remaps[page_num].contains_key(&inst.symbol_index)
                     || page_local_symbols[page_num].contains(&inst.symbol_index)
             });
             if !has_kept_symbol_instances {
@@ -2043,23 +2259,189 @@ impl<'a> Jbig2Encoder<'a> {
 
         let total_residual_symbols: usize = page_residual_symbols.iter().map(Vec::len).sum();
         let full_generic_pages = page_uses_generic_region.iter().filter(|&&v| v).count();
-        self.state.decision_debug_lines.push(format!(
-            "planning residuals: {} page-local one-off symbols moved to generic residuals",
-            total_residual_symbols
-        ));
-        self.state.decision_debug_lines.push(format!(
-            "planning page modes: full_generic_pages={} text_pages={}",
-            full_generic_pages,
-            self.pages.len().saturating_sub(full_generic_pages)
-        ));
-        for (page_num, residuals) in page_residual_symbols.iter().enumerate().take(32) {
-            if !residuals.is_empty() {
+        if diagnostics_enabled {
+            self.state.decision_debug_lines.push(format!(
+                "planning residuals: {} page-local one-off symbols moved to generic residuals",
+                total_residual_symbols
+            ));
+            self.state.decision_debug_lines.push(format!(
+                "planning page modes: full_generic_pages={} text_pages={}",
+                full_generic_pages,
+                self.pages.len().saturating_sub(full_generic_pages)
+            ));
+            if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify {
                 self.state.decision_debug_lines.push(format!(
-                    "page {} residual symbols: count={} sample={:?}",
-                    page_num + 1,
-                    residuals.len(),
-                    &residuals[..residuals.len().min(8)]
+                    "sym_unify planning anchor remaps: count={}",
+                    planning_anchor_attach_count
                 ));
+                if !planning_anchor_attach_sample.is_empty() {
+                    self.state.decision_debug_lines.push(format!(
+                        "sym_unify planning anchor sample: {:?}",
+                        planning_anchor_attach_sample
+                    ));
+                }
+            }
+        }
+        if diagnostics_enabled
+            && self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify
+            && total_residual_symbols > 0
+        {
+            let mut comparator = Comparator::default();
+            let mut residual_unique = FxHashSet::default();
+            for residuals in &page_residual_symbols {
+                residual_unique.extend(residuals.iter().copied());
+            }
+            let anchor_scale_profile = estimate_collapse_scale_profile(
+                &self.global_symbols,
+                &self.symbol_signatures,
+                &self.symbol_usage,
+            );
+            let anchor_map = self.build_sym_unify_anchor_map(self.pages.len(), anchor_scale_profile);
+            let mut any_global_map: FxHashMap<FamilyBucketKey, Vec<usize>> = FxHashMap::default();
+            for &symbol_index in &global_symbol_indices {
+                let key = family_bucket_key_for_symbol(
+                    &self.global_symbols[symbol_index],
+                    &self.symbol_signatures[symbol_index],
+                );
+                any_global_map.entry(key).or_default().push(symbol_index);
+            }
+            let mut attachable = 0usize;
+            let mut attachable_to_any_global = 0usize;
+            let mut sampled = Vec::new();
+            let mut sampled_any_global = Vec::new();
+            let mut visited = FxHashSet::default();
+            let mut reject_counts: FxHashMap<&'static str, usize> = FxHashMap::default();
+            let mut area_buckets = [0usize; 4];
+            for residual_index in residual_unique.iter().copied() {
+                let symbol = &self.global_symbols[residual_index];
+                let area = symbol.width.saturating_mul(symbol.height);
+                let bucket_index = if area <= 16 {
+                    0
+                } else if area <= 32 {
+                    1
+                } else if area <= 64 {
+                    2
+                } else {
+                    3
+                };
+                area_buckets[bucket_index] += 1;
+                let bucket = family_bucket_key_for_symbol(
+                    symbol,
+                    &self.symbol_signatures[residual_index],
+                );
+                visited.clear();
+                let mut matched_anchor = None;
+                let mut best_reject = SymUnifyAnchorDecision::RejectDim;
+                'anchor_search: for neighbor in family_bucket_neighbors(bucket) {
+                    let Some(candidates) = anchor_map.get(&neighbor) else {
+                        continue;
+                    };
+                    for &anchor_index in candidates {
+                        if anchor_index == residual_index || !visited.insert(anchor_index) {
+                            continue;
+                        }
+                        let decision = self.residual_symbol_anchor_decision(
+                            residual_index,
+                            anchor_index,
+                            &mut comparator,
+                        );
+                        match decision {
+                            SymUnifyAnchorDecision::Accept { .. } => {
+                                matched_anchor = Some(anchor_index);
+                                break 'anchor_search;
+                            }
+                            _ => {
+                                if decision.diagnostic_rank() > best_reject.diagnostic_rank() {
+                                    best_reject = decision;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(anchor_index) = matched_anchor {
+                    attachable += 1;
+                    if sampled.len() < 16 {
+                        sampled.push((residual_index, anchor_index));
+                    }
+                } else {
+                    *reject_counts.entry(best_reject.label()).or_insert(0) += 1;
+                }
+
+                visited.clear();
+                'any_global_search: for neighbor in family_bucket_neighbors(bucket) {
+                    let Some(candidates) = any_global_map.get(&neighbor) else {
+                        continue;
+                    };
+                    for &anchor_index in candidates {
+                        if anchor_index == residual_index || !visited.insert(anchor_index) {
+                            continue;
+                        }
+                        if matches!(
+                            self.residual_symbol_anchor_decision(
+                                residual_index,
+                                anchor_index,
+                                &mut comparator,
+                            ),
+                            SymUnifyAnchorDecision::Accept { .. }
+                        ) {
+                            attachable_to_any_global += 1;
+                            if sampled_any_global.len() < 16 {
+                                sampled_any_global.push((residual_index, anchor_index));
+                            }
+                            break 'any_global_search;
+                        }
+                    }
+                }
+            }
+            self.state.decision_debug_lines.push(format!(
+                "sym_unify residual anchor scan: residual_unique={} attachable_to_current_anchors={} unattached={}",
+                residual_unique.len(),
+                attachable,
+                residual_unique.len().saturating_sub(attachable)
+            ));
+            self.state.decision_debug_lines.push(format!(
+                "sym_unify residual reject breakdown: dim={} pixel_delta={} signature={} overlap={} compare={} outside_ink={} score={} area_le16={} area_le32={} area_le64={} area_gt64={}",
+                reject_counts.get("dim").copied().unwrap_or(0),
+                reject_counts.get("pixel_delta").copied().unwrap_or(0),
+                reject_counts.get("signature").copied().unwrap_or(0),
+                reject_counts.get("overlap").copied().unwrap_or(0),
+                reject_counts.get("compare").copied().unwrap_or(0),
+                reject_counts.get("outside_ink").copied().unwrap_or(0),
+                reject_counts.get("score").copied().unwrap_or(0),
+                area_buckets[0],
+                area_buckets[1],
+                area_buckets[2],
+                area_buckets[3],
+            ));
+            self.state.decision_debug_lines.push(format!(
+                "sym_unify residual any-global scan: residual_unique={} attachable_to_any_global={} extra_beyond_anchor_ready={}",
+                residual_unique.len(),
+                attachable_to_any_global,
+                attachable_to_any_global.saturating_sub(attachable),
+            ));
+            if !sampled.is_empty() {
+                self.state.decision_debug_lines.push(format!(
+                    "sym_unify residual anchor sample: {:?}",
+                    sampled
+                ));
+            }
+            if !sampled_any_global.is_empty() {
+                self.state.decision_debug_lines.push(format!(
+                    "sym_unify residual any-global sample: {:?}",
+                    sampled_any_global
+                ));
+            }
+        }
+        if diagnostics_enabled {
+            for (page_num, residuals) in page_residual_symbols.iter().enumerate().take(32) {
+                if !residuals.is_empty() {
+                    self.state.decision_debug_lines.push(format!(
+                        "page {} residual symbols: count={} sample={:?}",
+                        page_num + 1,
+                        residuals.len(),
+                        &residuals[..residuals.len().min(8)]
+                    ));
+                }
             }
         }
 
@@ -2067,6 +2449,7 @@ impl<'a> Jbig2Encoder<'a> {
             &global_symbol_indices,
             &page_local_symbols,
             &page_residual_symbols,
+            &page_residual_anchor_remaps,
             &page_uses_generic_region,
         )?;
 
@@ -2087,16 +2470,18 @@ impl<'a> Jbig2Encoder<'a> {
                 .collect();
             let dict_layout =
                 plan_symbol_dictionary_layout(&refs, &self.config, Some(&dict_usage))?;
-            self.state.decision_debug_lines.push(format!(
-                "global dict layout: families={} singletons={} refined_members={} exported_members={}",
-                dict_layout.diagnostics.family_count,
-                dict_layout.diagnostics.singleton_family_count,
-                dict_layout.diagnostics.refined_member_count,
-                dict_layout.diagnostics.exported_member_count
-            ));
-            self.state
-                .decision_debug_lines
-                .extend(dict_layout.diagnostics.sample_lines.iter().take(64).cloned());
+            if diagnostics_enabled {
+                self.state.decision_debug_lines.push(format!(
+                    "global dict layout: families={} singletons={} refined_members={} exported_members={}",
+                    dict_layout.diagnostics.family_count,
+                    dict_layout.diagnostics.singleton_family_count,
+                    dict_layout.diagnostics.refined_member_count,
+                    dict_layout.diagnostics.exported_member_count
+                ));
+                self.state
+                    .decision_debug_lines
+                    .extend(dict_layout.diagnostics.sample_lines.iter().take(64).cloned());
+            }
             let dict_start = Instant::now();
             encoded_global_dict =
                 encode_symbol_dictionary_segments(&refs, &self.config, &dict_layout)?;
@@ -2180,22 +2565,24 @@ impl<'a> Jbig2Encoder<'a> {
             };
             let mut local_dict_segment_numbers = Vec::new();
             if let Some(local_dict_layout) = &local_dict_layout {
-                self.state.decision_debug_lines.push(format!(
-                    "page {} local dict layout: families={} singletons={} refined_members={} exported_members={}",
-                    page_num + 1,
-                    local_dict_layout.diagnostics.family_count,
-                    local_dict_layout.diagnostics.singleton_family_count,
-                    local_dict_layout.diagnostics.refined_member_count,
-                    local_dict_layout.diagnostics.exported_member_count
-                ));
-                self.state.decision_debug_lines.extend(
-                    local_dict_layout
-                        .diagnostics
-                        .sample_lines
-                        .iter()
-                        .take(16)
-                        .cloned(),
-                );
+                if diagnostics_enabled {
+                    self.state.decision_debug_lines.push(format!(
+                        "page {} local dict layout: families={} singletons={} refined_members={} exported_members={}",
+                        page_num + 1,
+                        local_dict_layout.diagnostics.family_count,
+                        local_dict_layout.diagnostics.singleton_family_count,
+                        local_dict_layout.diagnostics.refined_member_count,
+                        local_dict_layout.diagnostics.exported_member_count
+                    ));
+                    self.state.decision_debug_lines.extend(
+                        local_dict_layout
+                            .diagnostics
+                            .sample_lines
+                            .iter()
+                            .take(16)
+                            .cloned(),
+                    );
+                }
                 for _ in 0..local_dict_layout.segment_count() {
                     local_dict_segment_numbers.push(current_segment_number);
                     current_segment_number += 1;
@@ -2220,15 +2607,18 @@ impl<'a> Jbig2Encoder<'a> {
             let end_of_page_segment_number = current_segment_number;
             current_segment_number += 1;
             let use_generic_region = page_uses_generic_region[page_num];
-            self.state.decision_debug_lines.push(format!(
-                "page {} plan: full_generic={} residual_region={} local_symbols={} residual_symbols={} instances={}",
-                page_num + 1,
-                use_generic_region,
-                has_residual_region,
-                page_local_symbols[page_num].len(),
-                page_residual_symbols[page_num].len(),
-                page.symbol_instances.len()
-            ));
+            if diagnostics_enabled {
+                self.state.decision_debug_lines.push(format!(
+                    "page {} plan: full_generic={} residual_region={} local_symbols={} residual_symbols={} anchor_remaps={} instances={}",
+                    page_num + 1,
+                    use_generic_region,
+                    has_residual_region,
+                    page_local_symbols[page_num].len(),
+                    page_residual_symbols[page_num].len(),
+                    page_residual_anchor_remaps[page_num].len(),
+                    page.symbol_instances.len()
+                ));
+            }
 
             page_layouts.push(PlannedPageLayout {
                 page_index: page_num,
@@ -2241,6 +2631,7 @@ impl<'a> Jbig2Encoder<'a> {
                 end_of_page_segment_number,
                 local_symbols: page_local_symbols[page_num].clone(),
                 residual_symbols: page_residual_symbols[page_num].clone(),
+                residual_anchor_remaps: page_residual_anchor_remaps[page_num].clone(),
                 use_generic_region,
             });
         }
@@ -2376,6 +2767,7 @@ impl<'a> Jbig2Encoder<'a> {
         {
             let mut referred_to_for_text_region = self.global_dict_segment_numbers.clone();
             let residual_set: HashSet<usize> = layout.residual_symbols.iter().copied().collect();
+            let residual_anchor_remaps = &layout.residual_anchor_remaps;
 
             let mut local_sym_to_dict_pos = vec![u32::MAX; self.global_symbols.len()];
             let mut local_refinement_map = vec![None; self.global_symbols.len()];
@@ -2429,7 +2821,14 @@ impl<'a> Jbig2Encoder<'a> {
             let mut planned_instances = Vec::with_capacity(page.symbol_instances.len());
             let mut residual_instances = Vec::new();
             for instance in &page.symbol_instances {
-                if residual_set.contains(&instance.symbol_index) {
+                if let Some(&anchor_index) = residual_anchor_remaps.get(&instance.symbol_index) {
+                    let mut remapped = instance.clone();
+                    remapped.symbol_index = anchor_index;
+                    remapped.needs_refinement = false;
+                    remapped.refinement_dx = 0;
+                    remapped.refinement_dy = 0;
+                    planned_instances.push(remapped);
+                } else if residual_set.contains(&instance.symbol_index) {
                     residual_instances.push(instance.clone());
                 } else {
                     planned_instances.push(instance.clone());
@@ -2935,6 +3334,7 @@ impl<'a> Jbig2Encoder<'a> {
         global_symbol_indices: &[usize],
         page_local_symbols: &[Vec<usize>],
         page_residual_symbols: &[Vec<usize>],
+        page_residual_anchor_remaps: &[FxHashMap<usize, usize>],
         page_uses_generic_region: &[bool],
     ) -> Result<()> {
         let global_set: HashSet<usize> = global_symbol_indices.iter().copied().collect();
@@ -2948,6 +3348,7 @@ impl<'a> Jbig2Encoder<'a> {
             for inst in &page.symbol_instances {
                 let idx = inst.symbol_index;
                 if !global_set.contains(&idx)
+                    && !page_residual_anchor_remaps[page_num].contains_key(&idx)
                     && !local_set.contains(&idx)
                     && !residual_set.contains(&idx)
                 {
