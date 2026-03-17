@@ -201,7 +201,7 @@ impl Default for Jbig2Config {
             sym_unify_min_page_span: 1,
             sym_unify_min_estimated_gain: 0,
             sym_unify_context_mode: LossyCollapseContextMode::Hybrid,
-            sym_unify_border_score_slack: 2,
+            sym_unify_border_score_slack: 4,
             sym_unify_max_border_outside_ink: 1,
         }
     }
@@ -249,7 +249,7 @@ impl Jbig2Config {
         cfg.sym_unify_min_page_span = 1;
         cfg.sym_unify_min_estimated_gain = 0;
         cfg.sym_unify_context_mode = LossyCollapseContextMode::Hybrid;
-        cfg.sym_unify_border_score_slack = 2;
+        cfg.sym_unify_border_score_slack = 4;
         cfg.sym_unify_max_border_outside_ink = 1;
         cfg
     }

@@ -66,6 +66,18 @@ pub struct HashKey(u64);
 
 const RECENT_SYMBOL_CACHE_CAP: usize = 64;
 
+#[derive(Debug, Clone, Copy)]
+enum SymUnifyAnchorDecision {
+    Accept { score: u32, dx: i32, dy: i32 },
+    RejectDim,
+    RejectPixelDelta,
+    RejectSignature,
+    RejectOverlap,
+    RejectCompare,
+    RejectScore,
+    RejectOutsideInk,
+}
+
 #[derive(Debug)]
 struct RecentSymbolCache {
     recent: VecDeque<usize>,
@@ -236,6 +248,9 @@ pub struct EncoderMetrics {
 pub struct PdfSplitOutput {
     pub global_segments: Option<Vec<u8>>,
     pub page_streams: Vec<Vec<u8>>,
+    pub local_dict_bytes_per_page: Vec<usize>,
+    pub text_region_bytes_per_page: Vec<usize>,
+    pub generic_region_bytes_per_page: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -325,6 +340,7 @@ struct EncoderState {
     use_refinement: bool,
     use_delta_encoding: bool,
     lossy_symbol_mode_applied: bool,
+    ingest_debug_lines: Vec<String>,
     decision_debug_lines: Vec<String>,
 }
 
@@ -395,6 +411,7 @@ impl<'a> Jbig2Encoder<'a> {
                 use_refinement: config.refine, // Enable refinement based on config
                 use_delta_encoding: true,      // Default to using delta encoding
                 lossy_symbol_mode_applied: false,
+                ingest_debug_lines: Vec::new(),
                 decision_debug_lines: Vec::new(),
             },
             global_symbols: Vec::new(),
@@ -428,7 +445,18 @@ impl<'a> Jbig2Encoder<'a> {
     }
 
     pub fn decision_debug_log(&self) -> String {
-        self.state.decision_debug_lines.join("\n")
+        if self.state.ingest_debug_lines.is_empty() {
+            return self.state.decision_debug_lines.join("\n");
+        }
+        if self.state.decision_debug_lines.is_empty() {
+            return self.state.ingest_debug_lines.join("\n");
+        }
+
+        let mut out = String::new();
+        out.push_str(&self.state.ingest_debug_lines.join("\n"));
+        out.push('\n');
+        out.push_str(&self.state.decision_debug_lines.join("\n"));
+        out
     }
 
     /// Returns debug information about symbol usage
@@ -668,19 +696,21 @@ impl<'a> Jbig2Encoder<'a> {
         candidate_pixels: usize,
         symbol_index: usize,
         comparator: &mut Comparator,
-    ) -> Option<(u32, i32, i32)> {
+    ) -> SymUnifyAnchorDecision {
         let proto = &self.global_symbols[symbol_index];
         if candidate.width.abs_diff(proto.width) > 1 || candidate.height.abs_diff(proto.height) > 1 {
-            return None;
+            return SymUnifyAnchorDecision::RejectDim;
         }
 
         let area = candidate
             .width
             .max(proto.width)
             .saturating_mul(candidate.height.max(proto.height));
-        let pixel_delta_limit = (area / 10).clamp(4, 16);
+        let strong_anchor =
+            self.symbol_usage[symbol_index] >= 16 || self.symbol_page_count[symbol_index] >= 6;
+        let pixel_delta_limit = (area / 10).clamp(4, 16) + usize::from(strong_anchor);
         if self.symbol_pixel_counts[symbol_index].abs_diff(candidate_pixels) > pixel_delta_limit {
-            return None;
+            return SymUnifyAnchorDecision::RejectPixelDelta;
         }
 
         if !family_signatures_are_compatible(
@@ -690,37 +720,60 @@ impl<'a> Jbig2Encoder<'a> {
             self.symbol_pixel_counts[symbol_index],
         ) {
             self.metrics.symbol_stats.signature_rejects += 1;
-            return None;
+            return SymUnifyAnchorDecision::RejectSignature;
         }
 
-        let overlap_limit = self.config.sym_unify_max_err.max(4).saturating_add(2).min(14);
-        let overlap = comparator.compare_overlap_only(candidate, proto, overlap_limit)?;
+        let overlap_limit = self
+            .config
+            .sym_unify_max_err
+            .max(4)
+            .saturating_add(2)
+            .saturating_add(u32::from(strong_anchor))
+            .min(15);
+        let Some(overlap) = comparator.compare_overlap_only(candidate, proto, overlap_limit) else {
+            return SymUnifyAnchorDecision::RejectOverlap;
+        };
         if overlap.dx.abs() > self.config.sym_unify_max_dx.max(0)
             || overlap.dy.abs() > self.config.sym_unify_max_dy.max(0)
             || overlap.overlap_err > overlap_limit
             || overlap.black_delta > pixel_delta_limit as u32
         {
-            return None;
+            return SymUnifyAnchorDecision::RejectOverlap;
         }
 
         self.metrics.symbol_stats.comparator_calls += 1;
-        let result = comparator.compare_for_symbol_unify(
+        let compare_max_err = self
+            .config
+            .sym_unify_max_err
+            .max(4)
+            .saturating_add(u32::from(strong_anchor));
+        let Some(result) = comparator.compare_for_symbol_unify(
             candidate,
             proto,
-            self.config.sym_unify_max_err.max(4),
+            compare_max_err,
             self.config.sym_unify_max_dx.max(0),
             self.config.sym_unify_max_dy.max(0),
-        )?;
+        ) else {
+            return SymUnifyAnchorDecision::RejectCompare;
+        };
         self.metrics.symbol_stats.comparator_hits += 1;
 
         let score = Self::symbol_unify_assignment_score(&result);
-        if score > self.config.sym_unify_class_accept_limit
-            || result.outside_ink_err > self.config.sym_unify_max_border_outside_ink.min(1)
-        {
-            return None;
+        let outside_limit =
+            self.config.sym_unify_max_border_outside_ink.min(1) + u32::from(strong_anchor);
+        let score_limit = self.config.sym_unify_class_accept_limit + u32::from(strong_anchor);
+        if result.outside_ink_err > outside_limit {
+            return SymUnifyAnchorDecision::RejectOutsideInk;
+        }
+        if score > score_limit {
+            return SymUnifyAnchorDecision::RejectScore;
         }
 
-        Some((score, result.dx, result.dy))
+        SymUnifyAnchorDecision::Accept {
+            score,
+            dx: result.dx,
+            dy: result.dy,
+        }
     }
 
     fn estimate_local_symbol_gain(&self, page: &PageData, symbol_index: usize) -> i64 {
@@ -734,6 +787,17 @@ impl<'a> Jbig2Encoder<'a> {
         let dict_cost = 24 + (area / 8);
         let saved_per_use = (area / 10).max(2);
         (uses * saved_per_use) - dict_cost
+    }
+
+    fn estimate_global_symbol_gain(&self, symbol_index: usize) -> i64 {
+        let uses = self.symbol_usage[symbol_index] as i64;
+        let page_span = self.symbol_page_count[symbol_index] as i64;
+        let symbol = &self.global_symbols[symbol_index];
+        let area = (symbol.width * symbol.height) as i64;
+        let dict_cost = 24 + (area / 8);
+        let id_savings = ((uses - page_span).max(0)) * 2;
+        let reuse_value = (uses * (area / 12).max(2)) + (page_span * 3);
+        reuse_value + id_savings - dict_cost
     }
 
     fn choose_cluster_prototype(&self, members: &[usize]) -> usize {
@@ -1353,6 +1417,18 @@ impl<'a> Jbig2Encoder<'a> {
         let mut sym_unify_anchor_map = sym_unify_scale_profile.map(|scale_profile| {
             self.build_sym_unify_anchor_map(page_num, scale_profile)
         });
+        let sym_unify_initial_anchor_count = sym_unify_anchor_map
+            .as_ref()
+            .map(|anchors| anchors.values().map(Vec::len).sum::<usize>())
+            .unwrap_or(0);
+        let mut sym_unify_recent_hits = 0usize;
+        let mut sym_unify_anchor_hits = 0usize;
+        let mut sym_unify_bucket_hits = 0usize;
+        let mut sym_unify_new_symbols = 0usize;
+        let mut sym_unify_anchor_score_rejects = 0usize;
+        let mut sym_unify_anchor_outside_rejects = 0usize;
+        let mut sym_unify_anchor_compare_rejects = 0usize;
+        let mut sym_unify_anchor_overlap_rejects = 0usize;
 
         // Extract symbols if symbol mode is enabled
         if self.config.symbol_mode && self.state.segment {
@@ -1489,6 +1565,9 @@ impl<'a> Jbig2Encoder<'a> {
                                         refinement_dy: if needs_refinement { dy } else { 0 },
                                     });
                                     recent_cache.touch(idx);
+                                    if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify {
+                                        sym_unify_recent_hits += 1;
+                                    }
                                     matched = true;
                                     break 'recent_search;
                                 }
@@ -1508,16 +1587,35 @@ impl<'a> Jbig2Encoder<'a> {
                                         if !visited.insert(idx) {
                                             continue;
                                         }
-                                        let Some((score, dx, dy)) = self
+                                        let decision = self
                                             .evaluate_symbol_unify_anchor_match(
                                                 &trimmed,
                                                 trimmed_sig,
                                                 pixel_count,
                                                 idx,
                                                 &mut comparator,
-                                            )
-                                        else {
-                                            continue;
+                                            );
+                                        let (score, dx, dy) = match decision {
+                                            SymUnifyAnchorDecision::Accept { score, dx, dy } => {
+                                                (score, dx, dy)
+                                            }
+                                            SymUnifyAnchorDecision::RejectScore => {
+                                                sym_unify_anchor_score_rejects += 1;
+                                                continue;
+                                            }
+                                            SymUnifyAnchorDecision::RejectOutsideInk => {
+                                                sym_unify_anchor_outside_rejects += 1;
+                                                continue;
+                                            }
+                                            SymUnifyAnchorDecision::RejectCompare => {
+                                                sym_unify_anchor_compare_rejects += 1;
+                                                continue;
+                                            }
+                                            SymUnifyAnchorDecision::RejectOverlap => {
+                                                sym_unify_anchor_overlap_rejects += 1;
+                                                continue;
+                                            }
+                                            _ => continue,
                                         };
 
                                         if debug_matching {
@@ -1557,6 +1655,7 @@ impl<'a> Jbig2Encoder<'a> {
                                             refinement_dy: 0,
                                         });
                                         recent_cache.touch(idx);
+                                        sym_unify_anchor_hits += 1;
                                         matched = true;
                                         break 'anchor_search;
                                     }
@@ -1655,6 +1754,9 @@ impl<'a> Jbig2Encoder<'a> {
                                                 },
                                             });
                                             recent_cache.touch(idx);
+                                            if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify {
+                                                sym_unify_bucket_hits += 1;
+                                            }
                                             matched = true;
                                             break 'bucket_search;
                                         }
@@ -1696,6 +1798,9 @@ impl<'a> Jbig2Encoder<'a> {
                                 refinement_dy: 0,
                             });
                             recent_cache.touch(idx);
+                            if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify {
+                                sym_unify_new_symbols += 1;
+                            }
                         }
                         cc_index += 1;
                     }
@@ -1718,6 +1823,28 @@ impl<'a> Jbig2Encoder<'a> {
                     let _ = writeln!(f, "{}", line);
                 }
             }
+        }
+
+        if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify {
+            let final_anchor_count = sym_unify_anchor_map
+                .as_ref()
+                .map(|anchors| anchors.values().map(Vec::len).sum::<usize>())
+                .unwrap_or(0);
+            self.state.ingest_debug_lines.push(format!(
+                "sym_unify ingest page={}: cc={} recent_hits={} anchor_hits={} bucket_hits={} new_symbols={} initial_anchors={} final_anchors={} anchor_score_rejects={} anchor_outside_rejects={} anchor_compare_rejects={} anchor_overlap_rejects={}",
+                page_num + 1,
+                cc_index,
+                sym_unify_recent_hits,
+                sym_unify_anchor_hits,
+                sym_unify_bucket_hits,
+                sym_unify_new_symbols,
+                sym_unify_initial_anchor_count,
+                final_anchor_count,
+                sym_unify_anchor_score_rejects,
+                sym_unify_anchor_outside_rejects,
+                sym_unify_anchor_compare_rejects,
+                sym_unify_anchor_overlap_rejects,
+            ));
         }
 
         self.pages.push(PageData {
@@ -1771,11 +1898,20 @@ impl<'a> Jbig2Encoder<'a> {
         }
         let plan = self.plan_document(false)?;
         self.validate_plan(&plan)?;
-        let (global_segments, page_streams) = self.serialize_pdf_split(&plan)?;
+        let (
+            global_segments,
+            page_streams,
+            local_dict_bytes_per_page,
+            text_region_bytes_per_page,
+            generic_region_bytes_per_page,
+        ) = self.serialize_pdf_split(&plan)?;
         self.next_segment_number = plan.next_segment_number;
         Ok(PdfSplitOutput {
             global_segments,
             page_streams,
+            local_dict_bytes_per_page,
+            text_region_bytes_per_page,
+            generic_region_bytes_per_page,
         })
     }
 
@@ -1793,13 +1929,45 @@ impl<'a> Jbig2Encoder<'a> {
         self.alias_local_symbols_to_globals()?;
         self.validate_symbol_instance_indices()?;
 
-        let global_symbol_indices: Vec<usize> = self
+        let multi_page_candidates: Vec<usize> = self
             .global_symbols
             .iter()
             .enumerate()
             .filter(|(i, _)| self.symbol_page_count[*i] > 1 || self.pages.len() == 1)
             .map(|(i, _)| i)
             .collect();
+        let global_symbol_indices: Vec<usize> = multi_page_candidates.clone();
+        let global_set: HashSet<usize> = global_symbol_indices.iter().copied().collect();
+        let low_value_global_candidates: Vec<(usize, usize, usize, i64)> = multi_page_candidates
+            .iter()
+            .copied()
+            .filter(|symbol_index| !global_set.contains(symbol_index))
+            .map(|symbol_index| {
+                (
+                    symbol_index,
+                    self.symbol_usage[symbol_index],
+                    self.symbol_page_count[symbol_index],
+                    self.estimate_global_symbol_gain(symbol_index),
+                )
+            })
+            .take(16)
+            .collect();
+        let multi_page_non_global = multi_page_candidates.len().saturating_sub(global_symbol_indices.len());
+        self.state.decision_debug_lines.push(format!(
+            "planning globals: selected={} multi_page_non_global={} low_value_candidates={}",
+            global_symbol_indices.len(),
+            multi_page_non_global,
+            low_value_global_candidates.len()
+        ));
+        for (symbol_index, usage, page_span, gain) in low_value_global_candidates {
+            self.state.decision_debug_lines.push(format!(
+                "planning global candidate: symbol={} usage={} page_span={} estimated_global_gain={}",
+                symbol_index,
+                usage,
+                page_span,
+                gain
+            ));
+        }
 
         let mut page_local_symbols: Vec<Vec<usize>> = self
             .page_symbol_indices
@@ -1808,7 +1976,7 @@ impl<'a> Jbig2Encoder<'a> {
                 symbols
                     .iter()
                     .copied()
-                    .filter(|&i| self.symbol_page_count[i] <= 1)
+                    .filter(|i| !global_set.contains(i))
                     .collect()
             })
             .collect();
@@ -1818,8 +1986,6 @@ impl<'a> Jbig2Encoder<'a> {
             &self.symbol_signatures,
             &self.symbol_usage,
         );
-
-        let global_set: HashSet<usize> = global_symbol_indices.iter().copied().collect();
         let mut page_uses_generic_region = vec![false; self.pages.len()];
         for (page_num, page) in self.pages.iter().enumerate() {
             if self.config.uses_lossy_symbol_dictionary()
@@ -1876,9 +2042,15 @@ impl<'a> Jbig2Encoder<'a> {
         }
 
         let total_residual_symbols: usize = page_residual_symbols.iter().map(Vec::len).sum();
+        let full_generic_pages = page_uses_generic_region.iter().filter(|&&v| v).count();
         self.state.decision_debug_lines.push(format!(
             "planning residuals: {} page-local one-off symbols moved to generic residuals",
             total_residual_symbols
+        ));
+        self.state.decision_debug_lines.push(format!(
+            "planning page modes: full_generic_pages={} text_pages={}",
+            full_generic_pages,
+            self.pages.len().saturating_sub(full_generic_pages)
         ));
         for (page_num, residuals) in page_residual_symbols.iter().enumerate().take(32) {
             if !residuals.is_empty() {
@@ -2048,6 +2220,15 @@ impl<'a> Jbig2Encoder<'a> {
             let end_of_page_segment_number = current_segment_number;
             current_segment_number += 1;
             let use_generic_region = page_uses_generic_region[page_num];
+            self.state.decision_debug_lines.push(format!(
+                "page {} plan: full_generic={} residual_region={} local_symbols={} residual_symbols={} instances={}",
+                page_num + 1,
+                use_generic_region,
+                has_residual_region,
+                page_local_symbols[page_num].len(),
+                page_residual_symbols[page_num].len(),
+                page.symbol_instances.len()
+            ));
 
             page_layouts.push(PlannedPageLayout {
                 page_index: page_num,
@@ -2458,7 +2639,7 @@ impl<'a> Jbig2Encoder<'a> {
     fn serialize_pdf_split(
         &self,
         plan: &PlannedDocument,
-    ) -> Result<(Option<Vec<u8>>, Vec<Vec<u8>>)> {
+    ) -> Result<(Option<Vec<u8>>, Vec<Vec<u8>>, Vec<usize>, Vec<usize>, Vec<usize>)> {
         let global_segments = if plan.global_segments.is_empty() {
             None
         } else {
@@ -2475,12 +2656,23 @@ impl<'a> Jbig2Encoder<'a> {
             .par_iter()
             .map(|page| {
                 let mut page_out = Vec::new();
+                let mut local_dict_bytes = 0usize;
+                let mut text_region_bytes = 0usize;
+                let mut generic_region_bytes = 0usize;
                 for seg in &page.segments {
+                    let start_len = page_out.len();
                     seg.write_into(&mut page_out)?;
+                    let seg_len = page_out.len().saturating_sub(start_len);
+                    match seg.seg_type {
+                        SegmentType::SymbolDictionary => local_dict_bytes += seg_len,
+                        SegmentType::ImmediateTextRegion => text_region_bytes += seg_len,
+                        SegmentType::ImmediateGenericRegion => generic_region_bytes += seg_len,
+                        _ => {}
+                    }
                 }
-                Ok(page_out)
+                Ok((page_out, local_dict_bytes, text_region_bytes, generic_region_bytes))
             })
-            .collect::<Vec<Result<Vec<u8>>>>()
+            .collect::<Vec<Result<(Vec<u8>, usize, usize, usize)>>>()
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
 
@@ -2489,15 +2681,43 @@ impl<'a> Jbig2Encoder<'a> {
             let mut page_streams = Vec::with_capacity(plan.pages.len());
             for page in &plan.pages {
                 let mut page_out = Vec::new();
+                let mut local_dict_bytes = 0usize;
+                let mut text_region_bytes = 0usize;
+                let mut generic_region_bytes = 0usize;
                 for seg in &page.segments {
+                    let start_len = page_out.len();
                     seg.write_into(&mut page_out)?;
+                    let seg_len = page_out.len().saturating_sub(start_len);
+                    match seg.seg_type {
+                        SegmentType::SymbolDictionary => local_dict_bytes += seg_len,
+                        SegmentType::ImmediateTextRegion => text_region_bytes += seg_len,
+                        SegmentType::ImmediateGenericRegion => generic_region_bytes += seg_len,
+                        _ => {}
+                    }
                 }
-                page_streams.push(page_out);
+                page_streams.push((page_out, local_dict_bytes, text_region_bytes, generic_region_bytes));
             }
             page_streams
         };
 
-        Ok((global_segments, page_streams))
+        let mut raw_pages = Vec::with_capacity(page_streams.len());
+        let mut local_dict_bytes_per_page = Vec::with_capacity(page_streams.len());
+        let mut text_region_bytes_per_page = Vec::with_capacity(page_streams.len());
+        let mut generic_region_bytes_per_page = Vec::with_capacity(page_streams.len());
+        for (page_out, local_dict_bytes, text_region_bytes, generic_region_bytes) in page_streams {
+            raw_pages.push(page_out);
+            local_dict_bytes_per_page.push(local_dict_bytes);
+            text_region_bytes_per_page.push(text_region_bytes);
+            generic_region_bytes_per_page.push(generic_region_bytes);
+        }
+
+        Ok((
+            global_segments,
+            raw_pages,
+            local_dict_bytes_per_page,
+            text_region_bytes_per_page,
+            generic_region_bytes_per_page,
+        ))
     }
 
     fn prune_symbols_if_needed(&mut self) {

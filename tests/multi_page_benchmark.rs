@@ -73,11 +73,19 @@ struct BenchRow {
     mpix_per_s: f64,
     raw_jbig2_bytes: usize,
     globals_bytes: usize,
-    savings_vs_generic: f64,
+    local_dict_bytes: usize,
+    text_region_bytes: usize,
+    generic_region_bytes: usize,
+    savings_vs_baseline: f64,
     savings_vs_pbm: f64,
     avg_page_kb: f64,
     min_page_kb: f64,
     max_page_kb: f64,
+    avg_local_dict_kb: f64,
+    max_local_dict_kb: f64,
+    avg_text_region_kb: f64,
+    avg_generic_region_kb: f64,
+    max_generic_region_kb: f64,
     cc_secs: f64,
     match_secs: f64,
     cluster_secs: f64,
@@ -160,6 +168,32 @@ fn raw_jbig2_stats(split: &PdfSplitOutput) -> (usize, usize, Vec<f64>) {
         .collect();
     let raw_pages: usize = split.page_streams.iter().map(|s| s.len()).sum();
     (raw_pages + globals_bytes, globals_bytes, page_sizes_kb)
+}
+
+fn local_dict_stats(split: &PdfSplitOutput) -> (usize, f64, f64) {
+    let total = split.local_dict_bytes_per_page.iter().sum::<usize>();
+    if split.local_dict_bytes_per_page.is_empty() {
+        return (total, 0.0, 0.0);
+    }
+    let avg = total as f64 / split.local_dict_bytes_per_page.len() as f64 / 1024.0;
+    let max = split
+        .local_dict_bytes_per_page
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0) as f64
+        / 1024.0;
+    (total, avg, max)
+}
+
+fn per_page_bytes_stats(values: &[usize]) -> (usize, f64, f64) {
+    let total = values.iter().sum::<usize>();
+    if values.is_empty() {
+        return (total, 0.0, 0.0);
+    }
+    let avg = total as f64 / values.len() as f64 / 1024.0;
+    let max = values.iter().copied().max().unwrap_or(0) as f64 / 1024.0;
+    (total, avg, max)
 }
 
 // ── Fragment writer / decoder ────────────────────────────────────────
@@ -278,11 +312,18 @@ fn bench_source_dir() -> (String, PathBuf) {
 
 fn bench_modes_filter() -> Option<Vec<String>> {
     std::env::var("BENCH_MODES").ok().map(|modes| {
-        modes
+        let mut selected: Vec<String> = modes
             .split(',')
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| !s.is_empty())
-            .collect()
+            .collect();
+        let needs_symbol_control = selected
+            .iter()
+            .any(|mode| mode == "sym_unify" || mode == "sym_collapse");
+        if needs_symbol_control && !selected.iter().any(|mode| mode == "symbol") {
+            selected.insert(0, "symbol".to_string());
+        }
+        selected
     })
 }
 
@@ -535,7 +576,13 @@ fn multi_page_compression_benchmark() {
         "Mode",
         "Raw KB",
         "Globals",
-        "vs Gen",
+        if mode_enabled(mode_filter.as_deref(), "generic") {
+            "vs Gen"
+        } else if mode_enabled(mode_filter.as_deref(), "symbol") {
+            "vs Sym"
+        } else {
+            "vs Base"
+        },
         "Enc (s)",
         "ms/pg",
         "MPix/s",
@@ -550,7 +597,9 @@ fn multi_page_compression_benchmark() {
         let total_pixels: u64 = pages.iter().map(|p| p.width as u64 * p.height as u64).sum();
         let total_pbm_bytes: u64 = pages.iter().map(|p| p.pbm_bytes).sum();
         let run_generic = mode_enabled(mode_filter.as_deref(), "generic");
+        let run_symbol = mode_enabled(mode_filter.as_deref(), "symbol");
         let mut gen_raw = 0usize;
+        let mut symbol_raw = None::<usize>;
 
         // ── Generic baseline ─────────────────────────────────────
         if run_generic {
@@ -596,11 +645,19 @@ fn multi_page_compression_benchmark() {
                 mpix_per_s: gen_mpix,
                 raw_jbig2_bytes: gen_raw,
                 globals_bytes: gen_globals,
-                savings_vs_generic: 0.0,
+                local_dict_bytes: 0,
+                text_region_bytes: 0,
+                generic_region_bytes: raw,
+                savings_vs_baseline: 0.0,
                 savings_vs_pbm: gen_vs_pbm,
                 avg_page_kb: gen_avg_page,
                 min_page_kb: gen_min_page,
                 max_page_kb: gen_max_page,
+                avg_local_dict_kb: 0.0,
+                max_local_dict_kb: 0.0,
+                avg_text_region_kb: 0.0,
+                avg_generic_region_kb: gen_avg_page,
+                max_generic_region_kb: gen_max_page,
                 cc_secs: gen_result.metrics.symbol_mode.cc_extraction.as_secs_f64(),
                 match_secs: gen_result.metrics.symbol_mode.matching_dedup.as_secs_f64(),
                 cluster_secs: gen_result.metrics.symbol_mode.clustering.as_secs_f64(),
@@ -657,6 +714,12 @@ fn multi_page_compression_benchmark() {
             );
 
             let (raw_total, globals_bytes, page_kb) = raw_jbig2_stats(&result.split);
+            let (local_dict_bytes, avg_local_dict_kb, max_local_dict_kb) =
+                local_dict_stats(&result.split);
+            let (text_region_bytes, avg_text_region_kb, _) =
+                per_page_bytes_stats(&result.split.text_region_bytes_per_page);
+            let (generic_region_bytes, avg_generic_region_kb, max_generic_region_kb) =
+                per_page_bytes_stats(&result.split.generic_region_bytes_per_page);
             if write_outputs {
                 write_fragments_and_decode(
                     &result.split,
@@ -672,8 +735,12 @@ fn multi_page_compression_benchmark() {
                 .unwrap_or_else(|e| panic!("write {label} decision log failed: {e}"));
             }
 
-            let savings_gen = if run_generic {
+            let savings_baseline = if run_generic {
                 (1.0 - raw_total as f64 / gen_raw as f64) * 100.0
+            } else if run_symbol && *label != "symbol" {
+                symbol_raw
+                    .map(|base| (1.0 - raw_total as f64 / base as f64) * 100.0)
+                    .unwrap_or(0.0)
             } else {
                 0.0
             };
@@ -690,7 +757,7 @@ fn multi_page_compression_benchmark() {
                 label,
                 raw_total as f64 / 1024.0,
                 globals_bytes as f64 / 1024.0,
-                if run_generic { savings_gen } else { 0.0 },
+                savings_baseline,
                 result.encode_secs,
                 ms,
                 mpix,
@@ -705,11 +772,19 @@ fn multi_page_compression_benchmark() {
                 mpix_per_s: mpix,
                 raw_jbig2_bytes: raw_total,
                 globals_bytes,
-                savings_vs_generic: savings_gen,
+                local_dict_bytes,
+                text_region_bytes,
+                generic_region_bytes,
+                savings_vs_baseline: savings_baseline,
                 savings_vs_pbm: savings_pbm,
                 avg_page_kb: avg_page,
                 min_page_kb: min_page,
                 max_page_kb: max_page,
+                avg_local_dict_kb,
+                max_local_dict_kb,
+                avg_text_region_kb,
+                avg_generic_region_kb,
+                max_generic_region_kb,
                 cc_secs: result.metrics.symbol_mode.cc_extraction.as_secs_f64(),
                 match_secs: result.metrics.symbol_mode.matching_dedup.as_secs_f64(),
                 cluster_secs: result.metrics.symbol_mode.clustering.as_secs_f64(),
@@ -735,6 +810,10 @@ fn multi_page_compression_benchmark() {
                 global_symbol_count: result.metrics.symbol_stats.global_symbol_count,
                 local_symbol_count: result.metrics.symbol_stats.local_symbol_count,
             });
+
+            if *label == "symbol" {
+                symbol_raw = Some(raw_total);
+            }
         }
         println!();
     }
@@ -744,10 +823,18 @@ fn multi_page_compression_benchmark() {
     for row in &all_rows {
         if row.mode != "generic" {
             println!(
-                "  {} {}p: globals {:.1}KB, pages avg {:.1}KB min {:.1}KB max {:.1}KB",
+                "  {} {}p: globals {:.1}KB, local dicts {:.1}KB avg {:.2}KB/page max {:.2}KB, text {:.1}KB avg {:.2}KB/page, generic {:.1}KB avg {:.2}KB/page max {:.2}KB, pages avg {:.1}KB min {:.1}KB max {:.1}KB",
                 row.mode,
                 row.pages,
                 row.globals_bytes as f64 / 1024.0,
+                row.local_dict_bytes as f64 / 1024.0,
+                row.avg_local_dict_kb,
+                row.max_local_dict_kb,
+                row.text_region_bytes as f64 / 1024.0,
+                row.avg_text_region_kb,
+                row.generic_region_bytes as f64 / 1024.0,
+                row.avg_generic_region_kb,
+                row.max_generic_region_kb,
                 row.avg_page_kb,
                 row.min_page_kb,
                 row.max_page_kb
@@ -775,11 +862,11 @@ fn multi_page_compression_benchmark() {
     if write_outputs {
         let csv_path = out_dir.join("results.csv");
         let mut csv = String::from(
-            "pages,mode,encode_secs,ms_per_page,mpix_per_s,raw_jbig2_bytes,globals_bytes,savings_vs_generic,savings_vs_pbm,cc_secs,match_secs,cluster_secs,planning_secs,dict_secs,text_secs,generic_secs,symbols_discovered,symbols_exported,avg_symbol_reuse,global_symbol_count,local_symbol_count\n",
+            "pages,mode,encode_secs,ms_per_page,mpix_per_s,raw_jbig2_bytes,globals_bytes,local_dict_bytes,text_region_bytes,generic_region_bytes,savings_vs_baseline,savings_vs_pbm,cc_secs,match_secs,cluster_secs,planning_secs,dict_secs,text_secs,generic_secs,symbols_discovered,symbols_exported,avg_symbol_reuse,global_symbol_count,local_symbol_count,avg_local_dict_kb,max_local_dict_kb,avg_text_region_kb,avg_generic_region_kb,max_generic_region_kb\n",
         );
         for row in &all_rows {
             csv += &format!(
-                "{},{},{:.4},{:.2},{:.2},{},{},{:.2},{:.2},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{},{:.4},{},{}\n",
+                "{},{},{:.4},{:.2},{:.2},{},{},{},{},{},{:.2},{:.2},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{},{:.4},{},{},{:.4},{:.4},{:.4},{:.4},{:.4}\n",
                 row.pages,
                 row.mode,
                 row.encode_secs,
@@ -787,7 +874,10 @@ fn multi_page_compression_benchmark() {
                 row.mpix_per_s,
                 row.raw_jbig2_bytes,
                 row.globals_bytes,
-                row.savings_vs_generic,
+                row.local_dict_bytes,
+                row.text_region_bytes,
+                row.generic_region_bytes,
+                row.savings_vs_baseline,
                 row.savings_vs_pbm,
                 row.cc_secs,
                 row.match_secs,
@@ -800,7 +890,12 @@ fn multi_page_compression_benchmark() {
                 row.symbols_exported,
                 row.avg_symbol_reuse,
                 row.global_symbol_count,
-                row.local_symbol_count
+                row.local_symbol_count,
+                row.avg_local_dict_kb,
+                row.max_local_dict_kb,
+                row.avg_text_region_kb,
+                row.avg_generic_region_kb,
+                row.max_generic_region_kb
             );
         }
         std::fs::write(&csv_path, csv).unwrap();
