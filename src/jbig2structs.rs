@@ -67,6 +67,19 @@ pub struct Jbig2Config {
     pub lossy_collapse_context_mode: LossyCollapseContextMode,
     pub lossy_collapse_prototype_mode: LossyCollapsePrototypeMode,
     pub lossy_collapse_prototype_selector_mode: LossyCollapsePrototypeSelectorMode,
+    pub sym_unify_min_class_size: usize,
+    pub sym_unify_max_err: u32,
+    pub sym_unify_max_dx: i32,
+    pub sym_unify_max_dy: i32,
+    pub sym_unify_class_accept_limit: u32,
+    pub sym_unify_core_close_threshold: u32,
+    pub sym_unify_min_core_ratio_permille: u16,
+    pub sym_unify_min_class_usage: usize,
+    pub sym_unify_min_page_span: usize,
+    pub sym_unify_min_estimated_gain: i32,
+    pub sym_unify_context_mode: LossyCollapseContextMode,
+    pub sym_unify_border_score_slack: u32,
+    pub sym_unify_max_border_outside_ink: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +190,19 @@ impl Default for Jbig2Config {
             lossy_collapse_context_mode: LossyCollapseContextMode::Hybrid,
             lossy_collapse_prototype_mode: LossyCollapsePrototypeMode::MedoidThenCleanup,
             lossy_collapse_prototype_selector_mode: LossyCollapsePrototypeSelectorMode::Baseline,
+            sym_unify_min_class_size: 2,
+            sym_unify_max_err: 12,
+            sym_unify_max_dx: 1,
+            sym_unify_max_dy: 1,
+            sym_unify_class_accept_limit: 16,
+            sym_unify_core_close_threshold: 11,
+            sym_unify_min_core_ratio_permille: 350,
+            sym_unify_min_class_usage: 2,
+            sym_unify_min_page_span: 1,
+            sym_unify_min_estimated_gain: 0,
+            sym_unify_context_mode: LossyCollapseContextMode::Hybrid,
+            sym_unify_border_score_slack: 2,
+            sym_unify_max_border_outside_ink: 1,
         }
     }
 }
@@ -212,6 +238,19 @@ impl Jbig2Config {
         cfg.lossy_symbol_mode = LossySymbolMode::SymbolUnify;
         cfg.refine = false;
         cfg.text_refine = false;
+        cfg.sym_unify_min_class_size = 2;
+        cfg.sym_unify_max_err = 12;
+        cfg.sym_unify_max_dx = 1;
+        cfg.sym_unify_max_dy = 1;
+        cfg.sym_unify_class_accept_limit = 16;
+        cfg.sym_unify_core_close_threshold = 11;
+        cfg.sym_unify_min_core_ratio_permille = 350;
+        cfg.sym_unify_min_class_usage = 2;
+        cfg.sym_unify_min_page_span = 1;
+        cfg.sym_unify_min_estimated_gain = 0;
+        cfg.sym_unify_context_mode = LossyCollapseContextMode::Hybrid;
+        cfg.sym_unify_border_score_slack = 2;
+        cfg.sym_unify_max_border_outside_ink = 1;
         cfg
     }
 

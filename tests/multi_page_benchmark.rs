@@ -1,7 +1,7 @@
 //! Multi-page JBIG2 compression benchmark
 //!
 //! Measures encode performance and compression for generic, symbol, and
-//! experimental symbol+refinement modes.
+//! experimental symbol-dictionary modes.
 //! Separates encode time from fragment writing / decode verification and disk I/O.
 //!
 //! Run with:
@@ -12,7 +12,7 @@
 //!                   example: BENCH_PAGES=1,5,10,20,50,100,all
 //!   BENCH_SOURCE  — dataset folder under repo root (default: "confed")
 //!   BENCH_WRITE   — set to "0" to disable writing JBIG2 fragments + decoded PBMs (default: write)
-//!   BENCH_MODES   — comma-separated modes to run: `generic`, `symbol`, `sym_collapse`, `sym_unify`, `sym_refine`
+//!   BENCH_MODES   — comma-separated modes to run: `generic`, `symbol`, `sym_collapse`, `sym_unify`
 //!   BENCH_COLLAPSE_MIN_FAMILY
 //!   BENCH_COLLAPSE_MIN_USAGE
 //!   BENCH_COLLAPSE_MIN_TOTAL_USAGE
@@ -21,6 +21,18 @@
 //!   BENCH_COLLAPSE_MAX_ERR
 //!   BENCH_COLLAPSE_MAX_DX
 //!   BENCH_COLLAPSE_MAX_DY
+//!   BENCH_UNIFY_MIN_CLASS
+//!   BENCH_UNIFY_MAX_ERR
+//!   BENCH_UNIFY_MAX_DX
+//!   BENCH_UNIFY_MAX_DY
+//!   BENCH_UNIFY_CLASS_ACCEPT
+//!   BENCH_UNIFY_CORE_CLOSE
+//!   BENCH_UNIFY_MIN_CORE_RATIO
+//!   BENCH_UNIFY_MIN_CLASS_USAGE
+//!   BENCH_UNIFY_MIN_PAGE_SPAN
+//!   BENCH_UNIFY_MIN_GAIN
+//!   BENCH_UNIFY_BORDER_SLACK
+//!   BENCH_UNIFY_MAX_BORDER_OUTSIDE
 //!   BENCH_COLLAPSE_MIN_WIDTH_RATIO
 //!   BENCH_COLLAPSE_MIN_HEIGHT_RATIO
 //!   BENCH_COLLAPSE_MIN_BLACK_RATIO
@@ -324,6 +336,18 @@ fn collapse_context_mode() -> LossyCollapseContextMode {
     }
 }
 
+fn unify_context_mode() -> LossyCollapseContextMode {
+    std::env::var("BENCH_UNIFY_CONTEXT_MODE")
+        .ok()
+        .and_then(|value| match value.to_ascii_lowercase().as_str() {
+            "jaccard" => Some(LossyCollapseContextMode::WeightedJaccard),
+            "cosine" => Some(LossyCollapseContextMode::Cosine),
+            "hybrid" => Some(LossyCollapseContextMode::Hybrid),
+            _ => None,
+        })
+        .unwrap_or(LossyCollapseContextMode::Hybrid)
+}
+
 fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig2Config)> {
     let mut cfgs = vec![];
 
@@ -377,53 +401,50 @@ fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig
     let mut cfg_unify = Jbig2Config::text_symbol_unify();
     cfg_unify.auto_thresh = false;
     cfg_unify.want_full_headers = false;
-    cfg_unify.lossy_collapse_min_family_size =
-        env_parse_or("BENCH_COLLAPSE_MIN_FAMILY", cfg_unify.lossy_collapse_min_family_size);
-    cfg_unify.lossy_collapse_min_usage =
-        env_parse_or("BENCH_COLLAPSE_MIN_USAGE", cfg_unify.lossy_collapse_min_usage);
-    cfg_unify.lossy_collapse_min_total_usage = env_parse_or(
-        "BENCH_COLLAPSE_MIN_TOTAL_USAGE",
-        cfg_unify.lossy_collapse_min_total_usage,
+    cfg_unify.sym_unify_min_class_size =
+        env_parse_or("BENCH_UNIFY_MIN_CLASS", cfg_unify.sym_unify_min_class_size);
+    cfg_unify.sym_unify_max_err =
+        env_parse_or("BENCH_UNIFY_MAX_ERR", cfg_unify.sym_unify_max_err);
+    cfg_unify.sym_unify_max_dx =
+        env_parse_or("BENCH_UNIFY_MAX_DX", cfg_unify.sym_unify_max_dx);
+    cfg_unify.sym_unify_max_dy =
+        env_parse_or("BENCH_UNIFY_MAX_DY", cfg_unify.sym_unify_max_dy);
+    cfg_unify.sym_unify_class_accept_limit = env_parse_or(
+        "BENCH_UNIFY_CLASS_ACCEPT",
+        cfg_unify.sym_unify_class_accept_limit,
     );
-    cfg_unify.lossy_collapse_min_prototype_usage = env_parse_or(
-        "BENCH_COLLAPSE_MIN_PROTO_USAGE",
-        cfg_unify.lossy_collapse_min_prototype_usage,
+    cfg_unify.sym_unify_core_close_threshold = env_parse_or(
+        "BENCH_UNIFY_CORE_CLOSE",
+        cfg_unify.sym_unify_core_close_threshold,
     );
-    cfg_unify.lossy_collapse_min_page_span = env_parse_or(
-        "BENCH_COLLAPSE_MIN_PAGE_SPAN",
-        cfg_unify.lossy_collapse_min_page_span,
+    cfg_unify.sym_unify_min_core_ratio_permille = env_parse_or(
+        "BENCH_UNIFY_MIN_CORE_RATIO",
+        cfg_unify.sym_unify_min_core_ratio_permille,
     );
-    cfg_unify.lossy_collapse_max_err =
-        env_parse_or("BENCH_COLLAPSE_MAX_ERR", cfg_unify.lossy_collapse_max_err);
-    cfg_unify.lossy_collapse_max_dx =
-        env_parse_or("BENCH_COLLAPSE_MAX_DX", cfg_unify.lossy_collapse_max_dx);
-    cfg_unify.lossy_collapse_max_dy =
-        env_parse_or("BENCH_COLLAPSE_MAX_DY", cfg_unify.lossy_collapse_max_dy);
-    cfg_unify.lossy_collapse_min_width_ratio_permille = env_parse_or(
-        "BENCH_COLLAPSE_MIN_WIDTH_RATIO",
-        cfg_unify.lossy_collapse_min_width_ratio_permille,
+    cfg_unify.sym_unify_min_class_usage = env_parse_or(
+        "BENCH_UNIFY_MIN_CLASS_USAGE",
+        cfg_unify.sym_unify_min_class_usage,
     );
-    cfg_unify.lossy_collapse_min_height_ratio_permille = env_parse_or(
-        "BENCH_COLLAPSE_MIN_HEIGHT_RATIO",
-        cfg_unify.lossy_collapse_min_height_ratio_permille,
+    cfg_unify.sym_unify_min_page_span = env_parse_or(
+        "BENCH_UNIFY_MIN_PAGE_SPAN",
+        cfg_unify.sym_unify_min_page_span,
     );
-    cfg_unify.lossy_collapse_min_black_ratio_permille = env_parse_or(
-        "BENCH_COLLAPSE_MIN_BLACK_RATIO",
-        cfg_unify.lossy_collapse_min_black_ratio_permille,
+    cfg_unify.sym_unify_min_estimated_gain = env_parse_or(
+        "BENCH_UNIFY_MIN_GAIN",
+        cfg_unify.sym_unify_min_estimated_gain,
     );
-    cfg_unify.lossy_collapse_context_mode = collapse_context_mode();
+    cfg_unify.sym_unify_border_score_slack = env_parse_or(
+        "BENCH_UNIFY_BORDER_SLACK",
+        cfg_unify.sym_unify_border_score_slack,
+    );
+    cfg_unify.sym_unify_max_border_outside_ink = env_parse_or(
+        "BENCH_UNIFY_MAX_BORDER_OUTSIDE",
+        cfg_unify.sym_unify_max_border_outside_ink,
+    );
+    cfg_unify.sym_unify_context_mode = unify_context_mode();
     cfgs.push(("sym_unify", cfg_unify));
 
     let _ = (count, total_pixels);
-    #[cfg(feature = "refine")]
-    {
-        let mut cfg_refine = Jbig2Config::text();
-        cfg_refine.auto_thresh = false;
-        cfg_refine.want_full_headers = false;
-        cfg_refine.refine = true;
-        cfg_refine.text_refine = false;
-        cfgs.push(("sym_refine", cfg_refine));
-    }
 
     cfgs
 }

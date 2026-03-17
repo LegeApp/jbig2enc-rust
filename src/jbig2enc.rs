@@ -6,7 +6,7 @@ use crate::jbig2collapse::{
     compute_symbol_signature as compute_symbol_signature_shared,
     estimate_collapse_scale_profile, symbol_looks_like_fragile_mark,
     family_bucket_key_for_symbol, family_bucket_neighbors, family_match_details,
-    refine_compare_score,
+    family_signatures_are_compatible, refine_compare_score,
 };
 use crate::jbig2comparator::{
     Comparator, MAX_DIMENSION_DELTA,
@@ -532,6 +532,80 @@ impl<'a> Jbig2Encoder<'a> {
         (false, false)
     }
 
+    #[inline]
+    fn symbol_unify_assignment_score(result: &crate::jbig2comparator::CompareResult) -> u32 {
+        result
+            .total_err
+            .saturating_add(result.black_delta.saturating_mul(2))
+            .saturating_add(result.outside_ink_err.saturating_mul(3))
+            .saturating_add(((result.dx.abs() + result.dy.abs()) as u32).saturating_mul(3))
+            .saturating_add((result.row_profile_err + result.col_profile_err) / 24)
+    }
+
+    #[inline]
+    fn sym_unify_anchor_ready(
+        &self,
+        symbol_index: usize,
+        page_num: usize,
+        scale_profile: crate::jbig2collapse::CollapseScaleProfile,
+    ) -> bool {
+        if self.symbol_usage[symbol_index] < 2
+            || self.symbol_pixel_counts[symbol_index] <= 1
+            || self.symbol_index_is_fragile_mark(symbol_index, scale_profile)
+        {
+            return false;
+        }
+
+        let usage_ready = self.symbol_usage[symbol_index] >= self.config.sym_unify_min_class_usage.max(2);
+        let page_span_ready =
+            self.symbol_page_count[symbol_index] >= self.config.sym_unify_min_page_span.max(2);
+        let recent_ready = self.symbol_last_page_seen[symbol_index]
+            .map(|last| page_num.saturating_sub(last) <= 1)
+            .unwrap_or(false)
+            && self.symbol_usage[symbol_index] >= 3;
+
+        usage_ready || page_span_ready || recent_ready
+    }
+
+    fn build_sym_unify_anchor_map(
+        &self,
+        page_num: usize,
+        scale_profile: crate::jbig2collapse::CollapseScaleProfile,
+    ) -> FxHashMap<FamilyBucketKey, Vec<usize>> {
+        let mut anchors: FxHashMap<FamilyBucketKey, Vec<usize>> = FxHashMap::default();
+        for symbol_index in 0..self.global_symbols.len() {
+            if !self.sym_unify_anchor_ready(symbol_index, page_num, scale_profile) {
+                continue;
+            }
+            let key = family_bucket_key_for_symbol(
+                &self.global_symbols[symbol_index],
+                &self.symbol_signatures[symbol_index],
+            );
+            anchors.entry(key).or_default().push(symbol_index);
+        }
+        anchors
+    }
+
+    fn maybe_add_sym_unify_anchor(
+        &self,
+        anchors: &mut FxHashMap<FamilyBucketKey, Vec<usize>>,
+        symbol_index: usize,
+        page_num: usize,
+        scale_profile: crate::jbig2collapse::CollapseScaleProfile,
+    ) {
+        if !self.sym_unify_anchor_ready(symbol_index, page_num, scale_profile) {
+            return;
+        }
+        let key = family_bucket_key_for_symbol(
+            &self.global_symbols[symbol_index],
+            &self.symbol_signatures[symbol_index],
+        );
+        let bucket = anchors.entry(key).or_default();
+        if !bucket.contains(&symbol_index) {
+            bucket.push(symbol_index);
+        }
+    }
+
     #[inline(always)]
     fn evaluate_symbol_match(
         &mut self,
@@ -584,6 +658,69 @@ impl<'a> Jbig2Encoder<'a> {
         }
 
         Some((err, dx, dy, needs_refinement))
+    }
+
+    #[inline(always)]
+    fn evaluate_symbol_unify_anchor_match(
+        &mut self,
+        candidate: &BitImage,
+        candidate_sig: SymbolSignature,
+        candidate_pixels: usize,
+        symbol_index: usize,
+        comparator: &mut Comparator,
+    ) -> Option<(u32, i32, i32)> {
+        let proto = &self.global_symbols[symbol_index];
+        if candidate.width.abs_diff(proto.width) > 1 || candidate.height.abs_diff(proto.height) > 1 {
+            return None;
+        }
+
+        let area = candidate
+            .width
+            .max(proto.width)
+            .saturating_mul(candidate.height.max(proto.height));
+        let pixel_delta_limit = (area / 10).clamp(4, 16);
+        if self.symbol_pixel_counts[symbol_index].abs_diff(candidate_pixels) > pixel_delta_limit {
+            return None;
+        }
+
+        if !family_signatures_are_compatible(
+            candidate_sig,
+            self.symbol_signatures[symbol_index],
+            candidate_pixels,
+            self.symbol_pixel_counts[symbol_index],
+        ) {
+            self.metrics.symbol_stats.signature_rejects += 1;
+            return None;
+        }
+
+        let overlap_limit = self.config.sym_unify_max_err.max(4).saturating_add(2).min(14);
+        let overlap = comparator.compare_overlap_only(candidate, proto, overlap_limit)?;
+        if overlap.dx.abs() > self.config.sym_unify_max_dx.max(0)
+            || overlap.dy.abs() > self.config.sym_unify_max_dy.max(0)
+            || overlap.overlap_err > overlap_limit
+            || overlap.black_delta > pixel_delta_limit as u32
+        {
+            return None;
+        }
+
+        self.metrics.symbol_stats.comparator_calls += 1;
+        let result = comparator.compare_for_symbol_unify(
+            candidate,
+            proto,
+            self.config.sym_unify_max_err.max(4),
+            self.config.sym_unify_max_dx.max(0),
+            self.config.sym_unify_max_dy.max(0),
+        )?;
+        self.metrics.symbol_stats.comparator_hits += 1;
+
+        let score = Self::symbol_unify_assignment_score(&result);
+        if score > self.config.sym_unify_class_accept_limit
+            || result.outside_ink_err > self.config.sym_unify_max_border_outside_ink.min(1)
+        {
+            return None;
+        }
+
+        Some((score, result.dx, result.dy))
     }
 
     fn estimate_local_symbol_gain(&self, page: &PageData, symbol_index: usize) -> i64 {
@@ -1116,7 +1253,9 @@ impl<'a> Jbig2Encoder<'a> {
 
         let mut remap: Vec<usize> = (0..self.global_symbols.len()).collect();
         let mut unified_members = 0usize;
+        let mut border_unified_members = 0usize;
         let mut retained_border_members = 0usize;
+        let mut retained_outlier_members = 0usize;
 
         self.state.decision_debug_lines.push(format!(
             "sym_unify: {} classes eligible across {} symbols",
@@ -1126,24 +1265,33 @@ impl<'a> Jbig2Encoder<'a> {
 
         for class in classes.iter().take(64) {
             self.state.decision_debug_lines.push(format!(
-                "sym_unify class: representative={} class_size={} core_size={} unified={} retained_border={} total_usage={} page_span={} representative_score={} subclusters={}",
+                "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} retained_border={} retained_outliers={} split_fragile={} total_usage={} page_span={} representative_score={} estimated_gain={} subclusters={}",
                 class.representative_index,
                 class.class_size,
                 class.dense_core_size,
                 class.core_members.len(),
+                class.border_members.len(),
                 class.retained_border_members,
+                class.retained_outlier_members,
+                class.split_fragile_members,
                 class.total_usage,
                 class.page_span,
                 class.representative_score,
+                class.estimated_gain,
                 class.candidate_subclusters
             ));
         }
 
         for class in &classes {
             retained_border_members += class.retained_border_members;
+            retained_outlier_members += class.retained_outlier_members;
             for member in &class.core_members {
                 remap[member.member_index] = class.representative_index;
                 unified_members += 1;
+            }
+            for member in &class.border_members {
+                remap[member.member_index] = class.representative_index;
+                border_unified_members += 1;
             }
         }
 
@@ -1158,12 +1306,14 @@ impl<'a> Jbig2Encoder<'a> {
 
         self.compact_symbol_table_after_remap();
         self.state.decision_debug_lines.push(format!(
-            "sym_unify export summary: before={} after={} removed={} unified_members={} retained_border_members={}",
+            "sym_unify export summary: before={} after={} removed={} unified_members={} border_unified_members={} retained_border_members={} retained_outlier_members={}",
             before_exported,
             self.global_symbols.len(),
             before_exported.saturating_sub(self.global_symbols.len()),
             unified_members,
-            retained_border_members
+            border_unified_members,
+            retained_border_members,
+            retained_outlier_members
         ));
         self.state.lossy_symbol_mode_applied = true;
         Ok(())
@@ -1189,6 +1339,20 @@ impl<'a> Jbig2Encoder<'a> {
             debug_lines.push(format!("Image: {}x{}", bitimage.width, bitimage.height));
         }
         let mut cc_index = 0usize;
+        let sym_unify_scale_profile = if self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify
+            && !self.global_symbols.is_empty()
+        {
+            Some(estimate_collapse_scale_profile(
+                &self.global_symbols,
+                &self.symbol_signatures,
+                &self.symbol_usage,
+            ))
+        } else {
+            None
+        };
+        let mut sym_unify_anchor_map = sym_unify_scale_profile.map(|scale_profile| {
+            self.build_sym_unify_anchor_map(page_num, scale_profile)
+        });
 
         // Extract symbols if symbol mode is enabled
         if self.config.symbol_mode && self.state.segment {
@@ -1331,6 +1495,75 @@ impl<'a> Jbig2Encoder<'a> {
                             }
                         }
 
+                        if !matched && !no_reuse && self.config.lossy_symbol_mode == LossySymbolMode::SymbolUnify
+                        {
+                            if let Some(anchor_map) = sym_unify_anchor_map.as_mut() {
+                                let anchor_key = family_bucket_key_for_symbol(&trimmed, &trimmed_sig);
+                                let mut visited = FxHashSet::default();
+                                'anchor_search: for neighbor in family_bucket_neighbors(anchor_key) {
+                                    let Some(bucket) = anchor_map.get(&neighbor) else {
+                                        continue;
+                                    };
+                                    for &idx in bucket {
+                                        if !visited.insert(idx) {
+                                            continue;
+                                        }
+                                        let Some((score, dx, dy)) = self
+                                            .evaluate_symbol_unify_anchor_match(
+                                                &trimmed,
+                                                trimmed_sig,
+                                                pixel_count,
+                                                idx,
+                                                &mut comparator,
+                                            )
+                                        else {
+                                            continue;
+                                        };
+
+                                        if debug_matching {
+                                            let proto = &self.global_symbols[idx];
+                                            debug_lines.push(format!(
+                                                "CC#{:04} UNIFY  pos=({},{}) {}x{} → proto#{} {}x{} score={} dx={} dy={} [anchor]",
+                                                cc_index,
+                                                rect.x,
+                                                rect.y,
+                                                rect.width,
+                                                rect.height,
+                                                idx,
+                                                proto.width,
+                                                proto.height,
+                                                score,
+                                                dx,
+                                                dy
+                                            ));
+                                        }
+
+                                        self.symbol_usage[idx] += 1;
+                                        self.note_symbol_page(idx, page_num);
+                                        if let Some(scale_profile) = sym_unify_scale_profile {
+                                            self.maybe_add_sym_unify_anchor(
+                                                anchor_map,
+                                                idx,
+                                                page_num,
+                                                scale_profile,
+                                            );
+                                        }
+                                        symbol_instances.push(SymbolInstance {
+                                            symbol_index: idx,
+                                            position: rect,
+                                            instance_bitmap: instance_bitmap.take().unwrap(),
+                                            needs_refinement: false,
+                                            refinement_dx: 0,
+                                            refinement_dy: 0,
+                                        });
+                                        recent_cache.touch(idx);
+                                        matched = true;
+                                        break 'anchor_search;
+                                    }
+                                }
+                            }
+                        }
+
                         if !matched && !no_reuse {
                             let h = trimmed.height as u64;
                             let w = trimmed.width as u64;
@@ -1394,6 +1627,17 @@ impl<'a> Jbig2Encoder<'a> {
 
                                             self.symbol_usage[idx] += 1;
                                             self.note_symbol_page(idx, page_num);
+                                            if let (Some(anchor_map), Some(scale_profile)) = (
+                                                sym_unify_anchor_map.as_mut(),
+                                                sym_unify_scale_profile,
+                                            ) {
+                                                self.maybe_add_sym_unify_anchor(
+                                                    anchor_map,
+                                                    idx,
+                                                    page_num,
+                                                    scale_profile,
+                                                );
+                                            }
                                             symbol_instances.push(SymbolInstance {
                                                 symbol_index: idx,
                                                 position: rect,
@@ -1432,6 +1676,17 @@ impl<'a> Jbig2Encoder<'a> {
                             }
                             let key = hash_key(&self.global_symbols[idx]);
                             self.hash_map.entry(key).or_default().push(idx);
+                            if let (Some(anchor_map), Some(scale_profile)) = (
+                                sym_unify_anchor_map.as_mut(),
+                                sym_unify_scale_profile,
+                            ) {
+                                self.maybe_add_sym_unify_anchor(
+                                    anchor_map,
+                                    idx,
+                                    page_num,
+                                    scale_profile,
+                                );
+                            }
                             symbol_instances.push(SymbolInstance {
                                 symbol_index: idx,
                                 position: rect,
