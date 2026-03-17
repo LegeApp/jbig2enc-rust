@@ -52,7 +52,7 @@ pub struct Jbig2Config {
     /// Lower = more aggressive matching (smaller files, lower quality).
     /// Typical range: 4 (aggressive) to 10 (conservative). Default: 7.
     pub match_tolerance: u32,
-    pub lossy_symbol_collapse: bool,
+    pub lossy_symbol_mode: LossySymbolMode,
     pub lossy_collapse_min_family_size: usize,
     pub lossy_collapse_min_usage: usize,
     pub lossy_collapse_min_total_usage: usize,
@@ -61,8 +61,19 @@ pub struct Jbig2Config {
     pub lossy_collapse_max_err: u32,
     pub lossy_collapse_max_dx: i32,
     pub lossy_collapse_max_dy: i32,
+    pub lossy_collapse_min_width_ratio_permille: u16,
+    pub lossy_collapse_min_height_ratio_permille: u16,
+    pub lossy_collapse_min_black_ratio_permille: u16,
+    pub lossy_collapse_context_mode: LossyCollapseContextMode,
     pub lossy_collapse_prototype_mode: LossyCollapsePrototypeMode,
     pub lossy_collapse_prototype_selector_mode: LossyCollapsePrototypeSelectorMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossySymbolMode {
+    Off,
+    LegacyCollapse,
+    SymbolUnify,
 }
 
 /// Configuration for halftone encoding
@@ -101,6 +112,15 @@ pub enum LossyCollapsePrototypeMode {
 pub enum LossyCollapsePrototypeSelectorMode {
     Baseline,
     SupportBiased,
+    DenseCenter,
+    DenseTrimmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossyCollapseContextMode {
+    WeightedJaccard,
+    Cosine,
+    Hybrid,
 }
 
 impl Default for HalftoneConfig {
@@ -142,7 +162,7 @@ impl Default for Jbig2Config {
             is_lossless: false,
             default_pixel: false,
             match_tolerance: 7,
-            lossy_symbol_collapse: false,
+            lossy_symbol_mode: LossySymbolMode::Off,
             lossy_collapse_min_family_size: 2,
             lossy_collapse_min_usage: 1,
             lossy_collapse_min_total_usage: 0,
@@ -151,6 +171,10 @@ impl Default for Jbig2Config {
             lossy_collapse_max_err: 24,
             lossy_collapse_max_dx: 1,
             lossy_collapse_max_dy: 1,
+            lossy_collapse_min_width_ratio_permille: 450,
+            lossy_collapse_min_height_ratio_permille: 550,
+            lossy_collapse_min_black_ratio_permille: 300,
+            lossy_collapse_context_mode: LossyCollapseContextMode::Hybrid,
             lossy_collapse_prototype_mode: LossyCollapsePrototypeMode::MedoidThenCleanup,
             lossy_collapse_prototype_selector_mode: LossyCollapsePrototypeSelectorMode::Baseline,
         }
@@ -177,10 +201,33 @@ impl Jbig2Config {
 
     pub fn text_lossy_collapse() -> Self {
         let mut cfg = Self::text();
-        cfg.lossy_symbol_collapse = true;
+        cfg.lossy_symbol_mode = LossySymbolMode::LegacyCollapse;
         cfg.refine = false;
         cfg.text_refine = false;
         cfg
+    }
+
+    pub fn text_symbol_unify() -> Self {
+        let mut cfg = Self::text();
+        cfg.lossy_symbol_mode = LossySymbolMode::SymbolUnify;
+        cfg.refine = false;
+        cfg.text_refine = false;
+        cfg
+    }
+
+    #[inline]
+    pub fn uses_legacy_collapse(&self) -> bool {
+        self.lossy_symbol_mode == LossySymbolMode::LegacyCollapse
+    }
+
+    #[inline]
+    pub fn uses_symbol_unify(&self) -> bool {
+        self.lossy_symbol_mode == LossySymbolMode::SymbolUnify
+    }
+
+    #[inline]
+    pub fn uses_lossy_symbol_dictionary(&self) -> bool {
+        self.lossy_symbol_mode != LossySymbolMode::Off
     }
 
     /// Creates a configuration for lossless image encoding

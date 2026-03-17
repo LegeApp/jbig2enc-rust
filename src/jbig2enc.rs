@@ -4,18 +4,21 @@ use crate::jbig2collapse::{
     CollapseFamilyBuildInputs, FamilyBucketKey, PrototypeBuildInputs, SymbolSignature,
     build_lossy_prototype, build_lossy_symbol_families,
     compute_symbol_signature as compute_symbol_signature_shared,
+    estimate_collapse_scale_profile,
     family_bucket_key_for_symbol, family_bucket_neighbors, family_match_details,
     refine_compare_score,
 };
 use crate::jbig2comparator::{
     Comparator, MAX_DIMENSION_DELTA,
 };
+use crate::jbig2collapse_context::build_collapse_context_model;
+use crate::jbig2unify::{SymbolUnifyInputs, UnifiedClass};
 // Symbol extraction using CC analysis
 #[cfg(feature = "cc-analysis")]
 use crate::jbig2cc::analyze_page;
 use crate::jbig2structs::{
-    FileHeader, GenericRegionConfig, GenericRegionParams, Jbig2Config, PageInfo, Segment,
-    SegmentType, SymbolDictParams, TextRegionParams,
+    FileHeader, GenericRegionConfig, GenericRegionParams, Jbig2Config, LossySymbolMode,
+    PageInfo, Segment, SegmentType, SymbolDictParams, TextRegionParams,
 };
 
 use crate::jbig2sym::{BitImage, Rect};
@@ -321,7 +324,7 @@ struct EncoderState {
     segment: bool,
     use_refinement: bool,
     use_delta_encoding: bool,
-    lossy_collapse_applied: bool,
+    lossy_symbol_mode_applied: bool,
     decision_debug_lines: Vec<String>,
 }
 
@@ -391,7 +394,7 @@ impl<'a> Jbig2Encoder<'a> {
                 segment: true,                 // Default to using segments
                 use_refinement: config.refine, // Enable refinement based on config
                 use_delta_encoding: true,      // Default to using delta encoding
-                lossy_collapse_applied: false,
+                lossy_symbol_mode_applied: false,
                 decision_debug_lines: Vec::new(),
             },
             global_symbols: Vec::new(),
@@ -709,6 +712,8 @@ impl<'a> Jbig2Encoder<'a> {
     }
 
     fn build_lossy_symbol_families(&mut self) -> Vec<crate::jbig2collapse::LossyFamily> {
+        let context_model =
+            build_collapse_context_model(&self.pages, &self.global_symbols, &self.symbol_signatures);
         let (families, diagnostics) = build_lossy_symbol_families(CollapseFamilyBuildInputs {
             config: self.config,
             global_symbols: &self.global_symbols,
@@ -717,19 +722,38 @@ impl<'a> Jbig2Encoder<'a> {
             symbol_signatures: &self.symbol_signatures,
             symbol_pixel_counts: &self.symbol_pixel_counts,
             page_symbol_indices: &self.page_symbol_indices,
+            context_model: Some(&context_model),
         });
         self.state.decision_debug_lines.extend(diagnostics.lines);
         families
     }
 
+    fn build_symbol_unify_classes(&mut self) -> Vec<UnifiedClass> {
+        let context_model =
+            build_collapse_context_model(&self.pages, &self.global_symbols, &self.symbol_signatures);
+        let (classes, diagnostics) = crate::jbig2unify::build_symbol_unify_classes(SymbolUnifyInputs {
+            config: self.config,
+            global_symbols: &self.global_symbols,
+            symbol_usage: &self.symbol_usage,
+            symbol_page_count: &self.symbol_page_count,
+            symbol_signatures: &self.symbol_signatures,
+            symbol_pixel_counts: &self.symbol_pixel_counts,
+            context_model: Some(&context_model),
+        });
+        self.state.decision_debug_lines.extend(diagnostics.lines);
+        classes
+    }
+
     fn make_lossy_prototype(
         &self,
         family: &crate::jbig2collapse::LossyFamily,
+        scale_profile: crate::jbig2collapse::CollapseScaleProfile,
         collect_stats: bool,
     ) -> (BitImage, crate::jbig2collapse::PrototypeBuildStats) {
         build_lossy_prototype(PrototypeBuildInputs {
             config: self.config,
             family,
+            scale_profile,
             global_symbols: &self.global_symbols,
             symbol_usage: &self.symbol_usage,
             symbol_page_count: &self.symbol_page_count,
@@ -777,7 +801,7 @@ impl<'a> Jbig2Encoder<'a> {
         }
         let text_refine = self.config.text_refine;
         let refine_enabled = self.config.refine;
-        let lossy_collapse = self.config.lossy_symbol_collapse;
+        let legacy_collapse = self.config.uses_legacy_collapse();
         let global_indices: Vec<usize> = self
             .global_symbols
             .iter()
@@ -819,14 +843,14 @@ impl<'a> Jbig2Encoder<'a> {
                 let area = (local_symbol.width * local_symbol.height) as u32;
                 let max_err = if self.config.text_refine {
                     (area / self.config.match_tolerance.max(1)).max(3)
-                } else if self.config.lossy_symbol_collapse {
+                } else if legacy_collapse {
                     self.config.lossy_collapse_max_err.max(2)
                 } else {
                     ((area as f32 * 0.05) as u32).max(2)
                 };
                 let dim_range: u64 = if self.config.text_refine
                     || self.config.refine
-                    || self.config.lossy_symbol_collapse
+                    || legacy_collapse
                 {
                     2
                 } else {
@@ -916,7 +940,7 @@ impl<'a> Jbig2Encoder<'a> {
                                 err,
                                 dx,
                                 dy,
-                                needs_refinement && !lossy_collapse && (text_refine || refine_enabled),
+                                needs_refinement && !legacy_collapse && (text_refine || refine_enabled),
                             ));
                             if err == 0 && dx == 0 && dy == 0 {
                                 break 'bucket_search;
@@ -965,7 +989,7 @@ impl<'a> Jbig2Encoder<'a> {
     }
 
     fn apply_lossy_symbol_collapse(&mut self) -> Result<()> {
-        if !self.config.lossy_symbol_collapse || self.state.lossy_collapse_applied {
+        if !self.config.uses_legacy_collapse() || self.state.lossy_symbol_mode_applied {
             return Ok(());
         }
 
@@ -975,7 +999,7 @@ impl<'a> Jbig2Encoder<'a> {
             self.state
                 .decision_debug_lines
                 .push("collapse: no eligible families".to_string());
-            self.state.lossy_collapse_applied = true;
+            self.state.lossy_symbol_mode_applied = true;
             return Ok(());
         }
 
@@ -1006,11 +1030,16 @@ impl<'a> Jbig2Encoder<'a> {
             }
         }
 
+        let scale_profile = estimate_collapse_scale_profile(
+            &self.global_symbols,
+            &self.symbol_signatures,
+            &self.symbol_usage,
+        );
         for (family_index, family) in families.iter().enumerate() {
             let prototype_usage = self.symbol_usage[family.prototype_index];
             let prototype_page_span = self.symbol_page_count[family.prototype_index];
             let collect_stats = family_index < 64;
-            let (prototype, stats) = self.make_lossy_prototype(family, collect_stats);
+            let (prototype, stats) = self.make_lossy_prototype(family, scale_profile, collect_stats);
             if collect_stats {
                 self.state.decision_debug_lines.push(format!(
                     "collapse prototype: prototype={} members={} total_usage={} proto_usage={} proto_pages={} mode={} medoid_black={} output_black={} kept={} removed={} added={} avg_before={:.2} avg_after={:.2}",
@@ -1048,7 +1077,77 @@ impl<'a> Jbig2Encoder<'a> {
             self.global_symbols.len(),
             before_exported.saturating_sub(self.global_symbols.len())
         ));
-        self.state.lossy_collapse_applied = true;
+        self.state.lossy_symbol_mode_applied = true;
+        Ok(())
+    }
+
+    fn apply_symbol_unify(&mut self) -> Result<()> {
+        if !self.config.uses_symbol_unify() || self.state.lossy_symbol_mode_applied {
+            return Ok(());
+        }
+
+        let before_exported = self.global_symbols.len();
+        let classes = self.build_symbol_unify_classes();
+        if classes.is_empty() {
+            self.state
+                .decision_debug_lines
+                .push("sym_unify: no eligible classes".to_string());
+            self.state.lossy_symbol_mode_applied = true;
+            return Ok(());
+        }
+
+        let mut remap: Vec<usize> = (0..self.global_symbols.len()).collect();
+        let mut unified_members = 0usize;
+        let mut retained_border_members = 0usize;
+
+        self.state.decision_debug_lines.push(format!(
+            "sym_unify: {} classes eligible across {} symbols",
+            classes.len(),
+            self.global_symbols.len()
+        ));
+
+        for class in classes.iter().take(64) {
+            self.state.decision_debug_lines.push(format!(
+                "sym_unify class: representative={} class_size={} core_size={} unified={} retained_border={} total_usage={} page_span={} representative_score={} subclusters={}",
+                class.representative_index,
+                class.class_size,
+                class.dense_core_size,
+                class.core_members.len(),
+                class.retained_border_members,
+                class.total_usage,
+                class.page_span,
+                class.representative_score,
+                class.candidate_subclusters
+            ));
+        }
+
+        for class in &classes {
+            retained_border_members += class.retained_border_members;
+            for member in &class.core_members {
+                remap[member.member_index] = class.representative_index;
+                unified_members += 1;
+            }
+        }
+
+        for page in &mut self.pages {
+            for instance in &mut page.symbol_instances {
+                instance.symbol_index = remap[instance.symbol_index];
+                instance.needs_refinement = false;
+                instance.refinement_dx = 0;
+                instance.refinement_dy = 0;
+            }
+        }
+
+        self.compact_symbol_table_after_remap();
+        self.state.decision_debug_lines.push(format!(
+            "sym_unify export summary: before={} after={} removed={} unified_members={} retained_border_members={}",
+            before_exported,
+            self.global_symbols.len(),
+            before_exported.saturating_sub(self.global_symbols.len()),
+            unified_members,
+            retained_border_members
+        ));
+        self.state.lossy_symbol_mode_applied = true;
         Ok(())
     }
 
@@ -1370,8 +1469,10 @@ impl<'a> Jbig2Encoder<'a> {
     pub fn flush(&mut self) -> Result<Vec<u8>> {
         let include_header = self.state.full_headers_remaining;
         self.state.decision_debug_lines.clear();
-        if self.config.lossy_symbol_collapse {
-            self.apply_lossy_symbol_collapse()?;
+        match self.config.lossy_symbol_mode {
+            LossySymbolMode::LegacyCollapse => self.apply_lossy_symbol_collapse()?,
+            LossySymbolMode::SymbolUnify => self.apply_symbol_unify()?,
+            LossySymbolMode::Off => {}
         }
         let plan = self.plan_document(include_header)?;
         self.validate_plan(&plan)?;
@@ -1384,8 +1485,10 @@ impl<'a> Jbig2Encoder<'a> {
     pub fn flush_pdf_split(&mut self) -> Result<PdfSplitOutput> {
         self.state.pdf_mode = true;
         self.state.decision_debug_lines.clear();
-        if self.config.lossy_symbol_collapse {
-            self.apply_lossy_symbol_collapse()?;
+        match self.config.lossy_symbol_mode {
+            LossySymbolMode::LegacyCollapse => self.apply_lossy_symbol_collapse()?,
+            LossySymbolMode::SymbolUnify => self.apply_symbol_unify()?,
+            LossySymbolMode::Off => {}
         }
         let plan = self.plan_document(false)?;
         self.validate_plan(&plan)?;
@@ -1435,7 +1538,10 @@ impl<'a> Jbig2Encoder<'a> {
         let global_set: HashSet<usize> = global_symbol_indices.iter().copied().collect();
         let mut page_uses_generic_region = vec![false; self.pages.len()];
         for (page_num, page) in self.pages.iter().enumerate() {
-            if self.config.lossy_symbol_collapse || self.config.refine || self.config.text_refine {
+            if self.config.uses_lossy_symbol_dictionary()
+                || self.config.refine
+                || self.config.text_refine
+            {
                 let mut local_use_counts = HashMap::new();
                 for instance in &page.symbol_instances {
                     *local_use_counts.entry(instance.symbol_index).or_insert(0usize) += 1;
@@ -1879,7 +1985,7 @@ impl<'a> Jbig2Encoder<'a> {
 
             if !planned_instances.is_empty() {
                 let text_start = Instant::now();
-                let use_refinement_text_region = !self.config.lossy_symbol_collapse
+                let use_refinement_text_region = !self.config.uses_lossy_symbol_dictionary()
                     && (self.config.text_refine || self.config.refine || needs_family_refinement);
                 let region_payload = if use_refinement_text_region {
                     encode_text_region_with_refinement(
@@ -4469,7 +4575,7 @@ pub fn encode_page_with_symbol_dictionary(
         }
     }
 
-    let region_payload = if !config.lossy_symbol_collapse
+    let region_payload = if !config.uses_lossy_symbol_dictionary()
         && (config.refine || symbol_instances.iter().any(|inst| inst.needs_refinement))
     {
         encode_text_region_with_refinement(

@@ -147,6 +147,11 @@ fn main() -> anyhow::Result<()> {
             cfg.refine = true;
             cfg
         }
+        "sym_unify" => {
+            let mut cfg = Jbig2Config::text_symbol_unify();
+            cfg.lossy_collapse_prototype_mode = collapse_proto_mode(&args.prototype);
+            cfg
+        }
         _ => {
             let mut cfg = Jbig2Config::text_lossy_collapse();
             cfg.lossy_collapse_prototype_mode = collapse_proto_mode(&args.prototype);

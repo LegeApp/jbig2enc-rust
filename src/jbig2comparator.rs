@@ -263,6 +263,21 @@ impl Comparator {
         Some(result)
     }
 
+    pub fn compare_for_symbol_unify(
+        &mut self,
+        a: &BitImage,
+        b: &BitImage,
+        max_err: u32,
+        max_dx: i32,
+        max_dy: i32,
+    ) -> Option<CompareResult> {
+        let result = self.compare_detailed_with_limits(a, b, max_err, max_dx, max_dy)?;
+        if result.dx.abs() > max_dx || result.dy.abs() > max_dy {
+            return None;
+        }
+        Some(result)
+    }
+
     pub fn collapse_compare_limits(result: &CompareResult) -> CollapseCompareLimits {
         let shift_slack = (result.dx.abs() + result.dy.abs()) as u32;
         CollapseCompareLimits {
@@ -393,17 +408,12 @@ impl Comparator {
         dx: i32,
         dy: i32,
     ) -> CompareResult {
-        let awpr = (a.width + 31) >> 5;
-        let bwpr = (b.width + 31) >> 5;
-        let a_words = a.packed_words();
-        let b_words = b.packed_words();
-
-        let a_x_offset = (-dx).max(0) as usize;
-        let b_x_offset = dx.max(0) as usize;
-        let a_y_offset = (-dy).max(0) as usize;
-        let b_y_offset = dy.max(0) as usize;
-        let used_rows = (a_y_offset + a.height).max(b_y_offset + b.height);
-        let used_cols = (a_x_offset + a.width).max(b_x_offset + b.width);
+        let min_x = 0.min(dx);
+        let min_y = 0.min(dy);
+        let max_x = (a.width as i32).max(dx + b.width as i32);
+        let max_y = (a.height as i32).max(dy + b.height as i32);
+        let used_rows = (max_y - min_y).max(0) as usize;
+        let used_cols = (max_x - min_x).max(0) as usize;
 
         self.ensure_profile_buffers(used_cols);
         self.col_a[..used_cols].fill(0);
@@ -412,79 +422,51 @@ impl Comparator {
         let mut overlap_err = 0u32;
         let mut outside_ink_err = 0u32;
         let mut row_profile_err = 0u32;
-        let mut total_a = 0u32;
-        let mut total_b = 0u32;
+        for gy in min_y..max_y {
+            let mut a_row_count = 0u32;
+            let mut b_row_count = 0u32;
 
-        let overlap_left = dx.max(0) as usize;
-        let overlap_right = ((dx + b.width as i32).min(a.width as i32)).max(0) as usize;
+            for gx in min_x..max_x {
+                let ax = gx;
+                let ay = gy;
+                let bx = gx - dx;
+                let by = gy - dy;
 
-        for union_y in 0..used_rows {
-            let a_row_index = union_y.checked_sub(a_y_offset);
-            let b_row_index = union_y.checked_sub(b_y_offset);
+                let in_a = ax >= 0
+                    && ay >= 0
+                    && (ax as usize) < a.width
+                    && (ay as usize) < a.height;
+                let in_b = bx >= 0
+                    && by >= 0
+                    && (bx as usize) < b.width
+                    && (by as usize) < b.height;
+                let a_on = in_a && a.get_usize(ax as usize, ay as usize);
+                let b_on = in_b && b.get_usize(bx as usize, by as usize);
 
-            let a_row = a_row_index.filter(|&row| row < a.height).map(|row| unsafe {
-                a_words.as_ptr().add(row * awpr)
-            });
-            let b_row = b_row_index.filter(|&row| row < b.height).map(|row| unsafe {
-                b_words.as_ptr().add(row * bwpr)
-            });
-
-            let a_row_ones = if let Some(a_row) = a_row {
-                unsafe {
-                    accumulate_row_columns(
-                        a_row,
-                        awpr,
-                        a.width,
-                        &mut self.col_a[..used_cols],
-                        a_x_offset,
-                    )
+                if !(a_on || b_on) {
+                    continue;
                 }
-            } else {
-                0
-            };
-            let b_row_ones = if let Some(b_row) = b_row {
-                unsafe {
-                    accumulate_row_columns(
-                        b_row,
-                        bwpr,
-                        b.width,
-                        &mut self.col_b[..used_cols],
-                        b_x_offset,
-                    )
+
+                let rx = (gx - min_x) as usize;
+                if a_on {
+                    a_row_count += 1;
+                    self.col_a[rx] += 1;
                 }
-            } else {
-                0
-            };
+                if b_on {
+                    b_row_count += 1;
+                    self.col_b[rx] += 1;
+                }
 
-            total_a += a_row_ones;
-            total_b += b_row_ones;
-            row_profile_err += a_row_ones.abs_diff(b_row_ones);
-
-            match (a_row, b_row) {
-                (Some(a_row), Some(b_row)) => {
-                    if overlap_left < overlap_right {
-                        let overlap_width = overlap_right - overlap_left;
-                        outside_ink_err += unsafe {
-                            count_row_range_ones(a_row, awpr, a.width, 0, overlap_left)
-                                + count_row_range_ones(a_row, awpr, a.width, overlap_right, a.width)
-                        };
-                        let b_overlap_left = overlap_left.saturating_sub(dx.max(0) as usize);
-                        let b_overlap_right = overlap_right.saturating_sub(dx.max(0) as usize);
-                        outside_ink_err += unsafe {
-                            count_row_range_ones(b_row, bwpr, b.width, 0, b_overlap_left)
-                                + count_row_range_ones(b_row, bwpr, b.width, b_overlap_right, b.width)
-                        };
-                        overlap_err += unsafe {
-                            count_row_overlap_xor(a_row, awpr, b_row, bwpr, overlap_width, dx)
-                        };
+                if a_on != b_on {
+                    if in_a && in_b {
+                        overlap_err += 1;
                     } else {
-                        outside_ink_err += a_row_ones + b_row_ones;
+                        outside_ink_err += 1;
                     }
                 }
-                (Some(_), None) => outside_ink_err += a_row_ones,
-                (None, Some(_)) => outside_ink_err += b_row_ones,
-                (None, None) => {}
             }
+
+            row_profile_err += a_row_count.abs_diff(b_row_count);
         }
 
         let mut col_profile_err = 0u32;
@@ -498,7 +480,7 @@ impl Comparator {
             outside_ink_err,
             row_profile_err,
             col_profile_err,
-            black_delta: total_a.abs_diff(total_b),
+            black_delta: a.count_ones().abs_diff(b.count_ones()) as u32,
             dx,
             dy,
         }

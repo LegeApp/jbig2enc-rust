@@ -1,4 +1,5 @@
 use crate::jbig2comparator::{CollapseCompareLimits, Comparator, CompareResult};
+use crate::jbig2collapse_context::{CollapseContextModel, ContextDecision};
 use crate::jbig2structs::{
     Jbig2Config, LossyCollapsePrototypeMode, LossyCollapsePrototypeSelectorMode,
 };
@@ -17,6 +18,9 @@ pub struct SymbolSignature {
     pub cy_times_256: u16,
     pub left_mass: u16,
     pub right_mass: u16,
+    pub top_mass: u16,
+    pub bottom_mass: u16,
+    pub hole_count: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -81,17 +85,26 @@ pub struct CollapseFamilyBuildInputs<'a> {
     pub symbol_signatures: &'a [SymbolSignature],
     pub symbol_pixel_counts: &'a [usize],
     pub page_symbol_indices: &'a [Vec<usize>],
+    pub context_model: Option<&'a CollapseContextModel>,
 }
 
 pub struct PrototypeBuildInputs<'a> {
     pub config: &'a Jbig2Config,
     pub family: &'a LossyFamily,
+    pub scale_profile: CollapseScaleProfile,
     pub global_symbols: &'a [BitImage],
     pub symbol_usage: &'a [usize],
     pub symbol_page_count: &'a [usize],
     pub symbol_signatures: &'a [SymbolSignature],
     pub symbol_pixel_counts: &'a [usize],
     pub collect_stats: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CollapseScaleProfile {
+    pub ref_width: usize,
+    pub ref_height: usize,
+    pub ref_black: u32,
 }
 
 pub fn compute_symbol_signature(img: &BitImage) -> SymbolSignature {
@@ -104,11 +117,29 @@ pub fn compute_symbol_signature(img: &BitImage) -> SymbolSignature {
     let mut sum_y = 0u32;
     let mut left_mass = 0u32;
     let mut right_mass = 0u32;
+    let mut top_mass = 0u32;
+    let mut bottom_mass = 0u32;
     let mid_x = img.width / 2;
+    let mid_y = img.height / 2;
+    let packed = img.packed_words();
+    let words_per_row = (img.width + 31) >> 5;
+    let tail_bits = img.width & 31;
+    let tail_mask = if tail_bits == 0 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - tail_bits)
+    };
 
     for y in 0..img.height {
-        for x in 0..img.width {
-            if img.get_usize(x, y) {
+        let row = &packed[y * words_per_row..(y + 1) * words_per_row];
+        for (word_idx, &row_word) in row.iter().enumerate() {
+            let mut word = row_word;
+            if tail_bits != 0 && word_idx + 1 == words_per_row {
+                word &= tail_mask;
+            }
+            while word != 0 {
+                let bit = word.leading_zeros() as usize;
+                let x = word_idx * 32 + bit;
                 black += 1;
                 left_col = left_col.min(x);
                 right_col = right_col.max(x);
@@ -121,9 +152,17 @@ pub fn compute_symbol_signature(img: &BitImage) -> SymbolSignature {
                 } else {
                     right_mass += 1;
                 }
+                if y < mid_y {
+                    top_mass += 1;
+                } else {
+                    bottom_mass += 1;
+                }
+                word &= !(1u32 << (31 - bit));
             }
         }
     }
+
+    let hole_count = count_enclosed_white_components(img).min(u8::MAX as usize) as u8;
 
     let (cx, cy) = if black == 0 {
         (0, 0)
@@ -145,7 +184,60 @@ pub fn compute_symbol_signature(img: &BitImage) -> SymbolSignature {
         cy_times_256: cy,
         left_mass: left_mass.min(u16::MAX as u32) as u16,
         right_mass: right_mass.min(u16::MAX as u32) as u16,
+        top_mass: top_mass.min(u16::MAX as u32) as u16,
+        bottom_mass: bottom_mass.min(u16::MAX as u32) as u16,
+        hole_count,
     }
+}
+
+fn count_enclosed_white_components(img: &BitImage) -> usize {
+    if img.width < 3 || img.height < 3 {
+        return 0;
+    }
+
+    let mut visited = vec![false; img.width * img.height];
+    let mut stack = Vec::new();
+    let mut holes = 0usize;
+
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let idx = y * img.width + x;
+            if visited[idx] || img.get_usize(x, y) {
+                continue;
+            }
+
+            visited[idx] = true;
+            stack.push((x, y));
+            let mut touches_border = x == 0 || y == 0 || x + 1 == img.width || y + 1 == img.height;
+
+            while let Some((cx, cy)) = stack.pop() {
+                let x0 = cx.saturating_sub(1);
+                let x1 = (cx + 1).min(img.width - 1);
+                let y0 = cy.saturating_sub(1);
+                let y1 = (cy + 1).min(img.height - 1);
+
+                for ny in y0..=y1 {
+                    for nx in x0..=x1 {
+                        let nidx = ny * img.width + nx;
+                        if visited[nidx] || img.get_usize(nx, ny) {
+                            continue;
+                        }
+                        visited[nidx] = true;
+                        if nx == 0 || ny == 0 || nx + 1 == img.width || ny + 1 == img.height {
+                            touches_border = true;
+                        }
+                        stack.push((nx, ny));
+                    }
+                }
+            }
+
+            if !touches_border {
+                holes += 1;
+            }
+        }
+    }
+
+    holes
 }
 
 #[inline]
@@ -169,6 +261,100 @@ pub fn family_bucket_key_for_symbol(symbol: &BitImage, sig: &SymbolSignature) ->
         centroid_y_bin: ((sig.cy_times_256 as u32 * 16) / (h.max(1) * 256)).min(15) as u8,
         lr_balance_bin: quantize_ratio_u8(sig.left_mass as u32, sig.black.max(1), 8),
     }
+}
+
+fn weighted_median_usize(values: &mut [(usize, usize)]) -> usize {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable_by_key(|&(value, _)| value);
+    let total_weight: usize = values.iter().map(|&(_, weight)| weight.max(1)).sum();
+    let target = total_weight.div_ceil(2);
+    let mut running = 0usize;
+    for &(value, weight) in values.iter() {
+        running += weight.max(1);
+        if running >= target {
+            return value;
+        }
+    }
+    values.last().map(|&(value, _)| value).unwrap_or(0)
+}
+
+fn weighted_median_u32(values: &mut [(u32, usize)]) -> u32 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable_by_key(|&(value, _)| value);
+    let total_weight: usize = values.iter().map(|&(_, weight)| weight.max(1)).sum();
+    let target = total_weight.div_ceil(2);
+    let mut running = 0usize;
+    for &(value, weight) in values.iter() {
+        running += weight.max(1);
+        if running >= target {
+            return value;
+        }
+    }
+    values.last().map(|&(value, _)| value).unwrap_or(0)
+}
+
+pub fn estimate_collapse_scale_profile(
+    symbols: &[BitImage],
+    signatures: &[SymbolSignature],
+    usage: &[usize],
+) -> CollapseScaleProfile {
+    let mut widths = Vec::with_capacity(symbols.len());
+    let mut heights = Vec::with_capacity(symbols.len());
+    let mut blacks = Vec::with_capacity(symbols.len());
+
+    for ((symbol, signature), &weight) in symbols.iter().zip(signatures.iter()).zip(usage.iter()) {
+        if signature.black < 4 || symbol.width < 2 || symbol.height < 2 {
+            continue;
+        }
+        let weight = weight.max(1);
+        widths.push((symbol.width, weight));
+        heights.push((symbol.height, weight));
+        blacks.push((signature.black, weight));
+    }
+
+    CollapseScaleProfile {
+        ref_width: weighted_median_usize(&mut widths).max(1),
+        ref_height: weighted_median_usize(&mut heights).max(1),
+        ref_black: weighted_median_u32(&mut blacks).max(1),
+    }
+}
+
+#[inline]
+fn collapse_shape_is_fragile(
+    config: &Jbig2Config,
+    scale_profile: CollapseScaleProfile,
+    symbol: &BitImage,
+    sig: &SymbolSignature,
+) -> bool {
+    let ref_width = scale_profile.ref_width.max(1);
+    let ref_height = scale_profile.ref_height.max(1);
+    let ref_black = scale_profile.ref_black.max(1);
+
+    symbol.width.saturating_mul(1000)
+        < ref_width.saturating_mul(config.lossy_collapse_min_width_ratio_permille as usize)
+        || symbol.height.saturating_mul(1000)
+            < ref_height.saturating_mul(config.lossy_collapse_min_height_ratio_permille as usize)
+        || sig.black.saturating_mul(1000)
+            < ref_black.saturating_mul(config.lossy_collapse_min_black_ratio_permille as u32)
+}
+
+#[inline]
+fn should_cleanup_prototype(
+    config: &Jbig2Config,
+    scale_profile: CollapseScaleProfile,
+    symbol: &BitImage,
+    sig: &SymbolSignature,
+    family_total_usage: usize,
+) -> bool {
+    !collapse_shape_is_fragile(config, scale_profile, symbol, sig)
+        && family_total_usage >= 6
+        && symbol.width >= 5
+        && symbol.height >= 8
+        && sig.black >= 20
 }
 
 pub fn family_bucket_neighbors(key: FamilyBucketKey) -> Vec<FamilyBucketKey> {
@@ -305,6 +491,9 @@ pub fn family_signatures_are_compatible(
         && lhs.cy_times_256.abs_diff(rhs.cy_times_256) <= 96
         && lhs.left_mass.abs_diff(rhs.left_mass) <= mass_tol
         && lhs.right_mass.abs_diff(rhs.right_mass) <= mass_tol
+        && lhs.top_mass.abs_diff(rhs.top_mass) <= mass_tol
+        && lhs.bottom_mass.abs_diff(rhs.bottom_mass) <= mass_tol
+        && lhs.hole_count == rhs.hole_count
 }
 
 #[inline]
@@ -411,19 +600,21 @@ pub fn lossy_family_probe(
         };
     }
 
-    let Some(result) = comparator.compare_detailed_with_limits(
-        target,
-        reference,
-        max_err,
-        max_dx,
-        max_dy,
-    ) else {
+    let Some(result) = comparator.compare_detailed(target, reference, max_err) else {
         return LossyFamilyProbe::Reject {
             reason: "overlap",
             result: None,
             limits: None,
         };
     };
+
+    if result.dx.abs() > max_dx || result.dy.abs() > max_dy {
+        return LossyFamilyProbe::Reject {
+            reason: "shift",
+            result: Some(result),
+            limits: None,
+        };
+    }
 
     let limits = Comparator::collapse_compare_limits(&result);
     if result.outside_ink_err > limits.outside_limit {
@@ -495,6 +686,25 @@ pub fn format_collapse_probe_reject(
     }
 }
 
+#[inline]
+fn context_decision(
+    config: &Jbig2Config,
+    context_model: Option<&CollapseContextModel>,
+    lhs: usize,
+    rhs: usize,
+) -> ContextDecision {
+    context_model
+        .map(|model| model.merge_decision(lhs, rhs, config.lossy_collapse_context_mode))
+        .unwrap_or(ContextDecision::Unknown)
+}
+
+#[inline]
+fn collapse_score_allowed_with_unknown_context(config: &Jbig2Config, result: &CompareResult) -> bool {
+    let score = collapse_compare_score(result);
+    let strict_limit = config.lossy_collapse_max_err.saturating_div(2).saturating_add(2);
+    score <= strict_limit && result.outside_ink_err == 0 && result.dx.abs() + result.dy.abs() <= 1
+}
+
 pub fn choose_lossy_family_prototype(
     config: &Jbig2Config,
     members: &[usize],
@@ -503,6 +713,7 @@ pub fn choose_lossy_family_prototype(
     page_counts: &[usize],
     signatures: &[SymbolSignature],
     black_counts: &[usize],
+    context_model: Option<&CollapseContextModel>,
     comparator: &mut Comparator,
     probe_cache: &mut FxHashMap<u64, LossyFamilyProbe>,
 ) -> (usize, u64) {
@@ -510,33 +721,51 @@ pub fn choose_lossy_family_prototype(
         return (members[0], 0);
     }
 
-    let mut candidate_order = members.to_vec();
-    candidate_order.sort_unstable_by(|&lhs, &rhs| {
-        let lhs_support = (page_counts[lhs] as u64 * 12) + usage[lhs] as u64 * 2;
-        let rhs_support = (page_counts[rhs] as u64 * 12) + usage[rhs] as u64 * 2;
-        rhs_support
-            .cmp(&lhs_support)
-            .then_with(|| usage[rhs].cmp(&usage[lhs]))
-            .then_with(|| black_counts[rhs].cmp(&black_counts[lhs]))
-            .then_with(|| lhs.cmp(&rhs))
-    });
+    #[derive(Clone, Copy)]
+    struct PrototypeCandidateStats {
+        index: usize,
+        total_score: u64,
+        close_weight: u64,
+        close_score_sum: u64,
+        support: u64,
+    }
+
+    impl PrototypeCandidateStats {
+        fn avg_close_score(self) -> u64 {
+            if self.close_weight == 0 {
+                u64::MAX
+            } else {
+                self.close_score_sum / self.close_weight
+            }
+        }
+    }
 
     let mut best_idx = members[0];
     let mut best_score = u64::MAX;
     let mut best_support = 0u64;
+    let close_threshold = config.lossy_collapse_max_err.saturating_div(2).saturating_add(4) as u64;
+    let mut candidate_stats = Vec::with_capacity(members.len());
 
-    for &candidate in &candidate_order {
+    for &candidate in members {
         let mut score = 0u64;
-        let score_slack = match config.lossy_collapse_prototype_selector_mode {
-            LossyCollapsePrototypeSelectorMode::Baseline => best_score / 50,
-            LossyCollapsePrototypeSelectorMode::SupportBiased => best_score / 8,
-        };
+        let mut close_weight = 0u64;
+        let mut close_score_sum = 0u64;
         for &other in members {
             if candidate == other {
                 continue;
             }
 
             let weight = usage[other].max(1) as u64;
+            match context_decision(config, context_model, other, candidate) {
+                ContextDecision::Reject => {
+                    score += 1_000_000 * weight;
+                    continue;
+                }
+                ContextDecision::Unknown => {
+                    score += 2_000 * weight;
+                }
+                ContextDecision::Allow => {}
+            }
             match lossy_family_probe_cached(
                 probe_cache,
                 comparator,
@@ -551,17 +780,31 @@ pub fn choose_lossy_family_prototype(
                 config.lossy_collapse_max_dy,
             ) {
                 LossyFamilyProbe::Accept(result) => {
-                    score += collapse_compare_score(&result) as u64 * weight;
+                    let compare_score = collapse_compare_score(&result) as u64;
+                    if compare_score <= close_threshold {
+                        close_weight += weight;
+                        close_score_sum += compare_score.saturating_mul(weight);
+                    }
+                    match context_decision(config, context_model, other, candidate) {
+                        ContextDecision::Allow => score += compare_score * weight,
+                        ContextDecision::Unknown => {
+                            score += compare_score.saturating_mul(4).saturating_mul(weight)
+                        }
+                        ContextDecision::Reject => unreachable!(),
+                    }
                 }
                 LossyFamilyProbe::Reject { .. } => score += 1_000_000 * weight,
             }
-
-            if best_score != u64::MAX && score > best_score.saturating_add(score_slack) {
-                break;
-            }
         }
 
-        let candidate_support = (page_counts[candidate] as u64 * 12) + usage[candidate] as u64 * 2;
+        let candidate_support = (page_counts[candidate] as u64 * 8) + usage[candidate] as u64;
+        candidate_stats.push(PrototypeCandidateStats {
+            index: candidate,
+            total_score: score,
+            close_weight,
+            close_score_sum,
+            support: candidate_support,
+        });
         let should_replace = match config.lossy_collapse_prototype_selector_mode {
             LossyCollapsePrototypeSelectorMode::Baseline => {
                 let score_close = if best_score == u64::MAX {
@@ -579,6 +822,8 @@ pub fn choose_lossy_family_prototype(
                 };
                 score < best_score || (score_close && candidate_support > best_support)
             }
+            LossyCollapsePrototypeSelectorMode::DenseCenter
+            | LossyCollapsePrototypeSelectorMode::DenseTrimmed => false,
         };
 
         if should_replace {
@@ -588,17 +833,61 @@ pub fn choose_lossy_family_prototype(
         }
     }
 
+    match config.lossy_collapse_prototype_selector_mode {
+        LossyCollapsePrototypeSelectorMode::DenseCenter
+        | LossyCollapsePrototypeSelectorMode::DenseTrimmed => {
+            let max_close = candidate_stats
+                .iter()
+                .map(|stats| stats.close_weight)
+                .max()
+                .unwrap_or(0);
+            let dense_pool: Vec<PrototypeCandidateStats> = if config
+                .lossy_collapse_prototype_selector_mode
+                == LossyCollapsePrototypeSelectorMode::DenseTrimmed
+            {
+                let trimmed: Vec<_> = candidate_stats
+                    .iter()
+                    .copied()
+                    .filter(|stats| stats.close_weight >= 2 && stats.close_weight.saturating_mul(2) >= max_close)
+                    .collect();
+                if trimmed.is_empty() {
+                    candidate_stats.clone()
+                } else {
+                    trimmed
+                }
+            } else {
+                candidate_stats.clone()
+            };
+
+            if let Some(best_dense) = dense_pool.into_iter().max_by(|lhs, rhs| {
+                lhs.close_weight
+                    .cmp(&rhs.close_weight)
+                    .then_with(|| rhs.avg_close_score().cmp(&lhs.avg_close_score()))
+                    .then_with(|| rhs.support.cmp(&lhs.support))
+                    .then_with(|| rhs.total_score.cmp(&lhs.total_score))
+            }) {
+                return (best_dense.index, best_dense.total_score);
+            }
+        }
+        _ => {}
+    }
+
     (best_idx, best_score)
 }
 
 pub fn build_lossy_symbol_families(
     inputs: CollapseFamilyBuildInputs<'_>,
 ) -> (Vec<LossyFamily>, CollapseBuildDiagnostics) {
-    if !inputs.config.lossy_symbol_collapse || inputs.global_symbols.len() <= 1 {
+    if !inputs.config.uses_legacy_collapse() || inputs.global_symbols.len() <= 1 {
         return (Vec::new(), CollapseBuildDiagnostics::default());
     }
 
     let symbol_count = inputs.global_symbols.len();
+    let scale_profile = estimate_collapse_scale_profile(
+        inputs.global_symbols,
+        inputs.symbol_signatures,
+        inputs.symbol_usage,
+    );
     let all_indices: Vec<usize> = (0..symbol_count).collect();
     let bucket_keys: Vec<FamilyBucketKey> = inputs
         .global_symbols
@@ -632,6 +921,25 @@ pub fn build_lossy_symbol_families(
             };
             let eligible_prefix = bucket.partition_point(|&other_index| other_index < symbol_index);
             for &other_index in &bucket[..eligible_prefix] {
+                let pair_context = context_decision(
+                    inputs.config,
+                    inputs.context_model,
+                    symbol_index,
+                    other_index,
+                );
+                if pair_context == ContextDecision::Reject {
+                    rejected_pair_count += 1;
+                    *reject_reason_counts.entry("context").or_insert(0) += 1;
+                    let sample_count = reject_reason_sample_counts.entry("context").or_insert(0);
+                    if *sample_count < 12 {
+                        *sample_count += 1;
+                        rejected_samples.push(format!(
+                            "collapse pair reject[context]: lhs={} rhs={}",
+                            symbol_index, other_index
+                        ));
+                    }
+                    continue;
+                }
                 match lossy_family_probe_cached(
                     &mut probe_cache,
                     &mut comparator,
@@ -646,6 +954,27 @@ pub fn build_lossy_symbol_families(
                     inputs.config.lossy_collapse_max_dy,
                 ) {
                     LossyFamilyProbe::Accept(result) => {
+                        if pair_context == ContextDecision::Unknown
+                            && !collapse_score_allowed_with_unknown_context(inputs.config, &result)
+                        {
+                            rejected_pair_count += 1;
+                            *reject_reason_counts.entry("context_unknown").or_insert(0) += 1;
+                            let sample_count =
+                                reject_reason_sample_counts.entry("context_unknown").or_insert(0);
+                            if *sample_count < 12 {
+                                *sample_count += 1;
+                                rejected_samples.push(format!(
+                                    "collapse pair reject[context_unknown]: lhs={} rhs={} score={} total={} dx={} dy={}",
+                                    symbol_index,
+                                    other_index,
+                                    collapse_compare_score(&result),
+                                    result.total_err,
+                                    result.dx,
+                                    result.dy
+                                ));
+                            }
+                            continue;
+                        }
                         accepted_pair_count += 1;
                         if accepted_samples.len() < 48 {
                             accepted_samples.push(format!(
@@ -694,6 +1023,7 @@ pub fn build_lossy_symbol_families(
     let mut families = Vec::new();
     let mut family_size_buckets = [0usize; 4];
     let mut skipped_low_value = 0usize;
+    let mut skipped_fragile_shape = 0usize;
     let mut skipped_samples = Vec::new();
     let mut retained_members = 0usize;
     let mut discarded_members = 0usize;
@@ -701,9 +1031,45 @@ pub fn build_lossy_symbol_families(
     for mut members in groups.into_values() {
         members.sort_unstable();
         let eligible: Vec<usize> = members
-            .into_iter()
-            .filter(|&index| inputs.symbol_usage[index] >= inputs.config.lossy_collapse_min_usage)
+            .iter()
+            .copied()
+            .filter(|&index| {
+                inputs.symbol_usage[index] >= inputs.config.lossy_collapse_min_usage
+                    && !collapse_shape_is_fragile(
+                        inputs.config,
+                        scale_profile,
+                        &inputs.global_symbols[index],
+                        &inputs.symbol_signatures[index],
+                    )
+            })
             .collect();
+        let skipped_in_group = members.len().saturating_sub(eligible.len());
+        if skipped_in_group > 0 {
+            skipped_fragile_shape += skipped_in_group;
+            if skipped_samples.len() < 64 {
+                for &index in members.iter().filter(|&&index| {
+                    inputs.symbol_usage[index] >= inputs.config.lossy_collapse_min_usage
+                        && collapse_shape_is_fragile(
+                            inputs.config,
+                            scale_profile,
+                            &inputs.global_symbols[index],
+                            &inputs.symbol_signatures[index],
+                        )
+                }) {
+                    skipped_samples.push(format!(
+                        "collapse skip fragile-shape: symbol={} w={} h={} black={} usage={}",
+                        index,
+                        inputs.global_symbols[index].width,
+                        inputs.global_symbols[index].height,
+                        inputs.symbol_signatures[index].black,
+                        inputs.symbol_usage[index]
+                    ));
+                    if skipped_samples.len() >= 64 {
+                        break;
+                    }
+                }
+            }
+        }
         if eligible.len() < inputs.config.lossy_collapse_min_family_size {
             continue;
         }
@@ -716,6 +1082,7 @@ pub fn build_lossy_symbol_families(
             inputs.symbol_page_count,
             inputs.symbol_signatures,
             inputs.symbol_pixel_counts,
+            inputs.context_model,
             &mut comparator,
             &mut probe_cache,
         );
@@ -764,6 +1131,15 @@ pub fn build_lossy_symbol_families(
             if member_index == prototype_index {
                 continue;
             }
+            let member_context = context_decision(
+                inputs.config,
+                inputs.context_model,
+                member_index,
+                prototype_index,
+            );
+            if member_context == ContextDecision::Reject {
+                continue;
+            }
             if let LossyFamilyProbe::Accept(result) = lossy_family_probe_cached(
                 &mut probe_cache,
                 &mut comparator,
@@ -777,6 +1153,11 @@ pub fn build_lossy_symbol_families(
                 inputs.config.lossy_collapse_max_dx,
                 inputs.config.lossy_collapse_max_dy,
             ) {
+                if member_context == ContextDecision::Unknown
+                    && !collapse_score_allowed_with_unknown_context(inputs.config, &result)
+                {
+                    continue;
+                }
                 family_members.push(LossyFamilyMatch {
                     member_index,
                     dx: result.dx,
@@ -808,6 +1189,15 @@ pub fn build_lossy_symbol_families(
 
     let mut lines = Vec::new();
     lines.push(format!(
+        "collapse scale profile: ref_width={} ref_height={} ref_black={} width_ratio={} height_ratio={} black_ratio={}",
+        scale_profile.ref_width,
+        scale_profile.ref_height,
+        scale_profile.ref_black,
+        inputs.config.lossy_collapse_min_width_ratio_permille,
+        inputs.config.lossy_collapse_min_height_ratio_permille,
+        inputs.config.lossy_collapse_min_black_ratio_permille
+    ));
+    lines.push(format!(
         "collapse pair probes: accepted={} rejected={}",
         accepted_pair_count, rejected_pair_count
     ));
@@ -823,8 +1213,8 @@ pub fn build_lossy_symbol_families(
         family_size_buckets[0], family_size_buckets[1], family_size_buckets[2], family_size_buckets[3]
     ));
     lines.push(format!(
-        "collapse family retention: prototypes={} discarded_members={} skipped_low_value={}",
-        retained_members, discarded_members, skipped_low_value
+        "collapse family retention: prototypes={} discarded_members={} skipped_low_value={} skipped_fragile_shape={}",
+        retained_members, discarded_members, skipped_low_value, skipped_fragile_shape
     ));
     lines.extend(skipped_samples);
 
@@ -835,6 +1225,14 @@ pub fn build_lossy_prototype(inputs: PrototypeBuildInputs<'_>) -> (BitImage, Pro
     let prototype_index = inputs.family.prototype_index;
     let medoid = inputs.global_symbols[prototype_index].clone();
     let medoid_black = medoid.count_ones();
+    let medoid_signature = inputs.symbol_signatures[prototype_index];
+    let allow_cleanup = should_cleanup_prototype(
+        inputs.config,
+        inputs.scale_profile,
+        &medoid,
+        &medoid_signature,
+        inputs.family.total_usage,
+    );
     let prototype = match inputs.config.lossy_collapse_prototype_mode {
         LossyCollapsePrototypeMode::Medoid => medoid.clone(),
         LossyCollapsePrototypeMode::MajorityVote => {
@@ -857,14 +1255,28 @@ pub fn build_lossy_prototype(inputs: PrototypeBuildInputs<'_>) -> (BitImage, Pro
                 threshold,
             )
         }
-        LossyCollapsePrototypeMode::MedoidThenCleanup => cleanup_symbol_bitmap(&medoid, 1),
-        LossyCollapsePrototypeMode::MedoidWithAdaptiveCleanup => {
-            let iterations = if inputs.family.total_usage >= 24 || inputs.family.members.len() >= 7 {
-                2
+        LossyCollapsePrototypeMode::MedoidThenCleanup => {
+            if allow_cleanup {
+                cleanup_symbol_bitmap(&medoid, 1)
             } else {
+                medoid.clone()
+            }
+        }
+        LossyCollapsePrototypeMode::MedoidWithAdaptiveCleanup => {
+            let iterations = if allow_cleanup
+                && (inputs.family.total_usage >= 24 || inputs.family.members.len() >= 7)
+            {
+                2
+            } else if allow_cleanup {
                 1
+            } else {
+                0
             };
-            cleanup_symbol_bitmap(&medoid, iterations)
+            if iterations == 0 {
+                medoid.clone()
+            } else {
+                cleanup_symbol_bitmap(&medoid, iterations)
+            }
         }
     };
 

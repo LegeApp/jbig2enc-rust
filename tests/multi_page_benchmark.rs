@@ -12,7 +12,7 @@
 //!                   example: BENCH_PAGES=1,5,10,20,50,100,all
 //!   BENCH_SOURCE  — dataset folder under repo root (default: "confed")
 //!   BENCH_WRITE   — set to "0" to disable writing JBIG2 fragments + decoded PBMs (default: write)
-//!   BENCH_MODES   — comma-separated modes to run: `generic`, `symbol`, `sym_collapse`, `sym_refine`
+//!   BENCH_MODES   — comma-separated modes to run: `generic`, `symbol`, `sym_collapse`, `sym_unify`, `sym_refine`
 //!   BENCH_COLLAPSE_MIN_FAMILY
 //!   BENCH_COLLAPSE_MIN_USAGE
 //!   BENCH_COLLAPSE_MIN_TOTAL_USAGE
@@ -21,11 +21,16 @@
 //!   BENCH_COLLAPSE_MAX_ERR
 //!   BENCH_COLLAPSE_MAX_DX
 //!   BENCH_COLLAPSE_MAX_DY
+//!   BENCH_COLLAPSE_MIN_WIDTH_RATIO
+//!   BENCH_COLLAPSE_MIN_HEIGHT_RATIO
+//!   BENCH_COLLAPSE_MIN_BLACK_RATIO
+//!   BENCH_COLLAPSE_CONTEXT — `jaccard`, `cosine`, or `hybrid`
 //!   BENCH_COLLAPSE_PROTO — `medoid`, `cleanup`, or `majority`
 
 use jbig2enc_rust::jbig2enc::{EncoderMetrics, Jbig2Encoder, PdfSplitOutput};
 use jbig2enc_rust::jbig2structs::{
-    Jbig2Config, LossyCollapsePrototypeMode, LossyCollapsePrototypeSelectorMode,
+    Jbig2Config, LossyCollapseContextMode, LossyCollapsePrototypeMode,
+    LossyCollapsePrototypeSelectorMode,
 };
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -301,7 +306,21 @@ fn collapse_selector_mode() -> LossyCollapsePrototypeSelectorMode {
         .as_str()
     {
         "support" | "support-biased" => LossyCollapsePrototypeSelectorMode::SupportBiased,
+        "dense" | "dense-center" => LossyCollapsePrototypeSelectorMode::DenseCenter,
+        "dense-trim" | "dense-trimmed" => LossyCollapsePrototypeSelectorMode::DenseTrimmed,
         _ => LossyCollapsePrototypeSelectorMode::Baseline,
+    }
+}
+
+fn collapse_context_mode() -> LossyCollapseContextMode {
+    match std::env::var("BENCH_COLLAPSE_CONTEXT")
+        .unwrap_or_else(|_| "hybrid".to_string())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jaccard" | "weighted-jaccard" => LossyCollapseContextMode::WeightedJaccard,
+        "cosine" => LossyCollapseContextMode::Cosine,
+        _ => LossyCollapseContextMode::Hybrid,
     }
 }
 
@@ -338,9 +357,62 @@ fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig
         env_parse_or("BENCH_COLLAPSE_MAX_DX", cfg_collapse.lossy_collapse_max_dx);
     cfg_collapse.lossy_collapse_max_dy =
         env_parse_or("BENCH_COLLAPSE_MAX_DY", cfg_collapse.lossy_collapse_max_dy);
+    cfg_collapse.lossy_collapse_min_width_ratio_permille = env_parse_or(
+        "BENCH_COLLAPSE_MIN_WIDTH_RATIO",
+        cfg_collapse.lossy_collapse_min_width_ratio_permille,
+    );
+    cfg_collapse.lossy_collapse_min_height_ratio_permille = env_parse_or(
+        "BENCH_COLLAPSE_MIN_HEIGHT_RATIO",
+        cfg_collapse.lossy_collapse_min_height_ratio_permille,
+    );
+    cfg_collapse.lossy_collapse_min_black_ratio_permille = env_parse_or(
+        "BENCH_COLLAPSE_MIN_BLACK_RATIO",
+        cfg_collapse.lossy_collapse_min_black_ratio_permille,
+    );
+    cfg_collapse.lossy_collapse_context_mode = collapse_context_mode();
     cfg_collapse.lossy_collapse_prototype_mode = collapse_proto_mode();
     cfg_collapse.lossy_collapse_prototype_selector_mode = collapse_selector_mode();
     cfgs.push(("sym_collapse", cfg_collapse));
+
+    let mut cfg_unify = Jbig2Config::text_symbol_unify();
+    cfg_unify.auto_thresh = false;
+    cfg_unify.want_full_headers = false;
+    cfg_unify.lossy_collapse_min_family_size =
+        env_parse_or("BENCH_COLLAPSE_MIN_FAMILY", cfg_unify.lossy_collapse_min_family_size);
+    cfg_unify.lossy_collapse_min_usage =
+        env_parse_or("BENCH_COLLAPSE_MIN_USAGE", cfg_unify.lossy_collapse_min_usage);
+    cfg_unify.lossy_collapse_min_total_usage = env_parse_or(
+        "BENCH_COLLAPSE_MIN_TOTAL_USAGE",
+        cfg_unify.lossy_collapse_min_total_usage,
+    );
+    cfg_unify.lossy_collapse_min_prototype_usage = env_parse_or(
+        "BENCH_COLLAPSE_MIN_PROTO_USAGE",
+        cfg_unify.lossy_collapse_min_prototype_usage,
+    );
+    cfg_unify.lossy_collapse_min_page_span = env_parse_or(
+        "BENCH_COLLAPSE_MIN_PAGE_SPAN",
+        cfg_unify.lossy_collapse_min_page_span,
+    );
+    cfg_unify.lossy_collapse_max_err =
+        env_parse_or("BENCH_COLLAPSE_MAX_ERR", cfg_unify.lossy_collapse_max_err);
+    cfg_unify.lossy_collapse_max_dx =
+        env_parse_or("BENCH_COLLAPSE_MAX_DX", cfg_unify.lossy_collapse_max_dx);
+    cfg_unify.lossy_collapse_max_dy =
+        env_parse_or("BENCH_COLLAPSE_MAX_DY", cfg_unify.lossy_collapse_max_dy);
+    cfg_unify.lossy_collapse_min_width_ratio_permille = env_parse_or(
+        "BENCH_COLLAPSE_MIN_WIDTH_RATIO",
+        cfg_unify.lossy_collapse_min_width_ratio_permille,
+    );
+    cfg_unify.lossy_collapse_min_height_ratio_permille = env_parse_or(
+        "BENCH_COLLAPSE_MIN_HEIGHT_RATIO",
+        cfg_unify.lossy_collapse_min_height_ratio_permille,
+    );
+    cfg_unify.lossy_collapse_min_black_ratio_permille = env_parse_or(
+        "BENCH_COLLAPSE_MIN_BLACK_RATIO",
+        cfg_unify.lossy_collapse_min_black_ratio_permille,
+    );
+    cfg_unify.lossy_collapse_context_mode = collapse_context_mode();
+    cfgs.push(("sym_unify", cfg_unify));
 
     let _ = (count, total_pixels);
     #[cfg(feature = "refine")]
