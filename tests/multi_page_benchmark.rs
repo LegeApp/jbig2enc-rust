@@ -24,6 +24,7 @@
 //!   BENCH_UNIFY_MIN_PAGE_SPAN
 //!   BENCH_UNIFY_MIN_GAIN
 //!   BENCH_UNIFY_BORDER_SLACK
+//!   BENCH_UNIFY_SCORE_RESCUE_SLACK
 //!   BENCH_UNIFY_MAX_BORDER_OUTSIDE
 //!   BENCH_UNIFY_CONTEXT_MODE — `jaccard`, `cosine`, or `hybrid`
 
@@ -346,12 +347,9 @@ fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig
     cfg_unify.want_full_headers = false;
     cfg_unify.sym_unify_min_class_size =
         env_parse_or("BENCH_UNIFY_MIN_CLASS", cfg_unify.sym_unify_min_class_size);
-    cfg_unify.sym_unify_max_err =
-        env_parse_or("BENCH_UNIFY_MAX_ERR", cfg_unify.sym_unify_max_err);
-    cfg_unify.sym_unify_max_dx =
-        env_parse_or("BENCH_UNIFY_MAX_DX", cfg_unify.sym_unify_max_dx);
-    cfg_unify.sym_unify_max_dy =
-        env_parse_or("BENCH_UNIFY_MAX_DY", cfg_unify.sym_unify_max_dy);
+    cfg_unify.sym_unify_max_err = env_parse_or("BENCH_UNIFY_MAX_ERR", cfg_unify.sym_unify_max_err);
+    cfg_unify.sym_unify_max_dx = env_parse_or("BENCH_UNIFY_MAX_DX", cfg_unify.sym_unify_max_dx);
+    cfg_unify.sym_unify_max_dy = env_parse_or("BENCH_UNIFY_MAX_DY", cfg_unify.sym_unify_max_dy);
     cfg_unify.sym_unify_class_accept_limit = env_parse_or(
         "BENCH_UNIFY_CLASS_ACCEPT",
         cfg_unify.sym_unify_class_accept_limit,
@@ -379,6 +377,10 @@ fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig
     cfg_unify.sym_unify_border_score_slack = env_parse_or(
         "BENCH_UNIFY_BORDER_SLACK",
         cfg_unify.sym_unify_border_score_slack,
+    );
+    cfg_unify.sym_unify_score_rescue_slack = env_parse_or(
+        "BENCH_UNIFY_SCORE_RESCUE_SLACK",
+        cfg_unify.sym_unify_score_rescue_slack,
     );
     cfg_unify.sym_unify_max_border_outside_ink = env_parse_or(
         "BENCH_UNIFY_MAX_BORDER_OUTSIDE",
@@ -451,9 +453,7 @@ fn multi_page_compression_benchmark() {
         std::fs::create_dir_all(&out_dir).unwrap();
     }
 
-    println!(
-        "Source: {source_name}/ ({total_pages} pages)  |  Write fragments: {write_outputs}"
-    );
+    println!("Source: {source_name}/ ({total_pages} pages)  |  Write fragments: {write_outputs}");
     if let Some(filter) = &mode_filter {
         println!("Modes: {:?}", filter);
     }

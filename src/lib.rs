@@ -120,14 +120,15 @@ pub mod jbig2arith;
 #[cfg(feature = "cc-analysis")]
 pub mod jbig2cc;
 pub mod jbig2classify;
-pub mod jbig2context;
-pub mod jbig2unify;
 pub mod jbig2comparator;
+pub mod jbig2context;
+pub mod jbig2cost;
 pub mod jbig2enc;
 pub mod jbig2halftone;
 pub mod jbig2shared;
 pub mod jbig2structs;
 pub mod jbig2sym;
+pub mod jbig2unify;
 
 // Re-export the main encode functions and config
 pub use crate::jbig2arith::Jbig2ArithCoder;

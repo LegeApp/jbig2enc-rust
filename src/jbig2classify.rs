@@ -1,5 +1,4 @@
 use crate::jbig2comparator::Comparator;
-use crate::jbig2structs::Jbig2Config;
 use crate::jbig2sym::BitImage;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -257,65 +256,6 @@ pub fn estimate_symbol_scale_profile(
         ref_height: weighted_median_usize(&mut heights).max(1),
         ref_black: weighted_median_u32(&mut blacks).max(1),
     }
-}
-
-#[inline]
-pub fn symbol_is_fragile_relative_to_scale(
-    config: &Jbig2Config,
-    scale_profile: SymbolScaleProfile,
-    symbol: &BitImage,
-    sig: &SymbolSignature,
-) -> bool {
-    let ref_width = scale_profile.ref_width.max(1);
-    let ref_height = scale_profile.ref_height.max(1);
-    let ref_black = scale_profile.ref_black.max(1);
-
-    symbol.width.saturating_mul(1000)
-        < ref_width.saturating_mul(config.fragile_mark_min_width_ratio_permille as usize)
-        || symbol.height.saturating_mul(1000)
-            < ref_height.saturating_mul(config.fragile_mark_min_height_ratio_permille as usize)
-        || sig.black.saturating_mul(1000)
-            < ref_black.saturating_mul(config.fragile_mark_min_black_ratio_permille as u32)
-}
-
-#[inline]
-pub fn symbol_looks_like_fragile_mark(
-    config: &Jbig2Config,
-    scale_profile: SymbolScaleProfile,
-    symbol: &BitImage,
-    sig: &SymbolSignature,
-) -> bool {
-    if !symbol_is_fragile_relative_to_scale(config, scale_profile, symbol, sig) {
-        return false;
-    }
-
-    let small_black = sig.black.saturating_mul(1000)
-        < scale_profile
-            .ref_black
-            .max(1)
-            .saturating_mul(config.fragile_mark_min_black_ratio_permille as u32);
-    let small_width = symbol.width.saturating_mul(1000)
-        < scale_profile
-            .ref_width
-            .max(1)
-            .saturating_mul(config.fragile_mark_min_width_ratio_permille as usize);
-    let small_height = symbol.height.saturating_mul(1000)
-        < scale_profile
-            .ref_height
-            .max(1)
-            .saturating_mul(config.fragile_mark_min_height_ratio_permille as usize);
-
-    let punctuation_like = symbol.width <= 4 && symbol.height <= 6 && sig.black <= 18;
-    let tittle_like = symbol.width <= 5
-        && symbol.height <= 5
-        && sig.black <= 16
-        && sig.top_mass >= sig.bottom_mass;
-    let apostrophe_like = symbol.width <= 4 && symbol.height <= 9 && sig.black <= 20;
-
-    punctuation_like
-        || tittle_like
-        || apostrophe_like
-        || (small_black && (small_width || small_height))
 }
 
 pub fn family_bucket_neighbors(key: FamilyBucketKey) -> Vec<FamilyBucketKey> {

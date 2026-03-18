@@ -19,7 +19,8 @@ use std::arch::x86_64::*;
 
 /// Maximum absolute shift (in pixels) that we search in x/y.
 const SEARCH_RADIUS: i32 = 5;
-const SEARCH_OFFSETS: [i32; (SEARCH_RADIUS as usize) * 2 + 1] = [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5];
+const SEARCH_OFFSETS: [i32; (SEARCH_RADIUS as usize) * 2 + 1] =
+    [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5];
 /// Maximum width/height delta that can still produce a match.
 pub const MAX_DIMENSION_DELTA: usize = (SEARCH_RADIUS as usize) * 2;
 
@@ -78,7 +79,8 @@ impl CompareWeights {
 
     #[inline]
     pub fn score(&self, r: &CompareResult) -> u32 {
-        self.overlap_err.saturating_mul(r.overlap_err)
+        self.overlap_err
+            .saturating_mul(r.overlap_err)
             .saturating_add(self.outside_ink_err.saturating_mul(r.outside_ink_err))
             .saturating_add(self.row_profile_err.saturating_mul(r.row_profile_err))
             .saturating_add(self.col_profile_err.saturating_mul(r.col_profile_err))
@@ -432,14 +434,10 @@ impl Comparator {
                 let bx = gx - dx;
                 let by = gy - dy;
 
-                let in_a = ax >= 0
-                    && ay >= 0
-                    && (ax as usize) < a.width
-                    && (ay as usize) < a.height;
-                let in_b = bx >= 0
-                    && by >= 0
-                    && (bx as usize) < b.width
-                    && (by as usize) < b.height;
+                let in_a =
+                    ax >= 0 && ay >= 0 && (ax as usize) < a.width && (ay as usize) < a.height;
+                let in_b =
+                    bx >= 0 && by >= 0 && (bx as usize) < b.width && (by as usize) < b.height;
                 let a_on = in_a && a.get_usize(ax as usize, ay as usize);
                 let b_on = in_b && b.get_usize(bx as usize, by as usize);
 
@@ -537,7 +535,11 @@ unsafe fn count_row_range_ones(
         } else {
             0
         };
-        let range_start = if word_index == start_word { start_bit } else { 0 };
+        let range_start = if word_index == start_word {
+            start_bit
+        } else {
+            0
+        };
         let range_end = if word_index == end_word { end_bit } else { 32 };
         word &= row_range_mask(range_start, range_end);
         total += word.count_ones();
@@ -571,7 +573,11 @@ unsafe fn count_row_overlap_xor(
         } else {
             unsafe { *a_row.add(a_idx as usize) }
         };
-        let mut bw = if w >= bwpr { 0 } else { unsafe { *b_row.add(w) } };
+        let mut bw = if w >= bwpr {
+            0
+        } else {
+            unsafe { *b_row.add(w) }
+        };
         let aligned_a = if bit_shift == 0 {
             aw
         } else {
@@ -690,7 +696,11 @@ unsafe fn row_kernel_noshift(
         }
     }
 
-    unsafe { row_kernel_noshift_scalar(a_row, a_len, b_row, cols_words, word_shift, err, best_err, max_err) }
+    unsafe {
+        row_kernel_noshift_scalar(
+            a_row, a_len, b_row, cols_words, word_shift, err, best_err, max_err,
+        )
+    }
 }
 
 #[inline(always)]
@@ -712,8 +722,7 @@ unsafe fn row_kernel_shift(
         if has_popcnt {
             return unsafe {
                 row_kernel_shift_scalar_popcnt(
-                    a_row, a_len, b_row, cols_words, word_shift, bit_shift, err, best_err,
-                    max_err,
+                    a_row, a_len, b_row, cols_words, word_shift, bit_shift, err, best_err, max_err,
                 )
             };
         }
@@ -886,7 +895,8 @@ unsafe fn row_kernel_shift_avx2(
         }
 
         let av = unsafe { _mm256_loadu_si256(a_row.add(a_idx as usize) as *const __m256i) };
-        let av_next = unsafe { _mm256_loadu_si256(a_row.add(a_idx as usize + 1) as *const __m256i) };
+        let av_next =
+            unsafe { _mm256_loadu_si256(a_row.add(a_idx as usize + 1) as *const __m256i) };
         let aligned = _mm256_or_si256(
             _mm256_sllv_epi32(av, lshift_vec),
             _mm256_srlv_epi32(av_next, rshift_vec),

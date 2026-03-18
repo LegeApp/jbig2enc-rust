@@ -1,10 +1,10 @@
 use crate::jbig2classify::{
-    FamilyBucketKey, SymbolScaleProfile, SymbolSignature, estimate_symbol_scale_profile,
-    family_bucket_key_for_symbol, family_match_details, family_signatures_are_compatible,
-    for_each_family_bucket_neighbor, refine_compare_score, symbol_looks_like_fragile_mark,
+    FamilyBucketKey, SymbolSignature, family_bucket_key_for_symbol, family_match_details,
+    family_signatures_are_compatible, for_each_family_bucket_neighbor, refine_compare_score,
 };
-use crate::jbig2context::{ContextDecision, SymbolContextModel};
 use crate::jbig2comparator::{Comparator, CompareResult};
+use crate::jbig2context::{ContextDecision, SymbolContextModel};
+use crate::jbig2cost::symbol_dictionary_entry_bytes;
 use crate::jbig2structs::Jbig2Config;
 use crate::jbig2sym::BitImage;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -41,7 +41,6 @@ pub struct UnifiedClass {
     pub retained_border_members: usize,
     pub retained_outlier_members: usize,
     pub candidate_subclusters: usize,
-    pub split_fragile_members: usize,
     pub estimated_gain: i32,
 }
 
@@ -150,7 +149,10 @@ fn prescreen_pair(
         return false;
     }
 
-    let area = lhs.width.max(rhs.width).saturating_mul(lhs.height.max(rhs.height));
+    let area = lhs
+        .width
+        .max(rhs.width)
+        .saturating_mul(lhs.height.max(rhs.height));
     let pixel_delta_limit = (area / 10).clamp(4, 16);
     if lhs_black.abs_diff(rhs_black) > pixel_delta_limit {
         return false;
@@ -164,20 +166,6 @@ fn prescreen_pair(
         && result.dy.abs() <= max_dy
         && result.overlap_err <= overlap_limit
         && result.black_delta <= pixel_delta_limit as u32
-}
-
-#[inline]
-fn fragile_mark_indices(
-    config: &Jbig2Config,
-    scale_profile: SymbolScaleProfile,
-    symbols: &[BitImage],
-    signatures: &[SymbolSignature],
-) -> Vec<bool> {
-    symbols
-        .iter()
-        .zip(signatures.iter())
-        .map(|(symbol, sig)| symbol_looks_like_fragile_mark(config, scale_profile, symbol, sig))
-        .collect()
 }
 
 fn find_root(parent: &mut [usize], index: usize) -> usize {
@@ -325,7 +313,10 @@ fn dense_core_component(
 
     let components = connected_components_for_members(&core_nodes, close_edges);
     let candidate_subclusters = components.len().saturating_sub(1);
-    (components.into_iter().next().unwrap_or_default(), candidate_subclusters)
+    (
+        components.into_iter().next().unwrap_or_default(),
+        candidate_subclusters,
+    )
 }
 
 fn triage_non_core_members(
@@ -394,10 +385,7 @@ fn triage_non_core_members(
                         && obs.result.outside_ink_err <= max_border_outside_ink.min(1)
                 }
             };
-            if border_accept
-                && obs.result.dx.abs() <= max_dx
-                && obs.result.dy.abs() <= max_dy
-            {
+            if border_accept && obs.result.dx.abs() <= max_dx && obs.result.dy.abs() <= max_dy {
                 triage.border_members.push(UnifiedClassMember {
                     member_index: member,
                     dx: obs.result.dx,
@@ -443,7 +431,7 @@ fn estimated_refinement_member_gain(
     usage_count: usize,
     page_span: usize,
 ) -> i32 {
-    let export_savings = (((target.width.saturating_mul(target.height) + 7) / 8) as i32 + 10)
+    let export_savings = symbol_dictionary_entry_bytes(target) as i32
         + (usage_count.min(12) as i32) * 3
         + (page_span.min(6) as i32) * 4;
     let refine_cost = 10
@@ -623,7 +611,8 @@ fn estimate_class_gain(
     retained_outlier_members: usize,
     representative_score: u64,
 ) -> GainBreakdown {
-    if unified_members.is_empty() && border_members.is_empty() && refinement_subclusters.is_empty() {
+    if unified_members.is_empty() && border_members.is_empty() && refinement_subclusters.is_empty()
+    {
         return GainBreakdown {
             bitmap_savings: 0,
             id_savings: 0,
@@ -638,7 +627,7 @@ fn estimate_class_gain(
         .chain(border_members.iter())
         .map(|member| {
             let symbol = &symbols[member.member_index];
-            ((symbol.width.saturating_mul(symbol.height) + 7) / 8) as i32 + 10
+            symbol_dictionary_entry_bytes(symbol) as i32
         })
         .sum::<i32>()
         + refinement_subclusters
@@ -646,7 +635,7 @@ fn estimate_class_gain(
             .flat_map(|subcluster| subcluster.refined_members.iter())
             .map(|member| {
                 let symbol = &symbols[member.member_index];
-                ((symbol.width.saturating_mul(symbol.height) + 7) / 8) as i32 + 10
+                symbol_dictionary_entry_bytes(symbol) as i32
             })
             .sum::<i32>();
     let id_savings: i32 = unified_members
@@ -670,7 +659,7 @@ fn estimate_class_gain(
 
     let representative_penalty = {
         let symbol = &symbols[representative_index];
-        (((symbol.width.saturating_mul(symbol.height) + 7) / 8) as i32 / 2)
+        (symbol_dictionary_entry_bytes(symbol) as i32 / 2)
             + (representative_score.min(1024) as i32 / 12)
     };
     let retained_penalty = retained_border_members as i32 * 8
@@ -782,20 +771,9 @@ pub fn build_symbol_unify_classes(
         .config
         .sym_unify_core_close_threshold
         .min(class_accept_limit);
-    let border_accept_limit = class_accept_limit
-        .saturating_add(inputs.config.sym_unify_border_score_slack);
+    let border_accept_limit =
+        class_accept_limit.saturating_add(inputs.config.sym_unify_border_score_slack);
 
-    let scale_profile = estimate_symbol_scale_profile(
-        inputs.global_symbols,
-        inputs.symbol_signatures,
-        inputs.symbol_usage,
-    );
-    let fragile_marks = fragile_mark_indices(
-        inputs.config,
-        scale_profile,
-        inputs.global_symbols,
-        inputs.symbol_signatures,
-    );
     let bucket_keys: Vec<FamilyBucketKey> = inputs
         .global_symbols
         .iter()
@@ -811,13 +789,15 @@ pub fn build_symbol_unify_classes(
 
     let mut comparator = Comparator::default();
     let mut pair_cache: FxHashMap<u64, Option<PairObservation>> =
-        FxHashMap::with_capacity_and_hasher(inputs.global_symbols.len().saturating_mul(16), Default::default());
+        FxHashMap::with_capacity_and_hasher(
+            inputs.global_symbols.len().saturating_mul(16),
+            Default::default(),
+        );
     let mut parent: Vec<usize> = (0..inputs.global_symbols.len()).collect();
     let mut rank = vec![0u8; inputs.global_symbols.len()];
     let mut accepted_edges: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     let mut reject_reason_counts: FxHashMap<&'static str, usize> = FxHashMap::default();
     let mut accepted_edge_count = 0usize;
-    let mut skipped_fragile_pairs = 0usize;
 
     for symbol_index in 0..inputs.global_symbols.len() {
         let key = bucket_keys[symbol_index];
@@ -829,11 +809,6 @@ pub fn build_symbol_unify_classes(
                 if other_index <= symbol_index {
                     continue;
                 }
-                if fragile_marks[symbol_index] || fragile_marks[other_index] {
-                    skipped_fragile_pairs += 1;
-                    continue;
-                }
-
                 let context_decision = inputs
                     .context_model
                     .map(|model| {
@@ -878,8 +853,14 @@ pub fn build_symbol_unify_classes(
 
                 accepted_edge_count += 1;
                 union(&mut parent, &mut rank, symbol_index, other_index);
-                accepted_edges.entry(symbol_index).or_default().push(other_index);
-                accepted_edges.entry(other_index).or_default().push(symbol_index);
+                accepted_edges
+                    .entry(symbol_index)
+                    .or_default()
+                    .push(other_index);
+                accepted_edges
+                    .entry(other_index)
+                    .or_default()
+                    .push(symbol_index);
             }
         });
     }
@@ -894,17 +875,12 @@ pub fn build_symbol_unify_classes(
     let mut diagnostics = UnifyBuildDiagnostics::default();
     if inputs.collect_diagnostics {
         diagnostics.lines.push(format!(
-            "sym_unify class build: symbols={} accepted_edges={} compare_rejects={} score_rejects={} context_rejects={} fragile_pair_splits={}",
+            "sym_unify class build: symbols={} accepted_edges={} compare_rejects={} score_rejects={} context_rejects={}",
             inputs.global_symbols.len(),
             accepted_edge_count,
             reject_reason_counts.get("compare").copied().unwrap_or(0),
             reject_reason_counts.get("score").copied().unwrap_or(0),
             reject_reason_counts.get("context").copied().unwrap_or(0),
-            skipped_fragile_pairs
-        ));
-        diagnostics.lines.push(format!(
-            "sym_unify fragile marks: count={}",
-            fragile_marks.iter().filter(|&&mark| mark).count()
         ));
     }
 
@@ -913,18 +889,10 @@ pub fn build_symbol_unify_classes(
 
     let mut rejected_weak_core = 0usize;
     let mut rejected_low_gain = 0usize;
-    let mut classes_with_fragile_members = 0usize;
 
     for members in grouped {
-        let split_fragile_members = members.iter().filter(|&&index| fragile_marks[index]).count();
-        if split_fragile_members > 0 {
-            classes_with_fragile_members += 1;
-        }
-        let non_fragile_members: Vec<usize> = members
-            .iter()
-            .copied()
-            .filter(|&index| !fragile_marks[index])
-            .collect();
+        let class_size = members.len();
+        let non_fragile_members = members;
 
         if non_fragile_members.len() < inputs.config.sym_unify_min_class_size.max(2) {
             continue;
@@ -986,7 +954,7 @@ pub fn build_symbol_unify_classes(
             if inputs.collect_diagnostics {
                 diagnostics.lines.push(format!(
                     "sym_unify skip weak-core: class_size={} non_fragile={} core_size={} core_ratio_permille={} sample={:?}",
-                    members.len(),
+                    class_size,
                     non_fragile_members.len(),
                     dense_core.len(),
                     core_ratio_permille,
@@ -1108,13 +1076,8 @@ pub fn build_symbol_unify_classes(
                 retained_border_members += component.len();
             }
         }
-        let retained_outlier_members: usize = triage
-            .outlier_components
-            .iter()
-            .map(Vec::len)
-            .sum();
-        let candidate_subclusters =
-            core_subcluster_count + triage.recurring_components.len();
+        let retained_outlier_members: usize = triage.outlier_components.iter().map(Vec::len).sum();
+        let candidate_subclusters = core_subcluster_count + triage.recurring_components.len();
         let total_usage: usize = non_fragile_members
             .iter()
             .map(|&index| inputs.symbol_usage[index])
@@ -1140,7 +1103,7 @@ pub fn build_symbol_unify_classes(
             rejected_low_gain += 1;
             if inputs.collect_diagnostics {
                 diagnostics.lines.push(format!(
-                    "sym_unify skip low-gain: representative={} class_size={} core_size={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} border_unified={} refined_subclusters={} refined_members={} retained_border={} retained_outliers={} split_fragile={}",
+                    "sym_unify skip low-gain: representative={} class_size={} core_size={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} border_unified={} refined_subclusters={} refined_members={} retained_border={} retained_outliers={}",
                     representative_index,
                     non_fragile_members.len(),
                     dense_core.len(),
@@ -1156,8 +1119,7 @@ pub fn build_symbol_unify_classes(
                         .map(|subcluster| subcluster.refined_members.len())
                         .sum::<usize>(),
                     retained_border_members,
-                    retained_outlier_members,
-                    split_fragile_members
+                    retained_outlier_members
                 ));
             }
             continue;
@@ -1177,7 +1139,7 @@ pub fn build_symbol_unify_classes(
                 ));
             }
             diagnostics.lines.push(format!(
-                "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} refined_subclusters={} refined_members={} retained_border={} retained_outliers={} split_fragile={} total_usage={} page_span={} rep_usage={} rep_pages={} rep_score={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} subclusters={}",
+                "sym_unify class: representative={} class_size={} core_size={} unified={} border_unified={} refined_subclusters={} refined_members={} retained_border={} retained_outliers={} total_usage={} page_span={} rep_usage={} rep_pages={} rep_score={} gain={} bitmap={} ids={} rep_penalty={} retained_penalty={} subclusters={}",
                 representative_index,
                 non_fragile_members.len(),
                 dense_core.len(),
@@ -1190,7 +1152,6 @@ pub fn build_symbol_unify_classes(
                     .sum::<usize>(),
                 retained_border_members,
                 retained_outlier_members,
-                split_fragile_members,
                 total_usage,
                 page_span,
                 inputs.symbol_usage[representative_index],
@@ -1218,13 +1179,13 @@ pub fn build_symbol_unify_classes(
             retained_border_members,
             retained_outlier_members,
             candidate_subclusters,
-            split_fragile_members,
             estimated_gain: gain.net_gain,
         });
     }
 
     let unified_members: usize = classes.iter().map(|class| class.core_members.len()).sum();
-    let border_unified_members: usize = classes.iter().map(|class| class.border_members.len()).sum();
+    let border_unified_members: usize =
+        classes.iter().map(|class| class.border_members.len()).sum();
     let refined_members: usize = classes
         .iter()
         .flat_map(|class| class.refinement_subclusters.iter())
@@ -1232,7 +1193,7 @@ pub fn build_symbol_unify_classes(
         .sum();
     if inputs.collect_diagnostics {
         diagnostics.lines.push(format!(
-            "sym_unify summary: classes={} unified_members={} border_unified_members={} refined_members={} retained_border_members={} retained_outlier_members={} rejected_weak_core={} rejected_low_gain={} classes_with_fragile_members={}",
+            "sym_unify summary: classes={} unified_members={} border_unified_members={} refined_members={} retained_border_members={} retained_outlier_members={} rejected_weak_core={} rejected_low_gain={}",
             classes.len(),
             unified_members,
             border_unified_members,
@@ -1246,8 +1207,7 @@ pub fn build_symbol_unify_classes(
                 .map(|class| class.retained_outlier_members)
                 .sum::<usize>(),
             rejected_weak_core,
-            rejected_low_gain,
-            classes_with_fragile_members
+            rejected_low_gain
         ));
     }
 

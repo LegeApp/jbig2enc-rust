@@ -201,13 +201,25 @@ impl SymbolContextModel {
             .values()
             .map(|&v| v as u32)
             .sum::<u32>()
-            .min(rhs_stats.left_tokens.values().map(|&v| v as u32).sum::<u32>());
+            .min(
+                rhs_stats
+                    .left_tokens
+                    .values()
+                    .map(|&v| v as u32)
+                    .sum::<u32>(),
+            );
         let right_mass: u32 = lhs_stats
             .right_tokens
             .values()
             .map(|&v| v as u32)
             .sum::<u32>()
-            .min(rhs_stats.right_tokens.values().map(|&v| v as u32).sum::<u32>());
+            .min(
+                rhs_stats
+                    .right_tokens
+                    .values()
+                    .map(|&v| v as u32)
+                    .sum::<u32>(),
+            );
 
         if similarity.evidence < 4 || left_mass + right_mass < 4 {
             return ContextDecision::Unknown;

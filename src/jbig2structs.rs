@@ -53,9 +53,6 @@ pub struct Jbig2Config {
     /// Typical range: 4 (aggressive) to 10 (conservative). Default: 7.
     pub match_tolerance: u32,
     pub lossy_symbol_mode: LossySymbolMode,
-    pub fragile_mark_min_width_ratio_permille: u16,
-    pub fragile_mark_min_height_ratio_permille: u16,
-    pub fragile_mark_min_black_ratio_permille: u16,
     pub sym_unify_min_class_size: usize,
     pub sym_unify_max_err: u32,
     pub sym_unify_max_dx: i32,
@@ -68,6 +65,7 @@ pub struct Jbig2Config {
     pub sym_unify_min_estimated_gain: i32,
     pub sym_unify_context_mode: SymbolContextMode,
     pub sym_unify_border_score_slack: u32,
+    pub sym_unify_score_rescue_slack: u32,
     pub sym_unify_max_border_outside_ink: u32,
     pub sym_unify_refine_min_subcluster_size: usize,
     pub sym_unify_refine_min_usage: usize,
@@ -152,9 +150,6 @@ impl Default for Jbig2Config {
             default_pixel: false,
             match_tolerance: 7,
             lossy_symbol_mode: LossySymbolMode::Off,
-            fragile_mark_min_width_ratio_permille: 450,
-            fragile_mark_min_height_ratio_permille: 550,
-            fragile_mark_min_black_ratio_permille: 300,
             sym_unify_min_class_size: 2,
             sym_unify_max_err: 12,
             sym_unify_max_dx: 1,
@@ -167,6 +162,7 @@ impl Default for Jbig2Config {
             sym_unify_min_estimated_gain: 0,
             sym_unify_context_mode: SymbolContextMode::Hybrid,
             sym_unify_border_score_slack: 4,
+            sym_unify_score_rescue_slack: 2,
             sym_unify_max_border_outside_ink: 1,
             sym_unify_refine_min_subcluster_size: 2,
             sym_unify_refine_min_usage: 12,
@@ -212,6 +208,7 @@ impl Jbig2Config {
         cfg.sym_unify_min_estimated_gain = 0;
         cfg.sym_unify_context_mode = SymbolContextMode::Hybrid;
         cfg.sym_unify_border_score_slack = 4;
+        cfg.sym_unify_score_rescue_slack = 2;
         cfg.sym_unify_max_border_outside_ink = 1;
         cfg.sym_unify_refine_min_subcluster_size = 2;
         cfg.sym_unify_refine_min_usage = 12;
@@ -580,14 +577,21 @@ pub struct SymbolDictParams {
     pub refine_aggregate: bool,
     pub refine_template: u8,
     pub refine_at: [(i8, i8); 2],
-    pub exsyms: u32,       // Number of exported symbols
-    pub newsyms: u32,      // Number of new symbols
+    pub exsyms: u32,  // Number of exported symbols
+    pub newsyms: u32, // Number of new symbols
 }
 
 impl SymbolDictParams {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            2 + 8 + if self.refine_aggregate && self.refine_template == 0 { 4 } else { 0 } + 4 + 4,
+            2 + 8
+                + if self.refine_aggregate && self.refine_template == 0 {
+                    4
+                } else {
+                    0
+                }
+                + 4
+                + 4,
         );
 
         let mut flags = 0u16;
