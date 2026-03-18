@@ -1,0 +1,4 @@
+pages,mode,encode_secs,ms_per_page,mpix_per_s,raw_jbig2_bytes,globals_bytes,pdf_bytes,savings_vs_generic,savings_vs_pbm
+10,generic,0.2025,20.25,44.14,201513,0,205829,0.00,82.14
+10,sym_no_at,1.7098,170.98,5.23,171180,11796,175906,15.05,84.83
+10,sym_at,27.7133,2771.33,0.32,169501,11761,174227,15.89,84.98

@@ -1,5 +1,4 @@
 // Integration tests for JBIG2 encoder core functionality
-use jbig2enc_rust as jbig2;
 
 use std::error::Error;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -7,12 +6,12 @@ use std::process::Command;
 use std::time::Instant;
 use tempfile::TempDir;
 
-use jbig2::jbig2arith::{Jbig2ArithCoder, State, BASE};
+use jbig2::jbig2arith::{BASE, Jbig2ArithCoder, State};
 use jbig2::jbig2sym::{BitImage, Symbol};
 // Import the common test utilities
 mod common;
-use common::{load_pbm, load_test_pbm, TEST_IMAGE1_PBM, TEST_IMAGE_PBM};
-use jbig2::jbig2enc::{encode_page_with_symbol_dictionary, encode_symbol_dict, Jbig2Encoder};
+use common::{TEST_IMAGE_PBM, TEST_IMAGE1_PBM, load_pbm, load_test_pbm};
+use jbig2::jbig2enc::{Jbig2Encoder, encode_page_with_symbol_dictionary, encode_symbol_dict};
 use jbig2::jbig2structs::Jbig2Config;
 use jbig2::jbig2sym::array_to_bitimage;
 use ndarray::Array2;
@@ -496,7 +495,7 @@ fn test_encode_page_with_symbol_dictionary() -> Result<(), Box<dyn Error>> {
 
 #[cfg(any(feature = "trace_encoder", feature = "trace_arith"))]
 fn init_tracing_for_test() {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::new("trace");
     let _subscriber = fmt().with_env_filter(filter).init();
     tracing::debug!("Tracing initialized for test with trace level");

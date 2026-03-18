@@ -6,7 +6,7 @@ use bitvec::order::Msb0;
 use bitvec::prelude::*;
 use bitvec::slice::BitSlice;
 use ndarray::Array2;
-use once_cell::unsync::OnceCell;
+use once_cell::sync::OnceCell;
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
@@ -173,6 +173,7 @@ impl BitImage {
 
     /// Returns a mutable view of the bitmap.
     pub fn as_mut_bits(&mut self) -> &mut BitSlice<u8, Msb0> {
+        let _ = self.packed_cache.take();
         &mut self.bits
     }
 
@@ -182,38 +183,42 @@ impl BitImage {
         self.bits.get(idx).map_or(false, |b| *b)
     }
 
-    /// Converts to packed 32-bit words for efficient comparison. Results are
-    /// cached to avoid repeated work when the same image is processed multiple
-    /// times.
-    pub fn to_packed_words(&self) -> Vec<u32> {
-        let cached = self.packed_cache.get_or_init(|| {
+    /// Returns packed 32-bit words for efficient comparison and generic-region
+    /// encoding. Results are cached to avoid repeated repacking work.
+    pub fn packed_words(&self) -> &[u32] {
+        self.packed_cache.get_or_init(|| {
             let words_per_row = (self.width + 31) / 32;
             let mut out = Vec::with_capacity(words_per_row * self.height);
 
             for y in 0..self.height {
-                for word_x in 0..words_per_row {
-                    let mut w = 0u32;
+                let row_offset = y * self.width;
+                let row_bits = &self.bits[row_offset..row_offset + self.width];
+                let mut row_bytes = row_bits.chunks(8).map(|chunk| {
+                    let mut byte = chunk.load_be::<u8>();
+                    if chunk.len() < 8 {
+                        byte <<= 8 - chunk.len();
+                    }
+                    byte
+                });
 
-                    // pack up to 32 pixels, MSb-first in each u32 word
-                    for bit in 0..32 {
-                        let x = word_x * 32 + bit;
-                        if x < self.width {
-                            // self.get_usize(x,y) -> true means a black pixel at (x,y)
-                            if self.get_usize(x, y) {
-                                // shift so that bit 31 is leftmost, bit 0 is rightmost
-                                w |= 1u32 << (31 - bit);
-                            }
+                for _ in 0..words_per_row {
+                    let mut word = 0u32;
+                    for byte_idx in 0..4 {
+                        if let Some(byte) = row_bytes.next() {
+                            word |= (byte as u32) << (24 - byte_idx * 8);
                         }
                     }
-
-                    out.push(w);
+                    out.push(word);
                 }
             }
 
             out
-        });
+        })
+    }
 
-        cached.clone()
+    /// Converts to packed 32-bit words for callers that need owned storage.
+    pub fn to_packed_words(&self) -> Vec<u32> {
+        self.packed_words().to_vec()
     }
 
     /// Gets a pixel value at (x, y).
@@ -265,6 +270,7 @@ impl BitImage {
     pub fn set(&mut self, x: u32, y: u32, value: bool) {
         if x < usize_to_u32(self.width) && y < usize_to_u32(self.height) {
             let idx = u32_to_usize(y) * self.width + u32_to_usize(x);
+            let _ = self.packed_cache.take();
             self.bits.set(idx, value);
         }
     }
@@ -274,6 +280,7 @@ impl BitImage {
     pub fn set_usize(&mut self, x: usize, y: usize, value: bool) {
         if x < self.width && y < self.height {
             let idx = y * self.width + x;
+            let _ = self.packed_cache.take();
             self.bits.set(idx, value);
         }
     }
@@ -321,18 +328,20 @@ impl BitImage {
         let mut max_x = 0;
         let mut max_y = 0;
 
-        // First pass: find min_y and max_y by checking each row
+        // First pass: find min_y and max_y using word-level row scanning
         for y in 0..self.height {
-            let row_has_pixels = (0..self.width).any(|x| self.get_usize(x, y));
-            if row_has_pixels {
+            let row_start = y * self.width;
+            let row_bits = &self.bits[row_start..row_start + self.width];
+            if row_bits.any() {
                 min_y = y;
                 break;
             }
         }
 
         for y in (0..self.height).rev() {
-            let row_has_pixels = (0..self.width).any(|x| self.get_usize(x, y));
-            if row_has_pixels {
+            let row_start = y * self.width;
+            let row_bits = &self.bits[row_start..row_start + self.width];
+            if row_bits.any() {
                 max_y = y;
                 break;
             }
@@ -435,9 +444,14 @@ impl BitImage {
     }
 
     /// Gets a pixel value safely, returning 0 for out-of-bounds.
+    ///
+    /// Casting negative i32 to u32 yields a huge positive value that naturally
+    /// fails the `< width/height` check, collapsing 4 branches into 2.
+    #[inline]
     pub fn get_pixel_safely(&self, x: i32, y: i32) -> u8 {
-        if x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height {
-            self.get(x as u32, y as u32) as u8
+        if (x as u32) < (self.width as u32) && (y as u32) < (self.height as u32) {
+            let idx = (y as usize) * self.width + (x as usize);
+            self.bits[idx] as u8
         } else {
             0
         }
@@ -446,20 +460,6 @@ impl BitImage {
     /// Returns pixel data as a byte slice for hashing.
     pub fn as_bytes(&self) -> &[u8] {
         self.bits.as_raw_slice()
-    }
-}
-
-impl lutz::Image for BitImage {
-    fn width(&self) -> u32 {
-        usize_to_u32(self.width)
-    }
-
-    fn height(&self) -> u32 {
-        usize_to_u32(self.height)
-    }
-
-    fn has_pixel(&self, x: u32, y: u32) -> bool {
-        self.get(x, y)
     }
 }
 
@@ -501,6 +501,9 @@ pub struct Symbol {
 /// Groups symbols by height, and sorts symbols within each height class by width.
 /// This prepares symbols for encoding in a JBIG2 symbol dictionary.
 /// The logic mirrors the sorting from jbig2enc's `jbig2sym.cc`.
+///
+/// Uses stable sorting to preserve the input order for symbols with identical dimensions,
+/// ensuring consistency with canonicalize_dict_symbols().
 pub fn sort_symbols_for_dictionary<'a>(symbols: &[&'a BitImage]) -> Vec<Vec<&'a BitImage>> {
     let mut height_classes = BTreeMap::new();
     for symbol in symbols {
@@ -512,10 +515,11 @@ pub fn sort_symbols_for_dictionary<'a>(symbols: &[&'a BitImage]) -> Vec<Vec<&'a 
 
     // BTreeMap keys (heights) are already sorted.
     // Now sort each inner Vec (symbols of same height) by width.
+    // Use stable sort to preserve input order for equal widths.
     height_classes
         .into_values()
         .map(|mut symbol_group| {
-            symbol_group.sort_by_key(|s| s.width);
+            symbol_group.sort_by(|a, b| a.width.cmp(&b.width));
             symbol_group
         })
         .collect()
@@ -531,18 +535,45 @@ pub fn compute_glyph_hash(image: &BitImage) -> u64 {
 /// Converts an `ndarray::Array2<u8>` to a `BitImage`.
 pub fn array_to_bitimage(array: &Array2<u8>) -> BitImage {
     let (height, width) = array.dim();
-    let mut bit_image = BitImage::new(usize_to_u32(width), usize_to_u32(height))
-        .expect("Failed to create image from array");
+    let total = width * height;
+    let mut bits = bitvec::bitvec![u8, Msb0; 0; total];
 
-    for (y, row) in array.rows().into_iter().enumerate() {
-        for (x, &pixel) in row.iter().enumerate() {
+    let mut idx = 0usize;
+    for row in array.rows() {
+        for &pixel in row.iter() {
             if pixel > 0 {
-                bit_image.set(usize_to_u32(x), usize_to_u32(y), true);
+                bits.set(idx, true);
             }
+            idx += 1;
         }
     }
 
-    bit_image
+    BitImage::from_bits(width, height, &bits)
+}
+
+/// Converts unpacked binary pixels (one byte per pixel, non-zero = set) to a `BitImage`.
+pub fn binary_pixels_to_bitimage(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<BitImage, String> {
+    let expected_len = width
+        .checked_mul(height)
+        .ok_or_else(|| "Dimensions too large".to_string())?;
+    if pixels.len() < expected_len {
+        return Err(format!(
+            "Binary pixel buffer too small: expected {}, got {}",
+            expected_len,
+            pixels.len()
+        ));
+    }
+
+    let bits = pixels[..expected_len]
+        .iter()
+        .map(|&pixel| pixel > 0)
+        .collect::<BitVec<u8, Msb0>>();
+
+    Ok(BitImage::from_bits(width, height, bits.as_bitslice()))
 }
 
 /// Loads a PBM file into a BitImage
@@ -590,6 +621,23 @@ pub fn load_pbm(path: &Path) -> Result<BitImage, String> {
         .map_err(|e| format!("Read failed: {}", e))?;
 
     Ok(BitImage::from_bytes(width, height, &data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{array_to_bitimage, binary_pixels_to_bitimage};
+    use ndarray::array;
+
+    #[test]
+    fn binary_pixels_match_array_conversion() {
+        let pixels = vec![0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0];
+        let array = array![[0u8, 1, 0, 1, 1], [1u8, 0, 0, 0, 1], [0u8, 0, 1, 1, 0],];
+
+        let from_pixels = binary_pixels_to_bitimage(&pixels, 5, 3).unwrap();
+        let from_array = array_to_bitimage(&array);
+
+        assert_eq!(from_pixels, from_array);
+    }
 }
 
 /// Helper function to find the first black pixel in packed u32 data

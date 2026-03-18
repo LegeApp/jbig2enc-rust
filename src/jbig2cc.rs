@@ -9,13 +9,7 @@
 //! 1. **Runs** compress horizontal spans into (y, x1, x2) triples — a typical
 //!    document page might have ~50 000 runs vs millions of pixels.
 //! 2. **Union-find** with path compression gives near-O(n) labeling.
-//! 3. **merge_and_split_ccs** handles the two pathological cases that cause
-//!    "too many symbols":
-//!    - Tiny fragments (noise, serifs, diacritical marks that got disconnected)
-//!      are **merged** into grid cells.
-//!    - Huge components (touching characters, rules, decorative borders) are
-//!      **split** along grid lines.
-//! 4. **Reading-order sort** groups components into text lines, which is
+//! 3. **Reading-order sort** groups components into text lines, which is
 //!    critical for efficient dictionary encoding (similar shapes appear near
 //!    each other).
 //!
@@ -129,6 +123,15 @@ pub struct CC {
     pub frun: i32,
 }
 
+/// Lightweight handle for a connected component before bitmap materialization.
+#[derive(Clone, Copy, Debug)]
+pub struct ShapeRef {
+    pub ccid: usize,
+    pub bbox: BBox,
+    pub black_pixels: usize,
+    pub run_count: usize,
+}
+
 // ─── CCImage ────────────────────────────────────────────────────────────────
 
 /// An image decomposed into runs, with connected-component analysis,
@@ -180,12 +183,7 @@ impl CCImage {
 
     /// Add a single run.
     pub fn add_single_run(&mut self, y: i32, x1: i32, x2: i32) {
-        self.runs.push(Run {
-            y,
-            x1,
-            x2,
-            ccid: 0,
-        });
+        self.runs.push(Run { y, x1, x2, ccid: 0 });
     }
 
     /// Extract all horizontal runs from a `BitImage`.
@@ -195,19 +193,22 @@ impl CCImage {
     /// of millions of pixel tuples.
     pub fn add_bitmap_runs(&mut self, bm: &BitImage) {
         for y in 0..bm.height {
+            let row_start = y * bm.width;
+            let row_bits = &bm.as_bits()[row_start..row_start + bm.width];
             let mut x = 0usize;
+
             while x < bm.width {
-                // Skip white pixels
-                while x < bm.width && !bm.get_pixel_unchecked(x, y) {
-                    x += 1;
-                }
-                if x < bm.width {
-                    let x1 = x;
-                    // Consume black pixels
-                    while x < bm.width && bm.get_pixel_unchecked(x, y) {
-                        x += 1;
-                    }
-                    self.add_single_run(y as i32, x1 as i32, (x - 1) as i32);
+                // Skip to the next black pixel using word-level scan (64 bits/cycle)
+                if let Some(black_offset) = row_bits[x..].first_one() {
+                    let x1 = x + black_offset;
+                    // Find the end of this black run
+                    let run_length = row_bits[x1..].first_zero().unwrap_or(bm.width - x1);
+                    let x2 = x1 + run_length - 1;
+
+                    self.add_single_run(y as i32, x1 as i32, x2 as i32);
+                    x = x2 + 1;
+                } else {
+                    break; // No more black pixels in this row
                 }
             }
         }
@@ -522,19 +523,17 @@ impl CCImage {
 
         self.nregularccs = self.ccs.len();
 
-        let makeccid = |key: (i16, i16, i32),
-                            map: &mut HashMap<(i16, i16, i32), i32>,
-                            ncc: &mut i32|
-         -> i32 {
-            if let Some(&id) = map.get(&key) {
-                id
-            } else {
-                let id = *ncc;
-                map.insert(key, id);
-                *ncc += 1;
-                id
-            }
-        };
+        let makeccid =
+            |key: (i16, i16, i32), map: &mut HashMap<(i16, i16, i32), i32>, ncc: &mut i32| -> i32 {
+                if let Some(&id) = map.get(&key) {
+                    id
+                } else {
+                    let id = *ncc;
+                    map.insert(key, id);
+                    *ncc += 1;
+                    id
+                }
+            };
 
         for ccid in 0..self.ccs.len() {
             let cc = &self.ccs[ccid];
@@ -583,8 +582,7 @@ impl CCImage {
                         // Run spans multiple grid columns — split it.
                         // Truncate the original run to its first grid cell.
                         let orig_x2 = self.runs[r].x2;
-                        self.runs[r].x2 =
-                            (gridj_start as i32 + 1) * splitsize - 1;
+                        self.runs[r].x2 = (gridj_start as i32 + 1) * splitsize - 1;
 
                         // Create new runs for intermediate grid cells
                         let mut current_gridj = gridj_start + 1;
@@ -653,7 +651,8 @@ impl CCImage {
         // Sort by top edge ascending (lowest ymin first) for Top-Down coordinates.
         // This ensures Top-to-Bottom reading order.
         cc_arr.sort_by(|a, b| {
-            a.1.bb.ymin
+            a.1.bb
+                .ymin
                 .cmp(&b.1.bb.ymin)
                 .then(a.1.bb.xmin.cmp(&b.1.bb.xmin))
                 .then(a.1.frun.cmp(&b.1.frun))
@@ -667,11 +666,11 @@ impl CCImage {
         while ccno < n {
             let line_start_ymin = cc_arr[ccno].1.bb.ymin;
             // Scan for the end of this line (items that are vertically close)
-            
+
             let mut nccno = ccno + 1;
             while nccno < n {
                 let curr_ymin = cc_arr[nccno].1.bb.ymin;
-                
+
                 // If the next items top edge is significantly below the line start, it's a new line
                 if curr_ymin > line_start_ymin + maxtopchange {
                     break;
@@ -680,11 +679,7 @@ impl CCImage {
             }
 
             // Sort this line left-to-right (by xmin)
-            cc_arr[ccno..nccno].sort_by(|a, b| {
-                a.1.bb
-                    .xmin
-                    .cmp(&b.1.bb.xmin)
-            });
+            cc_arr[ccno..nccno].sort_by(|a, b| a.1.bb.xmin.cmp(&b.1.bb.xmin));
 
             // Move to next line
             ccno = nccno;
@@ -698,16 +693,16 @@ impl CCImage {
             new_ccs.push(cc);
             old_to_new[old_idx] = new_idx;
         }
-        
+
         // Append the non-regular CCs
         for i in n..self.ccs.len() {
             let new_idx = new_ccs.len();
             new_ccs.push(self.ccs[i].clone());
             old_to_new[i] = new_idx;
         }
-        
+
         self.ccs = new_ccs;
-        
+
         // Remap runs
         for run in &mut self.runs {
             if run.ccid >= 0 {
@@ -757,34 +752,41 @@ impl CCImage {
     ///
     /// 1. `make_ccids_by_analysis()` — union-find labeling
     /// 2. `make_ccs_from_ccids()` — build descriptors
-    /// 3. `erase_tiny_ccs()` — remove noise (only if losslevel > 0)
-    /// 4. `merge_and_split_ccs()` — grid-based merge/split
-    /// 5. `sort_in_reading_order()` — reading-order sort
+    /// 3. `sort_in_reading_order()` — reading-order sort
     ///
     /// After this, iterate `0..self.ccs.len()` and call
     /// `get_bitmap_for_cc(i)` to extract symbol bitmaps.
     pub fn analyze(&mut self, losslevel: i32) {
+        let _ = losslevel;
         self.make_ccids_by_analysis();
         self.make_ccs_from_ccids();
-
-        if losslevel > 0 {
-            self.erase_tiny_ccs();
-        }
-
-        self.merge_and_split_ccs();
         self.sort_in_reading_order();
+    }
+
+    /// Return lightweight component descriptors without allocating bitmaps.
+    pub fn extract_shape_refs(&self) -> Vec<ShapeRef> {
+        let mut shapes = Vec::with_capacity(self.ccs.len());
+        for (ccid, cc) in self.ccs.iter().enumerate() {
+            if cc.nrun <= 0 {
+                continue;
+            }
+            shapes.push(ShapeRef {
+                ccid,
+                bbox: cc.bb,
+                black_pixels: cc.npix.max(0) as usize,
+                run_count: cc.nrun.max(0) as usize,
+            });
+        }
+        shapes
     }
 
     /// Convert the analyzed CCs into (bitmap, bounding_box) pairs ready
     /// for JB2 encoding, filtering out empty results.
     pub fn extract_shapes(&self) -> Vec<(BitImage, BBox)> {
         let mut shapes = Vec::with_capacity(self.ccs.len());
-        for ccid in 0..self.ccs.len() {
-            if self.ccs[ccid].nrun <= 0 {
-                continue;
-            }
-            if let Some(bm) = self.get_bitmap_for_cc(ccid) {
-                shapes.push((bm, self.ccs[ccid].bb));
+        for shape in self.extract_shape_refs() {
+            if let Some(bm) = self.get_bitmap_for_cc(shape.ccid) {
+                shapes.push((bm, shape.bbox));
             }
         }
         shapes
@@ -825,15 +827,7 @@ pub fn extract_symbols_for_jbig2(cc_image: &CCImage) -> Vec<(BitImage, i32, i32,
     let shapes = cc_image.extract_shapes();
     shapes
         .into_iter()
-        .map(|(bitmap, bbox)| {
-            (
-                bitmap,
-                bbox.xmin,
-                bbox.ymin,
-                bbox.width(),
-                bbox.height(),
-            )
-        })
+        .map(|(bitmap, bbox)| (bitmap, bbox.xmin, bbox.ymin, bbox.width(), bbox.height()))
         .collect()
 }
 

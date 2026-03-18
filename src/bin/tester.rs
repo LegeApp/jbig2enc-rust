@@ -1,14 +1,12 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use env_logger::Builder;
 use env_logger::Env;
-use jbig2enc_rust::jbig2enc::{encode_generic_region, Jbig2Encoder};
-use jbig2enc_rust::jbig2pdf;
-use jbig2enc_rust::jbig2pdf::{Jbig2Input, Jbig2Roi};
+use jbig2enc_rust::jbig2enc::{Jbig2Encoder, encode_generic_region};
 use jbig2enc_rust::jbig2structs::Jbig2Config;
 use jbig2enc_rust::jbig2sym::array_to_bitimage;
-use log::info;
 use log::LevelFilter;
+use log::info;
 use ndarray::Array2;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -108,13 +106,13 @@ fn main() -> Result<()> {
 
     // Set environment variables for logging configuration
     if args.console {
-        std::env::set_var("RUST_LOG_CONSOLE", "1");
+        unsafe { std::env::set_var("RUST_LOG_CONSOLE", "1") };
     }
     if let Some(dir) = &args.log_dir {
-        std::env::set_var("JBIG2_LOG_DIR", dir);
+        unsafe { std::env::set_var("JBIG2_LOG_DIR", dir) };
     }
     if let Some(file) = &args.log_file {
-        std::env::set_var("JBIG2_LOG_FILE", file);
+        unsafe { std::env::set_var("JBIG2_LOG_FILE", file) };
     }
 
     // Initialize logging
@@ -181,32 +179,14 @@ fn main() -> Result<()> {
 
     // 5. Write the output file
     if args.pdf_mode {
-        let output_path = args.output.replace(".jb2", ".pdf");
-        info!("PDF Mode: Creating PDF file at {}", output_path);
-
-        let jbig2_roi = Jbig2Roi {
-            stream: encoded_data,
-            width: width as u32,
-            height: height as u32,
-            xres: 300,
-            yres: 300,
-            pdf_x: 0.0,
-            pdf_y: 0.0,
-            pdf_width: width as f32,
-            pdf_height: height as f32,
-            page_index: 0,
-        };
-
-        let jbig2_input = Jbig2Input::from_memory(None, vec![jbig2_roi]);
-        let page_dims = vec![(width as f32, height as f32)];
-
-        jbig2pdf::create_jbig2_pdf(jbig2_input, &output_path, &page_dims)?;
-        info!("Successfully created PDF with JBIG2 fragment.");
-    } else {
-        let mut file = File::create(&args.output)?;
-        file.write_all(&encoded_data)?;
-        info!("Successfully wrote full JBIG2 file to {}", args.output);
+        return Err(anyhow!(
+            "PDF mode is not supported by src/bin/tester.rs. Use halftone-tester for PDF validation."
+        ));
     }
+
+    let mut file = File::create(&args.output)?;
+    file.write_all(&encoded_data)?;
+    info!("Successfully wrote full JBIG2 file to {}", args.output);
 
     info!("Encoded data written successfully.");
     Ok(())
