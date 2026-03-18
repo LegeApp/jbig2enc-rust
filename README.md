@@ -223,5 +223,5 @@ These papers were not copied into the code as one-to-one implementations, but th
 
 - Yan Ye, Dirck Schilling, Pamela Cosman, and Hyung Hwa Koy, “Symbol Dictionary Design for the JBIG2 Standard.” 
 - Yan Ye and Pamela Cosman, “Fast and Memory Efficient JBIG2 Encoder.” 
-- Maribel Figuera, Jonghyon Yi, and Charles A. Bouman, “A New Approach to JBIG2 Binary Image Compression.” Source text in [/home/dk/Desktop/testers-linux/Jbig2-technical-docs/figuera.txt](/home/dk/Desktop/testers-linux/Jbig2-technical-docs/figuera.txt).
+- Maribel Figuera, Jonghyon Yi, and Charles A. Bouman, “A New Approach to JBIG2 Binary Image Compression.” 
 - Yandong Guo, Dejan Depalov, Peter Bauer, Brent Bradburn, Jan P. Allebach, and Charles A. Bouman, “Binary Image Compression Using Conditional Entropy-Based Dictionary Design and Indexing.”
