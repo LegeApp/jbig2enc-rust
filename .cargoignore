@@ -1,0 +1,28 @@
+# Exclude large test output directories
+test_output_*/
+test_output_pdfs/
+test_output_fragments/
+
+# Exclude performance artifacts
+*.profraw
+perf.data*
+flamegraph.svg
+*.svg
+
+# Exclude test images and results
+test_*.pdf
+test_*.jbig2
+test_*.png
+test_*.pnm
+test_*.pbm
+
+# Exclude development files
+*.md
+!README.md
+ffi/
+dev-docs-old/
+sahib2/
+
+# Exclude build artifacts (should be automatic)
+target/
+Cargo.lock
