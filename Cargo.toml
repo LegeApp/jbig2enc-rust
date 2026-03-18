@@ -7,7 +7,6 @@ license = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/jbig2enc-rust"
 homepage = "https://github.com/LegeApp/jbig2enc-rust"
 repository = "https://github.com/LegeApp/jbig2enc-rust"
-readme = "README.md"
 keywords = ["jbig2", "encoder", "compression", "image", "pdf"]
 categories = ["multimedia::encoding", "multimedia::images"]
 
