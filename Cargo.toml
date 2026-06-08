@@ -1,6 +1,6 @@
 [package]
 name = "jbig2enc-rust"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 description = "JBIG2 encoder implementation in Rust with PDF fragment support"
 license = "MIT OR Apache-2.0"
@@ -9,6 +9,12 @@ homepage = "https://github.com/LegeApp/jbig2enc-rust"
 repository = "https://github.com/LegeApp/jbig2enc-rust"
 keywords = ["jbig2", "encoder", "compression", "image", "pdf"]
 categories = ["multimedia::encoding", "multimedia::images"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "build.rs",
+    "src/*.rs",
+]
 
 [lib]
 name = "jbig2enc_rust"
@@ -64,6 +70,11 @@ refine = []
 halftone_bin = ["dep:image"]
 parallel = ["dep:rayon"]
 profiling = ["dep:pprof"]
+
+[[bin]]
+name = "halftone_tester"
+path = "src/bin/halftone_tester.rs"
+required-features = ["halftone_bin"]
 
 [dev-dependencies]
 tracing = { version = "0.1", features = ["std"] }
