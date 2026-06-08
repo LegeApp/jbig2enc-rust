@@ -116,8 +116,9 @@ impl From<ndarray::ShapeError> for Jbig2Error {
 }
 
 // Module declarations
+pub mod jbig2;
 pub mod jbig2arith;
-#[cfg(feature = "cc-analysis")]
+#[cfg(feature = "symboldict")]
 pub mod jbig2cc;
 pub mod jbig2classify;
 pub mod jbig2comparator;
@@ -132,7 +133,7 @@ pub mod jbig2unify;
 
 // Re-export the main encode functions and config
 pub use crate::jbig2arith::Jbig2ArithCoder;
-#[cfg(feature = "cc-analysis")]
+#[cfg(feature = "symboldict")]
 pub use jbig2cc::{BBox, CC, CCImage, Run, analyze_page, extract_symbols_for_jbig2};
 pub use jbig2enc::encode_document;
 pub use jbig2structs::Jbig2Config;
@@ -259,6 +260,29 @@ pub fn encode_single_image(
     encode_single_bitimage(bitimage, Jbig2Context::with_pdf_mode(pdf_mode))
 }
 
+/// Encodes a single binary image into JBIG2 format with custom configuration.
+///
+/// This function allows specifying custom JBIG2 configurations for symbol encoding.
+///
+/// # Arguments
+/// * `input` - Binary image data (0/1 values)
+/// * `width` - Image width in pixels
+/// * `height` - Image height in pixels
+/// * `context` - JBIG2 encoding context with configuration
+///
+/// # Returns
+/// A `Jbig2EncodeResult` containing separate global and page data for PDF embedding,
+/// or combined data for standalone files.
+pub fn encode_single_image_with_config(
+    input: &[u8],
+    width: u32,
+    height: u32,
+    context: Jbig2Context,
+) -> Result<Jbig2EncodeResult, Jbig2Error> {
+    let bitimage = validate_and_build_bitimage(input, width, height)?;
+    encode_single_bitimage(bitimage, context)
+}
+
 /// Encodes a single binary image into JBIG2 format using lossless configuration.
 ///
 /// This function forces symbol_mode = false to create standalone JBIG2 streams
@@ -318,38 +342,45 @@ fn encode_single_bitimage(
         enc_config.text_refine = false;
     }
 
-    let global_data = if ctx.get_symbol_mode() && ctx.get_pdf_mode() {
-        let mut dict_encoder = Jbig2Encoder::new(&enc_config).dict_only();
-        dict_encoder
-            .add_page_bitimage(bitimage.clone())
-            .map_err(|e| Jbig2Error::DictionaryFailed {
-                message: e.to_string(),
-            })?;
-        Some(
-            dict_encoder
-                .flush_dict()
-                .map_err(|e| Jbig2Error::DictionaryFailed {
-                    message: e.to_string(),
-                })?,
-        )
-    } else {
-        None
-    };
-
     let mut encoder = Jbig2Encoder::new(&enc_config);
     encoder
         .add_page_bitimage(bitimage)
         .map_err(|e| Jbig2Error::EncodingFailed {
             message: e.to_string(),
         })?;
-    let page_data = encoder.flush().map_err(|e| Jbig2Error::EncodingFailed {
-        message: e.to_string(),
-    })?;
 
-    Ok(Jbig2EncodeResult {
-        global_data,
-        page_data,
-    })
+    if ctx.get_pdf_mode() {
+        // PDF embedding must use the same planning/serialization as tests/pdf_variants:
+        // one encoder, flush_pdf_split() → globals stream + page stream with matching
+        // segment references. The previous approach (dict_only().flush_dict() on one
+        // encoder + flush() on a second) paired unrelated streams and broke decoders
+        // (solid black/white pages, etc.).
+        let split = encoder
+            .flush_pdf_split()
+            .map_err(|e| Jbig2Error::EncodingFailed {
+                message: e.to_string(),
+            })?;
+        let n = split.page_streams.len();
+        if n != 1 {
+            return Err(Jbig2Error::StreamCountMismatch {
+                expected: 1,
+                actual: n,
+            });
+        }
+        let page_data = split.page_streams.into_iter().next().unwrap();
+        Ok(Jbig2EncodeResult {
+            global_data: split.global_segments,
+            page_data,
+        })
+    } else {
+        let page_data = encoder.flush().map_err(|e| Jbig2Error::EncodingFailed {
+            message: e.to_string(),
+        })?;
+        Ok(Jbig2EncodeResult {
+            global_data: None,
+            page_data,
+        })
+    }
 }
 
 /// Encodes a list of text-only binary PBM ROIs into JBIG2 streams.

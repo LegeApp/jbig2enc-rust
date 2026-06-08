@@ -1,6 +1,6 @@
 [package]
 name = "jbig2enc-rust"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "JBIG2 encoder implementation in Rust with PDF fragment support"
 license = "MIT OR Apache-2.0"
@@ -50,22 +50,20 @@ pprof = { version = "0.15", features = ["flamegraph"], optional = true }
 vergen = { version = "9.0.6", default-features = false, features = ["build"] }
 
 [features]
-default = []
+# `symboldict` gates the symbol-dictionary path: connected-component analysis
+# (jbig2cc.rs) -> symbol extraction -> symbol dictionary + text regions. It is on
+# by default because it is the encoder's primary mode; disable it (or build with
+# --no-default-features) to get the generic-region-only encoder.
+default = ["symboldict"]
 tracing = ["dep:tracing", "dep:tracing-subscriber"]
 trace_encoder = ["dep:tracing", "dep:tracing-subscriber"]
 trace_arith = []
 line_verify = []
-cc-analysis = []
-symboldict = ["cc-analysis"]
+symboldict = []
 refine = []
 halftone_bin = ["dep:image"]
 parallel = ["dep:rayon"]
 profiling = ["dep:pprof"]
-
-[[bin]]
-name = "halftone_tester"
-path = "src/bin/halftone_tester.rs"
-required-features = ["halftone_bin"]
 
 [dev-dependencies]
 tracing = { version = "0.1", features = ["std"] }
