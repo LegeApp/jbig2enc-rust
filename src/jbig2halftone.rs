@@ -842,7 +842,7 @@ fn encode_bitmap_mmr(image: &BitImage) -> Result<Vec<u8>> {
             }
         });
         encoder
-            .encode_line(row, width)
+            .encode_line(row, u32::from(width))
             .map_err(|e| anyhow!("fax encoder failed: {:?}", e))?;
     }
 
