@@ -1,15 +1,11 @@
-use std::error::Error;
-use vergen::{Build, Emitter};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-fn main() -> Result<(), Box<dyn Error>> {
-    // Set the JBIG2ENC_VERSION environment variable for the build
+fn main() {
     println!("cargo:rustc-env=JBIG2ENC_VERSION=0.29");
 
-    // Configure and build the build instructions
-    let build = Build::builder().build_timestamp(true).build();
-
-    // Create emitter and add instructions
-    Emitter::default().add_instructions(&build)?.emit()?;
-
-    Ok(())
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    println!("cargo:rustc-env=VERGEN_BUILD_TIMESTAMP={ts}");
 }

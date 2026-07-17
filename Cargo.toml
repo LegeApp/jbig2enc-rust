@@ -21,26 +21,12 @@ tracing = { version = "0.1", features = ["std"], optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "registry", "std"], optional = true }
 clap = { version = "4.5.41", features = ["derive"] }
 ndarray = "0.17.2"
-bytemuck = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
 thiserror = "2.0.18"
 log = "0.4"
 env_logger = "0.11.11"
 byteorder = "1.4"
-lopdf = "0.44.0"
-serde_json = "1.0"
-glob = "0.3"
 bitvec = "1.0"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-smallvec = "1.15"
-tinyvec = "1.9"
-bitfrob = "1.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_derive = "1.0"
-chrono = "0.4"
-fnv = "1.0"
-derive_builder = "0.20.2"
-lazy_static = "1.4"
 once_cell = "1.19"
 rustc-hash = "2.1.3"
 fax = { version = "0.3.0", default-features = false }
@@ -48,9 +34,6 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 rayon = { version = "1.10", optional = true }
 pprof = { version = "0.15", features = ["flamegraph"], optional = true }
 wide = "1.5.0"
-
-[build-dependencies]
-vergen = { version = "10.0.1", default-features = false, features = ["build"] }
 
 [features]
 # `symboldict` gates the symbol-dictionary path: connected-component analysis
@@ -80,6 +63,6 @@ which = "8.0.0"
 tempfile = "3.27.0"
 hex-literal = "1.0.0"
 
-# NOTE: Profile settings moved to workspace root Cargo.toml
-# [profile.test]
-# Profile-specific settings go here
+[profile.release]
+lto = "thin"
+codegen-units = 1
