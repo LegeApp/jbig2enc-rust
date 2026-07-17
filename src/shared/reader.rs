@@ -9,7 +9,7 @@
 // `ParseError` lives in `decode::error` per the plan's file map. In Phase 0
 // both halves are always compiled, so this shared module can borrow it; when
 // encode/decode feature gating lands (Phase 1), ParseError moves to `shared`.
-use crate::decode::error::ParseError;
+use crate::shared::error::ParseError;
 
 /// A cursor over a byte slice with checked, big-endian reads.
 #[derive(Clone, Debug)]

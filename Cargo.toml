@@ -40,12 +40,18 @@ wide = "1.5.0"
 # (jbig2cc.rs) -> symbol extraction -> symbol dictionary + text regions. It is on
 # by default because it is the encoder's primary mode; disable it (or build with
 # --no-default-features) to get the generic-region-only encoder.
-default = ["symboldict"]
+# The crate is split into an `encode` half and a `decode` half over a shared
+# protocol core (Gap A). The PDF renderer depends on
+# `default-features = false, features = ["decode"]`.
+default = ["encode", "decode", "symboldict"]
+encode = []
+decode = []
 tracing = ["dep:tracing", "dep:tracing-subscriber"]
 trace_encoder = ["dep:tracing", "dep:tracing-subscriber"]
 trace_arith = []
 line_verify = []
-symboldict = []
+# The symbol-dictionary path is part of the encoder half.
+symboldict = ["encode"]
 refine = []
 halftone_bin = ["dep:image"]
 parallel = ["dep:rayon"]
@@ -56,9 +62,19 @@ profiling = ["dep:pprof"]
 c-encoder-bench = []
 
 [[bin]]
+name = "tester"
+path = "src/bin/tester.rs"
+required-features = ["encode"]
+
+[[bin]]
 name = "halftone_tester"
 path = "src/bin/halftone_tester.rs"
-required-features = ["halftone_bin"]
+required-features = ["halftone_bin", "encode"]
+
+[[bench]]
+name = "decode"
+harness = false
+required-features = ["encode", "decode"]
 
 [dev-dependencies]
 tracing = { version = "0.1", features = ["std"] }
@@ -66,6 +82,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "reg
 which = "8.0.0"
 tempfile = "3.27.0"
 hex-literal = "1.0.0"
+criterion = "0.7"
 
 [profile.release]
 lto = "thin"

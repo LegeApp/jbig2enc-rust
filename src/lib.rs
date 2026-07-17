@@ -14,6 +14,7 @@ pub use ndarray::Array2;
 
 /// Errors that can occur during JBIG2 encoding
 #[derive(Debug)]
+#[cfg(feature = "encode")]
 pub enum Jbig2Error {
     /// Input buffer size mismatch
     BufferSizeMismatch {
@@ -49,6 +50,7 @@ pub enum Jbig2Error {
     },
 }
 
+#[cfg(feature = "encode")]
 impl std::fmt::Display for Jbig2Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -100,6 +102,7 @@ impl std::fmt::Display for Jbig2Error {
     }
 }
 
+#[cfg(feature = "encode")]
 impl std::error::Error for Jbig2Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -109,6 +112,7 @@ impl std::error::Error for Jbig2Error {
     }
 }
 
+#[cfg(feature = "encode")]
 impl From<ndarray::ShapeError> for Jbig2Error {
     fn from(source: ndarray::ShapeError) -> Self {
         Jbig2Error::ArrayShapeError { source }
@@ -117,7 +121,11 @@ impl From<ndarray::ShapeError> for Jbig2Error {
 
 // Module declarations: the crate is split into an encoder half, a decoder
 // half, and shared protocol definitions (see jbig2dec-gaps-plan.md, Gap A).
+// `shared` is unconditional; `encode`/`decode` are feature-gated so the PDF
+// renderer can depend on the decoder alone.
+#[cfg(feature = "decode")]
 pub mod decode;
+#[cfg(feature = "encode")]
 pub mod encode;
 pub mod shared;
 
@@ -125,35 +133,54 @@ pub mod shared;
 // existing users (`jbig2enc_rust::jbig2arith::...`) keep compiling after the
 // Phase 0 module rename (Gap A). Remove once dependents migrate to the
 // `encode::` paths.
+#[cfg(feature = "encode")]
 pub use encode::api as jbig2;
+#[cfg(feature = "encode")]
 pub use encode::arith as jbig2arith;
 #[cfg(feature = "symboldict")]
 pub use encode::cc as jbig2cc;
+#[cfg(feature = "encode")]
 pub use encode::classify as jbig2classify;
+#[cfg(feature = "encode")]
 pub use encode::comparator as jbig2comparator;
+#[cfg(feature = "encode")]
 pub use encode::context as jbig2context;
+#[cfg(feature = "encode")]
 pub use encode::cost as jbig2cost;
+#[cfg(feature = "encode")]
 pub use encode::document as jbig2enc;
+#[cfg(feature = "encode")]
 pub use encode::halftone as jbig2halftone;
+#[cfg(feature = "encode")]
 pub use encode::shared as jbig2shared;
+#[cfg(feature = "encode")]
 pub(crate) use encode::simd as jbig2simd;
+#[cfg(feature = "encode")]
 pub use encode::structs as jbig2structs;
+#[cfg(feature = "encode")]
 pub use encode::sym as jbig2sym;
+#[cfg(feature = "encode")]
 pub use encode::unify as jbig2unify;
 
 // Re-export the main encode functions and config
+#[cfg(feature = "encode")]
 pub use crate::jbig2arith::Jbig2ArithCoder;
 #[cfg(feature = "symboldict")]
 pub use jbig2cc::{BBox, CC, CCImage, Run, analyze_page, extract_symbols_for_jbig2};
+#[cfg(feature = "encode")]
 pub use jbig2enc::{PdfSplitOutput, encode_document};
+#[cfg(feature = "encode")]
 pub use jbig2structs::Jbig2Config;
 
+#[cfg(feature = "encode")]
 use jbig2enc::Jbig2Encoder;
+#[cfg(feature = "encode")]
 use jbig2sym::binary_pixels_to_bitimage;
 use std::env;
 
 /// Result of JBIG2 encoding with separate global and page data for PDF embedding
 #[derive(Debug, Clone)]
+#[cfg(feature = "encode")]
 pub struct Jbig2EncodeResult {
     /// Global dictionary data (if any) - should be stored as separate PDF object
     pub global_data: Option<Vec<u8>>,
@@ -163,12 +190,14 @@ pub struct Jbig2EncodeResult {
 
 /// Context for JBIG2 encoding operations
 #[derive(Debug, Clone)]
+#[cfg(feature = "encode")]
 pub struct Jbig2Context {
     /// The underlying configuration
     config: Jbig2Config,
     pdf_mode: bool,
 }
 
+#[cfg(feature = "encode")]
 impl Default for Jbig2Context {
     fn default() -> Self {
         Self {
@@ -178,6 +207,7 @@ impl Default for Jbig2Context {
     }
 }
 
+#[cfg(feature = "encode")]
 impl Jbig2Context {
     /// Create a new context with default values
     pub fn new() -> Self {
@@ -240,6 +270,7 @@ impl Jbig2Context {
 /// # Returns
 /// A `Jbig2EncodeResult` containing separate global and page data for PDF embedding,
 /// or combined data for standalone files.
+#[cfg(feature = "encode")]
 pub fn encode_single_image(
     input: &[u8],
     width: u32,
@@ -263,6 +294,7 @@ pub fn encode_single_image(
 /// # Returns
 /// A `Jbig2EncodeResult` containing separate global and page data for PDF embedding,
 /// or combined data for standalone files.
+#[cfg(feature = "encode")]
 pub fn encode_single_image_with_config(
     input: &[u8],
     width: u32,
@@ -286,6 +318,7 @@ pub fn encode_single_image_with_config(
 ///
 /// # Returns
 /// A `Jbig2EncodeResult` containing page data without global dictionary
+#[cfg(feature = "encode")]
 pub fn encode_single_image_lossless(
     input: &[u8],
     width: u32,
@@ -318,6 +351,7 @@ pub fn encode_single_image_lossless(
 /// # Returns
 /// A [`PdfSplitOutput`] with the optional global dictionary segment plus one
 /// page stream per input image, ready to embed directly.
+#[cfg(feature = "encode")]
 pub fn encode_document_pdf_split(
     images: &[Array2<u8>],
     config: &Jbig2Config,
@@ -345,6 +379,7 @@ pub fn encode_document_pdf_split(
         })
 }
 
+#[cfg(feature = "encode")]
 fn validate_and_build_bitimage(
     input: &[u8],
     width: u32,
@@ -370,6 +405,7 @@ fn validate_and_build_bitimage(
         .map_err(|message| Jbig2Error::EncodingFailed { message })
 }
 
+#[cfg(feature = "encode")]
 fn encode_single_bitimage(
     bitimage: jbig2sym::BitImage,
     ctx: Jbig2Context,

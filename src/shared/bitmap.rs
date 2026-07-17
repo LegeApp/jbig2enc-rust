@@ -10,7 +10,7 @@
 //! This layout keeps composition (`combine`) word-wise and leaves the door
 //! open to SIMD later without requiring it now.
 
-use crate::decode::error::{DecodeError, LimitError};
+use crate::shared::error::{DecodeError, LimitError};
 use crate::shared::limits::DecodeLimits;
 
 /// How a source bitmap is combined onto a destination (T.88 external and
@@ -184,7 +184,9 @@ impl MonoBitmap {
 
         // Clip the source column range [sx_start, sx_end) so the destination
         // column dx = x + sx stays within [0, width).
-        let sx_start = if x < 0 { (-x) as i64 } else { 0 };
+        // Negate in i64 so `x == i32::MIN` (reachable from a mutated region
+        // coordinate) cannot overflow.
+        let sx_start = if x < 0 { -(x as i64) } else { 0 };
         let sx_end = {
             let by_width = self.width as i64 - x as i64;
             (source.width as i64).min(by_width)
@@ -218,6 +220,7 @@ impl MonoBitmap {
     // ── Conversions to/from the encoder's BitImage ──────────────────────────
 
     /// Build a `MonoBitmap` from the encoder's `BitImage`.
+    #[cfg(feature = "encode")]
     pub fn from_bit_image(
         img: &crate::encode::sym::BitImage,
         limits: &DecodeLimits,
@@ -241,6 +244,7 @@ impl MonoBitmap {
 
     /// Convert to the encoder's `BitImage`. Errors if the dimensions fall
     /// outside what `BitImage` accepts (e.g. zero-sized).
+    #[cfg(feature = "encode")]
     pub fn to_bit_image(&self) -> Result<crate::encode::sym::BitImage, DecodeError> {
         let mut img = crate::encode::sym::BitImage::new(self.width, self.height).map_err(|_| {
             DecodeError::Overflow {
@@ -576,6 +580,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "encode")]
     #[test]
     fn bit_image_roundtrip() {
         let bm = checkerboard(37, 11, 0);

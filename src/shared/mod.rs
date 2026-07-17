@@ -7,6 +7,7 @@
 //! live here.
 
 pub mod bitmap;
+pub mod error;
 pub mod int_proc;
 pub mod limits;
 pub mod mq_table;
