@@ -92,7 +92,13 @@ pub fn encode_text_region_with_refinement(
         x: i32,
         t_offset: i32,
         symbol_id: u32,
-        symbol_width: i32,
+        /// Width of the bitmap actually placed into the region (WI in T.88
+        /// §6.4.5). For a refined instance this is the refined/trimmed width
+        /// (GRW = WOI + RDWI), which may differ from the prototype width; for a
+        /// direct substitution it is the prototype width. The decoder advances
+        /// CURS by WI-1 (§6.4.5 step 3c xi), so the S-delta encoding must use
+        /// this placed width, not the prototype width.
+        placed_width: i32,
         // Refinement data
         needs_refinement: bool,
         /// Index into original instances array (for accessing instance_bitmap)
@@ -120,6 +126,18 @@ pub fn encode_text_region_with_refinement(
             );
         };
 
+        // T.88 §6.4.5: the bitmap placed for this instance (IBI) is the refined
+        // trimmed bitmap when RI=1 (its width GRW = WOI + RDWI may differ from
+        // the prototype), otherwise the prototype symbol. CURS advances by
+        // WI-1 with WI the placed width, so the S-delta encoding below must use
+        // this width to stay in sync with any conformant decoder.
+        let placed_width = if instance.needs_refinement {
+            let (_, trimmed) = instance.instance_bitmap.trim();
+            trimmed.width as i32
+        } else {
+            sym.width as i32
+        };
+
         let abs = instance.position;
         let rel_x = abs.x as i32 - min_x as i32;
         // REFCORNER=TOPLEFT (value 1): T is the top of the original bounding box.
@@ -132,7 +150,7 @@ pub fn encode_text_region_with_refinement(
             x: rel_x,
             t_offset,
             symbol_id,
-            symbol_width: sym.width as i32,
+            placed_width,
             needs_refinement: instance.needs_refinement,
             orig_idx,
         });
@@ -237,7 +255,9 @@ pub fn encode_text_region_with_refinement(
                 // here desynchronises every refinement after the first.
             }
 
-            current_s += item.symbol_width - 1;
+            // §6.4.5 step 3c xi): CURS += WI - 1 where WI is the *placed* bitmap
+            // width (the refined width for RI=1 instances), matching the decoder.
+            current_s += item.placed_width - 1;
             idx += 1;
         }
         let _ = coder.encode_oob(IntProc::Iads);
