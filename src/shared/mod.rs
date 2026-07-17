@@ -9,4 +9,5 @@
 pub mod int_proc;
 pub mod limits;
 pub mod mq_table;
+pub mod reader;
 pub mod segment;
