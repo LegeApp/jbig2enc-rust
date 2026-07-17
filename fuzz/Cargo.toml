@@ -34,5 +34,19 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "symbol_dictionary"
+path = "fuzz_targets/symbol_dictionary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_region"
+path = "fuzz_targets/text_region.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

@@ -8,6 +8,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use jbig2enc_rust::decode::{DecodeOptions, DecoderContext, decode_file_with_context};
+use jbig2enc_rust::jbig2structs::Jbig2Config;
 use jbig2enc_rust::{Jbig2Context, encode_single_image_with_config};
 
 /// Deterministically synthesise a "text-like" bitmap: rows of short black runs
@@ -69,5 +70,71 @@ fn bench_decode_generic_a4(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_decode_generic_a4);
+/// Synthesise a text-heavy page (many repeated glyphs) so the encoder builds a
+/// symbol dictionary + text region, then benchmark decoding it (Gap D).
+fn synth_glyph_page(w: u32, h: u32) -> Vec<u8> {
+    let mut px = vec![0u8; (w as usize) * (h as usize)];
+    let mut s: u32 = 0x1234_5678;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    };
+    let (gw, gh) = (10u32, 14u32);
+    let mut y = 4;
+    while y + gh + 4 < h {
+        let mut x = 4;
+        while x + gw + 4 < w {
+            let kind = next() % 6;
+            for dy in 0..gh {
+                for dx in 0..gw {
+                    let on = match kind {
+                        0 => dx == 0 || dx == gw - 1 || dy == 0 || dy == gh - 1,
+                        1 => dx == gw / 2 || dy == gh / 2,
+                        2 => (dx + dy) % 3 == 0,
+                        3 => dx == dy || dx + dy == gw - 1,
+                        4 => dy < 3 || dy >= gh - 3,
+                        _ => dx < 2 || dx >= gw - 2,
+                    };
+                    if on {
+                        px[((y + dy) * w + (x + dx)) as usize] = 1;
+                    }
+                }
+            }
+            x += gw + 4;
+        }
+        y += gh + 4;
+    }
+    px
+}
+
+fn bench_decode_symbol_page(c: &mut Criterion) {
+    // ~US-Letter-ish text page at moderate size to keep encode setup quick.
+    let (w, h) = (1240u32, 1754u32);
+    let px = synth_glyph_page(w, h);
+
+    // Encode once in symbol mode (arithmetic dictionary + text region).
+    let ctx = Jbig2Context::with_config(Jbig2Config::text(), false);
+    let encoded = encode_single_image_with_config(&px, w, h, ctx)
+        .expect("encode symbol page")
+        .page_data;
+    eprintln!("encoded symbol page stream = {} bytes", encoded.len());
+
+    let opts = DecodeOptions::default();
+    let mut dctx = DecoderContext::new();
+
+    let mut group = c.benchmark_group("decode_symbol_page");
+    group.sample_size(20);
+    group.bench_function("decode", |b| {
+        b.iter(|| {
+            let doc =
+                decode_file_with_context(black_box(&encoded), &opts, &mut dctx).expect("decode");
+            black_box(doc.pages.len());
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_decode_generic_a4, bench_decode_symbol_page);
 criterion_main!(benches);

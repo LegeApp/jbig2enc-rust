@@ -6,7 +6,11 @@
 //! in for `cargo fuzz` (which needs nightly).
 
 use jbig2enc_rust::decode::{DecodeOptions, decode_embedded, decode_file};
-use jbig2enc_rust::{encode_single_image, encode_single_image_lossless};
+use jbig2enc_rust::jbig2structs::Jbig2Config;
+use jbig2enc_rust::{
+    Jbig2Context, encode_single_image, encode_single_image_lossless,
+    encode_single_image_with_config,
+};
 
 fn seed_streams() -> Vec<Vec<u8>> {
     let w = 24u32;
@@ -22,6 +26,71 @@ fn seed_streams() -> Vec<Vec<u8>> {
         encode_single_image(&px, w, h, true).unwrap().page_data,
         encode_single_image_lossless(&px, w, h, false).unwrap().page_data,
     ]
+}
+
+/// A small synthetic text-like page encoded in symbol mode (real symbol
+/// dictionary + refinement text region) for the symbol-mode chaos gate.
+fn symbol_stream() -> Vec<u8> {
+    let (sw, sh) = (48u32, 36u32);
+    let mut spx = vec![0u8; (sw * sh) as usize];
+    let mut yy = 3u32;
+    while yy + 12 < sh {
+        let mut xx = 3u32;
+        while xx + 8 < sw {
+            for dy in 0..10u32 {
+                for dx in 0..6u32 {
+                    if dx == 0 || dx == 5 || dy == 0 || dy == 9 || (dx + dy) % 3 == 0 {
+                        spx[((yy + dy) * sw + (xx + dx)) as usize] = 1;
+                    }
+                }
+            }
+            xx += 10;
+        }
+        yy += 14;
+    }
+    encode_single_image_with_config(
+        &spx,
+        sw,
+        sh,
+        Jbig2Context::with_config(Jbig2Config::text(), false),
+    )
+    .unwrap()
+    .page_data
+}
+
+/// Tight limits so a mutated size field cannot make the symbol chaos gate slow
+/// by attempting a large (still under the generous default) decode.
+fn tight_opts() -> DecodeOptions {
+    use jbig2enc_rust::decode::DecodeLimits;
+    DecodeOptions::with_limits(DecodeLimits {
+        max_width: 1 << 10,
+        max_height: 1 << 10,
+        max_page_pixels: 1 << 20,
+        max_region_pixels: 1 << 20,
+        max_symbols: 4096,
+        max_symbol_pixels: 1 << 16,
+        max_total_dictionary_pixels: 1 << 22,
+        ..DecodeLimits::default()
+    })
+}
+
+/// Every single-byte mutation of a symbol-mode stream must return a bounded
+/// result or a typed error — never a panic (Gap C symbol-mode chaos gate).
+#[test]
+fn symbol_stream_single_byte_mutations_never_panic() {
+    let opts = tight_opts();
+    let stream = symbol_stream();
+    for pos in 0..stream.len() {
+        for &val in &[0x00u8, 0x01, 0x80, 0xFF, 0xAA] {
+            let mut m = stream.clone();
+            m[pos] = val;
+            let _ = decode_file(&m, &opts);
+            let _ = decode_embedded(None, &m, &opts);
+        }
+    }
+    for cut in 0..=stream.len() {
+        let _ = decode_file(&stream[..cut], &opts);
+    }
 }
 
 #[test]
