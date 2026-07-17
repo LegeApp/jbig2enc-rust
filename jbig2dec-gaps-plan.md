@@ -299,6 +299,42 @@ diff, runs the checklist, and only then does the next phase start.
   saturating (an out-of-range offset just reads the reference window as zero).
   Found by extending the chaos gate to a refine-mode stream.
 
+## Phase 4 findings (MMR + halftone)
+
+* **Phase 4 exit criterion MET.** All current halftone modes and MMR generic
+  regions decode exactly. `tests/decode_halftone.rs` asserts, for the §21.3
+  rows, `native == jbig2dec` pixel-exact across every mode combination:
+  pattern dict {MMR, arithmetic} × gray planes {MMR, arithmetic} × {lossy,
+  lossless}, standalone and embedded-with-globals; generic MMR is additionally
+  pixel-exact vs source (lossless). Malformed inputs (GRAYMAX overflow,
+  truncated collective bitmap, missing referred pattern dictionary) are typed
+  errors, and the halftone stream is in the `decode_chaos` mutation/truncation
+  gate. New fuzz targets `mmr_generic` and `halftone_region` compile under
+  nightly.
+
+* **MMR gray-plane block boundaries.** The encoder emits each halftone gray
+  Gray-code plane as an independent, byte-aligned, EOFB-terminated T.6 block,
+  concatenated back to back (Annex C, GSMMR=1). The `fax` crate's `decode_g4`
+  reports no byte offset and stops at the *first* EOL of the two-EOL EOFB, so
+  it undershoots the true byte-aligned boundary. `decode::mmr` recovers each
+  boundary with a monotone binary-search "decode point" plus a forward scan to
+  the next valid block start. This is the one place the thin `fax` wrapper
+  needed non-trivial glue; a future in-house T.6 decoder that tracks bit
+  position would remove it.
+
+* **Encoder arithmetic pattern dictionary uses nominal AT, not spec AT
+  (documented, not fixed).** `encode_generic_region_inner` ignores the AT
+  argument and always forms the nominal template-0 context, whereas the spec
+  (and jbig2dec) use AT1 = (-HDPW, 0) for the pattern-dictionary collective
+  bitmap (§6.7.5). The native decoder follows the spec, so `native == jbig2dec`
+  holds regardless (both decode the same bytes the same way); halftone is lossy
+  so there is no source comparison to fail. Only the default MMR pattern dict is
+  exercised in production; the arithmetic variant is a config option. Fixing the
+  encoder's AT handling is a separate encoder task (would change halftone bytes).
+
+* **Both encoder fixes from the ledger below are now DONE** (referred-segment
+  width boundary; refinement_layout test) — see the entries.
+
 ## Gap F: Out of scope for now (explicitly deferred)
 
 * Product B / Phase 5 (Huffman, striped pages, random access, templates
