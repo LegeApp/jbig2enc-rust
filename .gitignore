@@ -4,3 +4,5 @@
 # Artifacts written to the working dir by integration tests (mode_comparison).
 /decoded_lossless.pbm
 /decoded_symbol.pbm
+/fuzz/target
+/fuzz/Cargo.lock
