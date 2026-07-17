@@ -6,10 +6,17 @@
 //! origin with a compatible operator, the decoded region bitmap is moved into
 //! the page with no copy (the dominant single-region scanned-page case).
 
+use std::sync::Arc;
+
 use crate::decode::context::DecoderContext;
 use crate::decode::error::{DecodeError, LimitError, ParseError, UnsupportedFeature};
-use crate::decode::file::ParsedDocument;
+use crate::decode::file::{ParsedDocument, ParsedSegment};
 use crate::decode::generic::{decode_generic_region, parse_generic_region};
+use crate::decode::globals::DecodedGlobals;
+use crate::decode::refinement::REFINEMENT_CONTEXT_COUNT;
+use crate::decode::store::{DecodedSegment, SegmentStore};
+use crate::decode::symbol_dictionary::{decode_symbol_dictionary, SymbolDictionary};
+use crate::decode::text_region::decode_text_region;
 use crate::shared::bitmap::{CombinationOperator, MonoBitmap};
 use crate::shared::limits::DecodeLimits;
 use crate::shared::reader::Reader;
@@ -93,11 +100,100 @@ pub fn process_document(
     limits: &DecodeLimits,
     ctx: &mut DecoderContext,
 ) -> Result<Vec<DecodedPage>, DecodeError> {
+    process_document_with_globals(doc, None, limits, ctx)
+}
+
+/// Decode a symbol-dictionary segment and register it in `local`, returning the
+/// shared handle (jbig2decplan.md §16, §19). Imported symbols are gathered from
+/// the segment's referred dictionaries (in `local`, then `globals`).
+pub(crate) fn decode_symbol_dict_into(
+    seg: &ParsedSegment<'_>,
+    local: &mut SegmentStore,
+    globals: Option<&SegmentStore>,
+    limits: &DecodeLimits,
+    ctx: &mut DecoderContext,
+) -> Result<Arc<SymbolDictionary>, DecodeError> {
+    let imported =
+        local.gather_symbols(seg.header.number, &seg.header.referred_to, globals)?;
+
+    ctx.ensure_generic();
+    // Disjoint field borrows: generic + integer context banks at once.
+    let generic = &mut ctx.generic_contexts[..crate::decode::context::GENERIC_CONTEXT_COUNT];
+    let int_ctx = &mut ctx.integer_contexts;
+    let dict = decode_symbol_dictionary(seg.data, &imported, limits, int_ctx, generic)
+        .map_err(|source| annotate(seg.header.number, source))?;
+
+    let arc = Arc::new(dict);
+    local.insert(
+        seg.header.number,
+        DecodedSegment::SymbolDictionary(arc.clone()),
+    )?;
+    Ok(arc)
+}
+
+/// Attach the segment number to a bare parse error; other errors pass through.
+fn annotate(segment: u32, err: DecodeError) -> DecodeError {
+    match err {
+        DecodeError::Parse(source) => DecodeError::Segment { segment, source },
+        other => other,
+    }
+}
+
+/// Process a parsed document, resolving referred symbol dictionaries against an
+/// optional set of shared globals (jbig2decplan.md §6, §16, §17).
+pub fn process_document_with_globals(
+    doc: &ParsedDocument<'_>,
+    globals: Option<&DecodedGlobals>,
+    limits: &DecodeLimits,
+    ctx: &mut DecoderContext,
+) -> Result<Vec<DecodedPage>, DecodeError> {
     let mut pages: Vec<DecodedPage> = Vec::new();
     let mut current: Option<usize> = None;
+    let mut store = SegmentStore::new();
+    let globals_store = globals.map(|g| g.store());
 
     for seg in &doc.segments {
         let ty = seg.header.segment_type();
+        match ty {
+            Some(SegmentType::SymbolDictionary) => {
+                decode_symbol_dict_into(seg, &mut store, globals_store, limits, ctx)?;
+                continue;
+            }
+            Some(
+                SegmentType::ImmediateTextRegion
+                | SegmentType::ImmediateLosslessTextRegion
+                | SegmentType::IntermediateTextRegion,
+            ) => {
+                let symbols = store.gather_symbols(
+                    seg.header.number,
+                    &seg.header.referred_to,
+                    globals_store,
+                )?;
+                // Ensure the refinement bank is sized, then split disjoint field
+                // borrows for the integer, IAID, and refinement context banks.
+                if ctx.refinement_contexts.len() < REFINEMENT_CONTEXT_COUNT {
+                    ctx.refinement_contexts
+                        .resize(REFINEMENT_CONTEXT_COUNT, Default::default());
+                }
+                let int_ctx = &mut ctx.integer_contexts;
+                let iaid_ctx = &mut ctx.iaid_contexts;
+                let refine_ctx = &mut ctx.refinement_contexts[..REFINEMENT_CONTEXT_COUNT];
+                let result =
+                    decode_text_region(seg.data, &symbols, limits, int_ctx, iaid_ctx, refine_ctx)
+                        .map_err(|source| annotate(seg.header.number, source))?;
+                let target =
+                    resolve_page(&mut pages, current, seg.header.page_association)?;
+                compose_region(
+                    &mut pages[target].bitmap,
+                    result.bitmap,
+                    result.x,
+                    result.y,
+                    result.comb_operator,
+                );
+                continue;
+            }
+            _ => {}
+        }
         match ty {
             Some(SegmentType::PageInformation) => {
                 let info = parse_page_info(seg.data).map_err(|source| DecodeError::Segment {

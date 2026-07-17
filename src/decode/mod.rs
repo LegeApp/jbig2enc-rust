@@ -16,13 +16,23 @@ pub mod context;
 pub mod error;
 pub mod file;
 pub mod generic;
+pub mod globals;
+pub mod iaid;
+pub mod integer;
 pub mod page;
+pub mod refinement;
 pub mod segment;
+pub mod store;
+pub mod symbol_dictionary;
+pub mod text_region;
 
 pub use context::{DecodeOptions, DecodeStrictness, DecoderContext};
 pub use error::{DecodeError, LimitError, ParseError, UnsupportedFeature};
 pub use file::{FileOrganization, ParsedDocument, ParsedSegment};
+pub use globals::{decode_globals, DecodedGlobals};
 pub use page::{DecodedPage, PageInformation};
+pub use store::{DecodedSegment, SegmentStore};
+pub use symbol_dictionary::SymbolDictionary;
 
 pub use crate::shared::limits::DecodeLimits;
 
@@ -64,9 +74,9 @@ pub fn decode_file_with_context(
 /// Decode a single PDF-embedded page stream, returning its page bitmap
 /// (jbig2decplan.md §5).
 ///
-/// `globals` is accepted for API stability. Any globals content is symbol-
-/// dictionary material (Phase 2); a non-empty globals stream that contributes
-/// segments other than metadata therefore currently errors `Unsupported`.
+/// `globals`, when present, is a PDF `JBIG2Globals` byte stream carrying shared
+/// symbol dictionaries; it is decoded (once) and its symbols made available to
+/// this page's text regions.
 pub fn decode_embedded(
     globals: Option<&[u8]>,
     page_data: &[u8],
@@ -76,36 +86,35 @@ pub fn decode_embedded(
     decode_embedded_with_context(globals, page_data, options, &mut ctx)
 }
 
-/// Decode a single embedded page stream reusing a worker-local context.
+/// Decode a single embedded page stream reusing a worker-local context. Any
+/// `globals` bytes are decoded on every call; prefer
+/// [`decode_globals`] + [`decode_embedded_with_globals`] to decode shared
+/// globals once and reuse them across pages (jbig2decplan.md §6).
 pub fn decode_embedded_with_context(
     globals: Option<&[u8]>,
     page_data: &[u8],
     options: &DecodeOptions,
     ctx: &mut DecoderContext,
 ) -> Result<MonoBitmap, DecodeError> {
-    // Phase 1: globals only ever carry symbol dictionaries, which are not yet
-    // supported. Reject a globals stream that contains any decodable segment
-    // beyond metadata so callers get a typed error rather than a wrong image.
-    if let Some(g) = globals {
-        let gdoc = file::parse_auto(g, &options.limits)?;
-        for seg in &gdoc.segments {
-            match seg.header.segment_type() {
-                Some(
-                    crate::shared::segment::SegmentType::EndOfFile
-                    | crate::shared::segment::SegmentType::EndOfPage
-                    | crate::shared::segment::SegmentType::EndOfStripe
-                    | crate::shared::segment::SegmentType::Extension
-                    | crate::shared::segment::SegmentType::Profiles,
-                ) => {}
-                _ => {
-                    return Err(DecodeError::Unsupported(UnsupportedFeature::SymbolCoding));
-                }
-            }
-        }
-    }
+    let decoded_globals = match globals {
+        Some(g) if !g.is_empty() => Some(decode_globals(g, options)?),
+        _ => None,
+    };
+    decode_embedded_with_globals(decoded_globals.as_ref(), page_data, options, ctx)
+}
 
+/// Decode a single embedded page stream against already-decoded shared globals
+/// (jbig2decplan.md §5, §6). The immutable `&DecodedGlobals` may be shared by
+/// many page workers concurrently; `ctx` is this worker's mutable scratch.
+pub fn decode_embedded_with_globals(
+    globals: Option<&DecodedGlobals>,
+    page_data: &[u8],
+    options: &DecodeOptions,
+    ctx: &mut DecoderContext,
+) -> Result<MonoBitmap, DecodeError> {
     let doc = file::parse_auto(page_data, &options.limits)?;
-    let mut pages = page::process_document(&doc, &options.limits, ctx)?;
+    let mut pages =
+        page::process_document_with_globals(&doc, globals, &options.limits, ctx)?;
     if pages.is_empty() {
         return Err(DecodeError::InvalidFileHeader);
     }
