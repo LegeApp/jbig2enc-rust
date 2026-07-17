@@ -25,23 +25,12 @@ pub enum CombinationOperator {
 }
 
 /// A packed one-bit-per-pixel bitmap with word-aligned rows.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct MonoBitmap {
     width: u32,
     height: u32,
     stride_words: u32,
     words: Vec<u32>,
-}
-
-impl Default for MonoBitmap {
-    fn default() -> Self {
-        Self {
-            width: 0,
-            height: 0,
-            stride_words: 0,
-            words: Vec::new(),
-        }
-    }
 }
 
 impl core::fmt::Debug for MonoBitmap {
@@ -203,8 +192,8 @@ impl MonoBitmap {
         if sx_start >= sx_end {
             return;
         }
-        let dx_start = (x as i64 + sx_start) as i64; // >= 0
-        let dx_end = (x as i64 + sx_end) as i64; // <= width
+        let dx_start = x as i64 + sx_start; // >= 0
+        let dx_end = x as i64 + sx_end; // <= width
 
         for sy in 0..source.height {
             let dy = y as i64 + sy as i64;
@@ -281,10 +270,11 @@ fn fill_black_rows(words: &mut [u32], width: u32, stride_words: u32) {
         for w in row.iter_mut().take(full_words) {
             *w = !0u32;
         }
+        // When width is not a multiple of 32 there is exactly one partial word
+        // at index `full_words` (stride_words = full_words + 1), so this index
+        // is always in range.
         if rem != 0 {
-            if let Some(w) = row.get_mut(full_words) {
-                *w = last_mask;
-            }
+            row[full_words] = last_mask;
         }
     }
 }
@@ -305,7 +295,8 @@ fn combine_row(
     let w_first = (dx_start / 32) as usize;
     let w_last = ((dx_end - 1) / 32) as usize;
 
-    for w in w_first..=w_last {
+    for (i, dword) in dst_row[w_first..=w_last].iter_mut().enumerate() {
+        let w = w_first + i;
         // Source bit position aligned to this destination word's bit 0.
         let a = 32 * (w as i64) - x;
         let src_val = read_window(src_row, a);
@@ -317,8 +308,7 @@ fn combine_row(
         let hi = dx_end.min(word_hi);
         let mask = mask_range((lo - word_lo) as u32, (hi - word_lo) as u32);
 
-        let d = dst_row[w];
-        dst_row[w] = apply_operator(d, src_val, mask, operator);
+        *dword = apply_operator(*dword, src_val, mask, operator);
     }
 }
 
@@ -522,7 +512,7 @@ mod tests {
         let mut bm = MonoBitmap::new(w, h, false, &limits()).unwrap();
         for y in 0..h {
             for x in 0..w {
-                if (x + y + phase) % 2 == 0 {
+                if (x + y + phase).is_multiple_of(2) {
                     bm.set(x, y, true);
                 }
             }
@@ -596,16 +586,20 @@ mod tests {
 
     #[test]
     fn new_rejects_oversized_dimensions() {
-        let mut tight = DecodeLimits::default();
-        tight.max_width = 10;
+        let narrow = DecodeLimits {
+            max_width: 10,
+            ..Default::default()
+        };
         assert!(matches!(
-            MonoBitmap::new(11, 1, false, &tight),
+            MonoBitmap::new(11, 1, false, &narrow),
             Err(DecodeError::Limit(LimitError::Dimension { .. }))
         ));
-        tight.max_width = 1000;
-        tight.max_region_pixels = 100;
+        let few_pixels = DecodeLimits {
+            max_region_pixels: 100,
+            ..Default::default()
+        };
         assert!(matches!(
-            MonoBitmap::new(50, 50, false, &tight),
+            MonoBitmap::new(50, 50, false, &few_pixels),
             Err(DecodeError::Limit(LimitError::Pixels { .. }))
         ));
     }
