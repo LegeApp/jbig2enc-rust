@@ -5,3 +5,5 @@
 //! Populated by the Phase 0 refactor (see `jbig2decplan.md` §23 and
 //! `jbig2dec-gaps-plan.md` Gap A). Encoder/decoder *state machines* never
 //! live here.
+
+pub mod segment;

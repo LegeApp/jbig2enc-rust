@@ -242,70 +242,10 @@ impl Jbig2Config {
     }
 }
 
-/// JBIG2 segment types as defined in the specification
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SegmentType {
-    #[default]
-    SymbolDictionary = 0,
-    IntermediateTextRegion = 4,
-    ImmediateTextRegion = 6,
-    ImmediateLosslessTextRegion = 7,
-    PatternDictionary = 16,
-    IntermediateHalftoneRegion = 20,
-    ImmediateHalftoneRegion = 22,
-    ImmediateLosslessHalftoneRegion = 23,
-    IntermediateGenericRegion = 36,
-    ImmediateGenericRegion = 38,
-    ImmediateLosslessGenericRegion = 39,
-    IntermediateGenericRefinementRegion = 40,
-    ImmediateGenericRefinementRegion = 42,
-    ImmediateLosslessGenericRefinementRegion = 43,
-    PageInformation = 48,
-    EndOfPage = 49,
-    EndOfStripe = 50,
-    EndOfFile = 51,
-    Profiles = 52,
-    Tables = 53,
-    ColorPalette = 54,
-    FileHeader = 56,
-    Extension = 62,
-}
-
-impl TryFrom<u8> for SegmentType {
-    type Error = io::Error;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(SegmentType::SymbolDictionary),
-            4 => Ok(SegmentType::IntermediateTextRegion),
-            6 => Ok(SegmentType::ImmediateTextRegion),
-            7 => Ok(SegmentType::ImmediateLosslessTextRegion),
-            16 => Ok(SegmentType::PatternDictionary),
-            20 => Ok(SegmentType::IntermediateHalftoneRegion),
-            22 => Ok(SegmentType::ImmediateHalftoneRegion),
-            23 => Ok(SegmentType::ImmediateLosslessHalftoneRegion),
-            36 => Ok(SegmentType::IntermediateGenericRegion),
-            38 => Ok(SegmentType::ImmediateGenericRegion),
-            39 => Ok(SegmentType::ImmediateLosslessGenericRegion),
-            40 => Ok(SegmentType::IntermediateGenericRefinementRegion),
-            42 => Ok(SegmentType::ImmediateGenericRefinementRegion),
-            43 => Ok(SegmentType::ImmediateLosslessGenericRefinementRegion),
-            48 => Ok(SegmentType::PageInformation),
-            49 => Ok(SegmentType::EndOfPage),
-            50 => Ok(SegmentType::EndOfStripe),
-            51 => Ok(SegmentType::EndOfFile),
-            52 => Ok(SegmentType::Profiles),
-            53 => Ok(SegmentType::Tables),
-            54 => Ok(SegmentType::ColorPalette),
-            56 => Ok(SegmentType::FileHeader),
-            62 => Ok(SegmentType::Extension),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid segment type: {}", value),
-            )),
-        }
-    }
-}
+// `SegmentType` is pure T.88 protocol data and now lives in the shared
+// module so the decoder can use it too. Re-exported here to preserve the
+// historical `encode::structs::SegmentType` path (Gap A / Phase 0).
+pub use crate::shared::segment::SegmentType;
 
 // -----------------------------------------------------------------------------
 // File header (magic + flags + number of pages)
