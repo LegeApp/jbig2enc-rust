@@ -7,5 +7,6 @@
 //! live here.
 
 pub mod int_proc;
+pub mod limits;
 pub mod mq_table;
 pub mod segment;
