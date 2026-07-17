@@ -1,4 +1,8 @@
 //! Common utility functions for integration tests
+#![allow(dead_code)]
+
+pub mod oracle;
+pub mod pbm;
 
 use jbig2enc_rust as jbig2;
 use jbig2enc_rust::jbig2sym::BitImage;
