@@ -11,7 +11,8 @@ use std::sync::Arc;
 use crate::decode::context::DecoderContext;
 use crate::decode::error::{DecodeError, UnsupportedFeature};
 use crate::decode::file;
-use crate::decode::page::decode_symbol_dict_into;
+use crate::decode::page::{decode_pattern_dict_into, decode_symbol_dict_into};
+use crate::decode::pattern_dictionary::PatternDictionary;
 use crate::decode::store::SegmentStore;
 use crate::decode::symbol_dictionary::SymbolDictionary;
 use crate::decode::DecodeOptions;
@@ -21,6 +22,7 @@ use crate::shared::segment::SegmentType;
 pub struct DecodedGlobals {
     store: SegmentStore,
     symbol_dictionaries: Vec<Arc<SymbolDictionary>>,
+    pattern_dictionaries: Vec<Arc<PatternDictionary>>,
 }
 
 impl DecodedGlobals {
@@ -36,10 +38,16 @@ impl DecodedGlobals {
         &self.symbol_dictionaries
     }
 
+    /// Every pattern dictionary decoded from the globals, in stream order.
+    #[inline]
+    pub fn pattern_dictionaries(&self) -> &[Arc<PatternDictionary>] {
+        &self.pattern_dictionaries
+    }
+
     /// Whether the globals carried no decodable resource.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.symbol_dictionaries.is_empty()
+        self.symbol_dictionaries.is_empty() && self.pattern_dictionaries.is_empty()
     }
 }
 
@@ -55,6 +63,7 @@ pub fn decode_globals(
     let mut ctx = DecoderContext::new();
     let mut store = SegmentStore::new();
     let mut symbol_dictionaries = Vec::new();
+    let mut pattern_dictionaries = Vec::new();
 
     for seg in &doc.segments {
         match seg.header.segment_type() {
@@ -62,6 +71,10 @@ pub fn decode_globals(
                 let dict =
                     decode_symbol_dict_into(seg, &mut store, None, &options.limits, &mut ctx)?;
                 symbol_dictionaries.push(dict);
+            }
+            Some(SegmentType::PatternDictionary) => {
+                let dict = decode_pattern_dict_into(seg, &mut store, &options.limits, &mut ctx)?;
+                pattern_dictionaries.push(dict);
             }
             // Structural / metadata segments carry no resource.
             Some(
@@ -85,6 +98,7 @@ pub fn decode_globals(
     Ok(DecodedGlobals {
         store,
         symbol_dictionaries,
+        pattern_dictionaries,
     })
 }
 

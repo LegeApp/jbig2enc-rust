@@ -13,6 +13,8 @@ use crate::decode::error::{DecodeError, LimitError, ParseError, UnsupportedFeatu
 use crate::decode::file::{ParsedDocument, ParsedSegment};
 use crate::decode::generic::{decode_generic_region, parse_generic_region};
 use crate::decode::globals::DecodedGlobals;
+use crate::decode::halftone_region::{decode_halftone_region, parse_halftone_region};
+use crate::decode::pattern_dictionary::{decode_pattern_dictionary, PatternDictionary};
 use crate::decode::refinement::{
     decode_refinement_region, page_reference_window, parse_refinement_region,
     REFINEMENT_CONTEXT_COUNT,
@@ -131,6 +133,25 @@ pub(crate) fn decode_symbol_dict_into(
     local.insert(
         seg.header.number,
         DecodedSegment::SymbolDictionary(arc.clone()),
+    )?;
+    Ok(arc)
+}
+
+/// Decode a pattern-dictionary segment and register it in `local`, returning the
+/// shared handle (jbig2decplan.md §18, §19).
+pub(crate) fn decode_pattern_dict_into(
+    seg: &ParsedSegment<'_>,
+    local: &mut SegmentStore,
+    limits: &DecodeLimits,
+    ctx: &mut DecoderContext,
+) -> Result<Arc<PatternDictionary>, DecodeError> {
+    let generic = ctx.generic_contexts();
+    let dict = decode_pattern_dictionary(seg.data, limits, generic)
+        .map_err(|source| annotate(seg.header.number, source))?;
+    let arc = Arc::new(dict);
+    local.insert(
+        seg.header.number,
+        DecodedSegment::PatternDictionary(arc.clone()),
     )?;
     Ok(arc)
 }
@@ -255,13 +276,38 @@ pub fn process_document_with_globals(
             ) => {
                 return Err(DecodeError::Unsupported(UnsupportedFeature::SymbolCoding));
             }
+            Some(SegmentType::PatternDictionary) => {
+                decode_pattern_dict_into(seg, &mut store, limits, ctx)?;
+            }
             Some(
-                SegmentType::PatternDictionary
-                | SegmentType::IntermediateHalftoneRegion
+                SegmentType::IntermediateHalftoneRegion
                 | SegmentType::ImmediateHalftoneRegion
                 | SegmentType::ImmediateLosslessHalftoneRegion,
             ) => {
-                return Err(DecodeError::Unsupported(UnsupportedFeature::HalftoneCoding));
+                let region = parse_halftone_region(seg.data).map_err(|source| {
+                    DecodeError::Segment {
+                        segment: seg.header.number,
+                        source,
+                    }
+                })?;
+                let patterns = store
+                    .pattern_dictionary(seg.header.number, &seg.header.referred_to, globals_store)?
+                    .clone();
+                let region_bm = decode_halftone_region(
+                    &region,
+                    &patterns,
+                    limits,
+                    ctx.generic_contexts(),
+                )
+                .map_err(|source| annotate(seg.header.number, source))?;
+                let target = resolve_page(&mut pages, current, seg.header.page_association)?;
+                compose_region(
+                    &mut pages[target].bitmap,
+                    region_bm,
+                    region.x,
+                    region.y,
+                    region.comb_operator,
+                );
             }
             Some(
                 SegmentType::ImmediateGenericRefinementRegion

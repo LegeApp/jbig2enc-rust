@@ -102,7 +102,14 @@ pub fn decode_generic_region(
     contexts: &mut [MqContext],
 ) -> Result<MonoBitmap, DecodeError> {
     if region.mmr {
-        return Err(DecodeError::Unsupported(UnsupportedFeature::MmrCoding));
+        // MMR (Group 4) generic region: no arithmetic coder, no AT pixels; the
+        // payload is byte-aligned T.6 data for the full region (T.88 §6.2.6).
+        return crate::decode::mmr::decode_mmr_bitmap(
+            region.data,
+            region.width,
+            region.height,
+            limits,
+        );
     }
     if region.tpgdon {
         return Err(DecodeError::Unsupported(UnsupportedFeature::TypicalPrediction));
@@ -407,11 +414,6 @@ mod tests {
             at: NOMINAL_AT0,
             data: &[0u8; 4],
         };
-        let mmr = GenericRegion { mmr: true, ..base.clone() };
-        assert!(matches!(
-            decode_generic_region(&mmr, &limits, &mut ctx),
-            Err(DecodeError::Unsupported(UnsupportedFeature::MmrCoding))
-        ));
         let tp = GenericRegion { tpgdon: true, ..base.clone() };
         assert!(matches!(
             decode_generic_region(&tp, &limits, &mut ctx),

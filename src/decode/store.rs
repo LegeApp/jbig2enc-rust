@@ -10,6 +10,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use crate::decode::error::DecodeError;
+use crate::decode::pattern_dictionary::PatternDictionary;
 use crate::decode::symbol_dictionary::SymbolDictionary;
 use crate::shared::bitmap::MonoBitmap;
 
@@ -18,6 +19,8 @@ use crate::shared::bitmap::MonoBitmap;
 pub enum DecodedSegment {
     /// A symbol dictionary's exported symbols.
     SymbolDictionary(Arc<SymbolDictionary>),
+    /// A pattern dictionary's patterns (referred by halftone regions).
+    PatternDictionary(Arc<PatternDictionary>),
     /// A retained region bitmap (intermediate regions; not produced by the
     /// current encoder but modelled for completeness).
     Region(Arc<MonoBitmap>),
@@ -64,6 +67,29 @@ impl SegmentStore {
             Some(_) => Err(DecodeError::WrongReferredSegmentType { segment, referred }),
             None => Err(DecodeError::MissingReferredSegment { segment, referred }),
         }
+    }
+
+    /// Resolve a pattern dictionary by number, checking `self` then `globals`,
+    /// erroring if it is missing or of the wrong type. `segment` is the
+    /// referring (halftone) segment (for the error).
+    pub fn pattern_dictionary<'a>(
+        &'a self,
+        segment: u32,
+        referred: &[u32],
+        globals: Option<&'a SegmentStore>,
+    ) -> Result<&'a Arc<PatternDictionary>, DecodeError> {
+        for &rn in referred {
+            match self.values.get(&rn).or_else(|| globals.and_then(|g| g.get(rn))) {
+                Some(DecodedSegment::PatternDictionary(p)) => return Ok(p),
+                _ => continue,
+            }
+        }
+        // No referred pattern dictionary found among the resolvable segments.
+        let referred_num = referred.first().copied().unwrap_or(0);
+        Err(DecodeError::MissingReferredSegment {
+            segment,
+            referred: referred_num,
+        })
     }
 
     /// Gather the exported symbols of every referred *symbol dictionary*, in
