@@ -5,6 +5,7 @@ const TEST_IMAGE1_PBM: &str = "tests/fixtures/test_image1.pbm";
 
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
+use jbig2enc_rust as jbig2;
 use jbig2::jbig2enc::{encode_page_with_symbol_dictionary, encode_symbol_dict};
 use jbig2::jbig2structs::Jbig2Config;
 use jbig2::jbig2sym;

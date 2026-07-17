@@ -15,7 +15,7 @@ mod common;
 use common::{TEST_IMAGE_PBM, TEST_IMAGE1_PBM, load_pbm};
 
 use jbig2::jbig2sym::BitImage;
-use jbig2::{Jbig2PdfSplitResult, encode_single_image, encode_single_image_lossless};
+use jbig2::{Jbig2EncodeResult, encode_single_image, encode_single_image_lossless};
 
 /// Configuration for test mode selection
 #[derive(Debug, Clone, Copy)]
@@ -54,9 +54,9 @@ impl EncodingStats {
         }
     }
 
-    fn mark_success(&mut self, result: &Jbig2PdfSplitResult, encoding_time: u128) {
-        self.output_size = result.page_streams.first().map(|s| s.len()).unwrap_or(0);
-        self.global_dict_size = result.global_segments.as_ref().map(|d| d.len());
+    fn mark_success(&mut self, result: &Jbig2EncodeResult, encoding_time: u128) {
+        self.output_size = result.page_data.len();
+        self.global_dict_size = result.global_data.as_ref().map(|d| d.len());
         self.total_output_size = self.output_size + self.global_dict_size.unwrap_or(0);
         self.compression_ratio = self.input_size as f64 / self.total_output_size as f64;
         self.encoding_time_ms = encoding_time;
@@ -125,7 +125,7 @@ impl ComparisonResults {
         }
 
         // Print comparison if both modes were tested
-        if let (Some(ref lossless), Some(ref symbol)) = (&self.lossless, &self.symbol) {
+        if let (Some(lossless), Some(symbol)) = (&self.lossless, &self.symbol) {
             if lossless.success && symbol.success {
                 println!("=== Comparison ===");
 
@@ -196,7 +196,7 @@ fn test_lossless_mode(input: &[u8], width: u32, height: u32) -> EncodingStats {
 
             // Save the JBIG2 output to file for decoding verification
             let output_file = "test_output_lossless.jb2";
-            let page_data = result.page_streams.first().cloned().unwrap_or_default();
+            let page_data = result.page_data.clone();
             if let Err(e) = std::fs::write(output_file, &page_data) {
                 println!("⚠️  Warning: Could not save lossless output: {}", e);
             } else {
@@ -249,12 +249,8 @@ fn test_symbol_mode(input: &[u8], width: u32, height: u32) -> EncodingStats {
     println!("🔧 DEBUG: Inspecting PDF-mode fragment sizes (not a standalone file)");
     match encode_single_image(input, width, height, true) {
         Ok(pdf_result) => {
-            let page_len = pdf_result
-                .page_streams
-                .first()
-                .map(|s| s.len())
-                .unwrap_or(0);
-            if let Some(ref dict) = pdf_result.global_segments {
+            let page_len = pdf_result.page_data.len();
+            if let Some(ref dict) = pdf_result.global_data {
                 println!(
                     "🔧 PDF mode: global_data = {} bytes, page_data = {} bytes",
                     dict.len(),
@@ -263,9 +259,7 @@ fn test_symbol_mode(input: &[u8], width: u32, height: u32) -> EncodingStats {
 
                 if std::env::var("SAVE_PDF_PROBE").is_ok() {
                     let mut combined_pdf = dict.clone();
-                    if let Some(page_data) = pdf_result.page_streams.first() {
-                        combined_pdf.extend_from_slice(page_data);
-                    }
+                    combined_pdf.extend_from_slice(&pdf_result.page_data);
                     let test_file = "test_output_pdf_combined.jb2";
                     match std::fs::write(test_file, &combined_pdf) {
                         Ok(_) => println!(
@@ -289,7 +283,7 @@ fn test_symbol_mode(input: &[u8], width: u32, height: u32) -> EncodingStats {
             println!("✓ Symbol encoding completed in {} ms", elapsed);
 
             // Debug: Check if page_data is empty or has content
-            let page_data = result.page_streams.first().cloned().unwrap_or_default();
+            let page_data = result.page_data.clone();
             if page_data.is_empty() {
                 println!("⚠️  WARNING: Symbol mode produced empty page_data!");
             } else {
@@ -300,7 +294,7 @@ fn test_symbol_mode(input: &[u8], width: u32, height: u32) -> EncodingStats {
             let output_file = "test_output_symbol.jb2";
 
             // In standalone mode (pdf_mode=false), combine global and page data if present
-            let complete_data = if let Some(ref dict) = result.global_segments {
+            let complete_data = if let Some(ref dict) = result.global_data {
                 println!(
                     "📖 Global data present: {} bytes (combining with page data for standalone file)",
                     dict.len()
@@ -561,7 +555,7 @@ fn test_specified_image_only() {
         println!("\n📊 FINAL SUMMARY FOR SPECIFIED IMAGE");
         println!("=====================================");
 
-        if let (Some(ref lossless), Some(ref symbol)) = (&results.lossless, &results.symbol) {
+        if let (Some(lossless), Some(symbol)) = (&results.lossless, &results.symbol) {
             if lossless.success && symbol.success {
                 println!("✅ Both encoding modes completed successfully!");
                 println!();
@@ -696,7 +690,7 @@ fn test_comprehensive_comparison() {
 
     for (name, results) in all_results.iter() {
         println!("\n{}", name);
-        if let (Some(ref lossless), Some(ref symbol)) = (&results.lossless, &results.symbol) {
+        if let (Some(lossless), Some(symbol)) = (&results.lossless, &results.symbol) {
             if lossless.success && symbol.success {
                 let size_winner = if symbol.total_output_size < lossless.total_output_size {
                     "Symbol"
