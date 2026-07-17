@@ -77,7 +77,7 @@ pub(crate) fn plan_symbol_dictionary_layout(
     })
 }
 
-fn build_refinement_family_layout(
+pub(crate) fn build_refinement_family_layout(
     symbols: &[&BitImage],
     canonical_order: &[usize],
     usage_weights: Option<&[usize]>,
