@@ -55,5 +55,19 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "mmr_generic"
+path = "fuzz_targets/mmr_generic.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "halftone_region"
+path = "fuzz_targets/halftone_region.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

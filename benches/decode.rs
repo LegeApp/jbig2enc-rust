@@ -8,7 +8,9 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 
 use jbig2enc_rust::decode::{DecodeOptions, DecoderContext, decode_file_with_context};
-use jbig2enc_rust::jbig2structs::Jbig2Config;
+use jbig2enc_rust::jbig2halftone::encode_halftone_document_auto;
+use jbig2enc_rust::jbig2structs::{GenericRegionParams, Jbig2Config};
+use jbig2enc_rust::jbig2sym::BitImage;
 use jbig2enc_rust::{Jbig2Context, encode_single_image_with_config};
 
 /// Deterministically synthesise a "text-like" bitmap: rows of short black runs
@@ -166,10 +168,53 @@ fn bench_decode_refined_symbol_page(c: &mut Criterion) {
     group.finish();
 }
 
+/// Synthesise a grayscale-ramp bilevel page and encode it as a halftone
+/// document (pattern dictionary + halftone region with arithmetic gray planes),
+/// then benchmark decoding it (Gap D, Phase 4).
+fn bench_decode_halftone_page(c: &mut Criterion) {
+    let (w, h) = (1240u32, 1754u32);
+    let mut img = BitImage::new(w, h).expect("halftone bitmap");
+    let mut s: u32 = 0x2468_ACE0;
+    for y in 0..h {
+        for x in 0..w {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            if ((s >> 16) & 0xFF) < x * 255 / (w - 1) {
+                img.set(x, y, true);
+            }
+        }
+    }
+    let mut cfg = Jbig2Config::default();
+    cfg.want_full_headers = true;
+    cfg.symbol_mode = false;
+    cfg.halftone.grid_size_m = 4;
+    cfg.halftone.quant_levels_n = 16;
+    let region = GenericRegionParams::new(w, h, 300);
+    let encoded = encode_halftone_document_auto(&img, &cfg, &region, 0, Some(1))
+        .expect("encode halftone page");
+    eprintln!("encoded halftone page stream = {} bytes", encoded.len());
+
+    let opts = DecodeOptions::default();
+    let mut dctx = DecoderContext::new();
+
+    let mut group = c.benchmark_group("decode_halftone_page");
+    group.sample_size(20);
+    group.bench_function("decode", |b| {
+        b.iter(|| {
+            let doc =
+                decode_file_with_context(black_box(&encoded), &opts, &mut dctx).expect("decode");
+            black_box(doc.pages.len());
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_decode_generic_a4,
     bench_decode_symbol_page,
-    bench_decode_refined_symbol_page
+    bench_decode_refined_symbol_page,
+    bench_decode_halftone_page
 );
 criterion_main!(benches);

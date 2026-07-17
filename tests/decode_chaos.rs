@@ -6,11 +6,38 @@
 //! in for `cargo fuzz` (which needs nightly).
 
 use jbig2enc_rust::decode::{DecodeOptions, decode_embedded, decode_file};
-use jbig2enc_rust::jbig2structs::Jbig2Config;
+use jbig2enc_rust::jbig2halftone::encode_halftone_document_auto;
+use jbig2enc_rust::jbig2structs::{GenericRegionParams, Jbig2Config};
+use jbig2enc_rust::jbig2sym::BitImage;
 use jbig2enc_rust::{
     Jbig2Context, encode_single_image, encode_single_image_lossless,
     encode_single_image_with_config,
 };
+
+/// A halftone stream (pattern dictionary + halftone region with MMR gray
+/// planes) for the Phase 4 halftone chaos gate.
+fn halftone_stream() -> Vec<u8> {
+    let (w, h) = (48u32, 36u32);
+    let mut img = BitImage::new(w, h).unwrap();
+    let mut s: u32 = 0x51F0;
+    for y in 0..h {
+        for x in 0..w {
+            s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            if ((s >> 16) & 0xFF) < x * 255 / (w - 1) {
+                img.set(x, y, true);
+            }
+        }
+    }
+    let mut cfg = Jbig2Config::default();
+    cfg.want_full_headers = true;
+    cfg.symbol_mode = false;
+    cfg.halftone.grid_size_m = 4;
+    cfg.halftone.quant_levels_n = 16;
+    cfg.halftone.gray_mmr = true;
+    cfg.halftone.dict_mmr = true;
+    let region = GenericRegionParams::new(w, h, 300);
+    encode_halftone_document_auto(&img, &cfg, &region, 0, Some(1)).unwrap()
+}
 
 fn seed_streams() -> Vec<Vec<u8>> {
     let w = 24u32;
@@ -118,7 +145,7 @@ fn tight_opts() -> DecodeOptions {
 #[test]
 fn symbol_stream_single_byte_mutations_never_panic() {
     let opts = tight_opts();
-    for stream in [symbol_stream(), refine_stream()] {
+    for stream in [symbol_stream(), refine_stream(), halftone_stream()] {
         for pos in 0..stream.len() {
             for &val in &[0x00u8, 0x01, 0x80, 0xFF, 0xAA] {
                 let mut m = stream.clone();
