@@ -115,22 +115,30 @@ impl From<ndarray::ShapeError> for Jbig2Error {
     }
 }
 
-// Module declarations
-pub mod jbig2;
-pub mod jbig2arith;
+// Module declarations: the crate is split into an encoder half, a decoder
+// half, and shared protocol definitions (see jbig2dec-gaps-plan.md, Gap A).
+pub mod decode;
+pub mod encode;
+pub mod shared;
+
+// Compatibility re-exports of the historical top-level module paths, so
+// existing users (`jbig2enc_rust::jbig2arith::...`) keep compiling. Remove
+// once dependents migrate to the `encode::` paths.
+pub use encode::jbig2;
+pub use encode::jbig2arith;
 #[cfg(feature = "symboldict")]
-pub mod jbig2cc;
-pub mod jbig2classify;
-pub mod jbig2comparator;
-pub mod jbig2context;
-pub mod jbig2cost;
-pub mod jbig2enc;
-pub mod jbig2halftone;
-pub mod jbig2shared;
-pub(crate) mod jbig2simd;
-pub mod jbig2structs;
-pub mod jbig2sym;
-pub mod jbig2unify;
+pub use encode::jbig2cc;
+pub use encode::jbig2classify;
+pub use encode::jbig2comparator;
+pub use encode::jbig2context;
+pub use encode::jbig2cost;
+pub use encode::jbig2enc;
+pub use encode::jbig2halftone;
+pub use encode::jbig2shared;
+pub(crate) use encode::jbig2simd;
+pub use encode::jbig2structs;
+pub use encode::jbig2sym;
+pub use encode::jbig2unify;
 
 // Re-export the main encode functions and config
 pub use crate::jbig2arith::Jbig2ArithCoder;
