@@ -6,6 +6,11 @@
 //! context belongs to one worker and is reused across pages so allocations are
 //! not repeated per page.
 
+use std::sync::Arc;
+
+use crate::decode::iaid::IaidContexts;
+use crate::decode::integer::IntegerContexts;
+use crate::decode::refinement::REFINEMENT_CONTEXT_COUNT;
 use crate::shared::bitmap::MonoBitmap;
 use crate::shared::limits::DecodeLimits;
 use crate::shared::mq_table::MqContext;
@@ -64,6 +69,15 @@ pub struct DecoderContext {
     /// Generic-region arithmetic contexts (grown lazily to
     /// [`GENERIC_CONTEXT_COUNT`]).
     pub generic_contexts: Vec<MqContext>,
+    /// Arithmetic integer procedure contexts (§11), reused across pages.
+    pub integer_contexts: IntegerContexts,
+    /// IAID symbol-id contexts (§11), grown as symbol-id width increases.
+    pub iaid_contexts: IaidContexts,
+    /// Refinement-region contexts (§17), reused across text regions; grown to
+    /// [`REFINEMENT_CONTEXT_COUNT`] lazily.
+    pub refinement_contexts: Vec<MqContext>,
+    /// Scratch for the combined referred-symbol list, reused per text region.
+    pub symbol_scratch: Vec<Arc<MonoBitmap>>,
     /// Scratch for a temporary region bitmap when a region cannot decode
     /// straight into the page.
     pub temporary_bitmap: MonoBitmap,
@@ -78,14 +92,35 @@ impl DecoderContext {
     /// Return a zeroed generic-context slice of [`GENERIC_CONTEXT_COUNT`]
     /// entries, reusing the existing allocation.
     pub fn generic_contexts(&mut self) -> &mut [MqContext] {
-        if self.generic_contexts.len() < GENERIC_CONTEXT_COUNT {
-            self.generic_contexts
-                .resize(GENERIC_CONTEXT_COUNT, MqContext::default());
-        }
+        self.ensure_generic();
         for c in &mut self.generic_contexts[..GENERIC_CONTEXT_COUNT] {
             *c = MqContext::default();
         }
         &mut self.generic_contexts[..GENERIC_CONTEXT_COUNT]
+    }
+
+    /// Ensure the generic-context buffer holds at least [`GENERIC_CONTEXT_COUNT`]
+    /// entries, *without* zeroing (the symbol-dictionary decoder zeroes once and
+    /// carries state across symbols).
+    pub fn ensure_generic(&mut self) {
+        if self.generic_contexts.len() < GENERIC_CONTEXT_COUNT {
+            self.generic_contexts
+                .resize(GENERIC_CONTEXT_COUNT, MqContext::default());
+        }
+    }
+
+    /// Return a zeroed refinement-context slice of [`REFINEMENT_CONTEXT_COUNT`]
+    /// entries, reusing the existing allocation. Reset once per text-region
+    /// segment; refined instances within a region share the state.
+    pub fn refinement_contexts(&mut self) -> &mut [MqContext] {
+        if self.refinement_contexts.len() < REFINEMENT_CONTEXT_COUNT {
+            self.refinement_contexts
+                .resize(REFINEMENT_CONTEXT_COUNT, MqContext::default());
+        }
+        for c in &mut self.refinement_contexts[..REFINEMENT_CONTEXT_COUNT] {
+            *c = MqContext::default();
+        }
+        &mut self.refinement_contexts[..REFINEMENT_CONTEXT_COUNT]
     }
 
     /// Trim buffers that exceed `retained_words` after a pathological page so

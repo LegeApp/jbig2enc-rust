@@ -132,6 +132,38 @@ pub fn decode_generic_region(
     Ok(bitmap)
 }
 
+/// Decode a single template-0 generic bitmap from an *existing* arithmetic
+/// decoder, without resetting `contexts` (jbig2decplan.md §16).
+///
+/// Symbol-dictionary bitmaps share one arithmetic stream and one generic-context
+/// bank across every symbol in the dictionary, so this variant neither creates
+/// its own decoder nor zeroes the contexts — the dictionary decoder owns both.
+/// `contexts` must be at least `1 << 16` entries.
+pub fn decode_generic_bitmap(
+    decoder: &mut ArithmeticDecoder<'_>,
+    width: u32,
+    height: u32,
+    at: [(i8, i8); 4],
+    contexts: &mut [MqContext],
+    limits: &DecodeLimits,
+) -> Result<MonoBitmap, DecodeError> {
+    if (contexts.len() as u64) < (1u64 << 16) {
+        return Err(DecodeError::Overflow {
+            operation: "generic bitmap context array too small",
+        });
+    }
+    let mut bitmap = MonoBitmap::new(width, height, false, limits)?;
+    if width == 0 || height == 0 {
+        return Ok(bitmap);
+    }
+    if at == NOMINAL_AT0 {
+        decode_template0_nominal(&mut bitmap, decoder, contexts);
+    } else {
+        decode_template0_general(&mut bitmap, decoder, contexts, at);
+    }
+    Ok(bitmap)
+}
+
 #[inline(always)]
 fn sample(row: &[u32], width: u32, x: i64) -> u32 {
     if x < 0 || x >= width as i64 {
