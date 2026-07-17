@@ -6,6 +6,7 @@
 //! `jbig2dec-gaps-plan.md` Gap A). Encoder/decoder *state machines* never
 //! live here.
 
+pub mod bitmap;
 pub mod int_proc;
 pub mod limits;
 pub mod mq_table;
