@@ -765,11 +765,16 @@ impl Segment {
         w.write_u8(flags2)?;
 
         // T.88 §7.2.5: the referred-to segment number width is determined by the
-        // current segment's number — strict less-than comparisons (the spec uses
-        // "less than 256" / "less than 65536").
-        let ref_size = if self.number < 256 {
+        // current segment's number using inclusive boundaries — one byte if the
+        // number is <= 256, two bytes if <= 65536, else four. This matches the
+        // decoder (`decode::segment::referred_size`) and jbig2dec. The previous
+        // strict `< 256` / `< 65_536` was a latent boundary bug (jbig2decplan.md
+        // §9): the encoder never emits a segment that both sits on a boundary and
+        // carries referred-to segments, so the byte-identical manifest is
+        // unchanged, but the writer is now correct for those cases.
+        let ref_size = if self.number <= 256 {
             1
-        } else if self.number < 65_536 {
+        } else if self.number <= 65_536 {
             2
         } else {
             4
