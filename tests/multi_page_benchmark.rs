@@ -399,7 +399,17 @@ fn configs_for_count(count: usize, total_pixels: u64) -> Vec<(&'static str, Jbig
 #[test]
 fn multi_page_compression_benchmark() {
     let (source_name, source_dir) = bench_source_dir();
-    assert!(source_dir.exists(), "{source_name}/ directory not found");
+    // This is an opt-in benchmark over an external multi-page PBM corpus that is
+    // not checked into the repository. Skip (rather than fail) when the corpus
+    // directory is absent, matching the interop tests that skip without their
+    // external tools. Set BENCH_SOURCE to point at a directory of >=10 pages.
+    if !source_dir.exists() {
+        eprintln!(
+            "Skipping multi_page_compression_benchmark: {source_name}/ directory not found \
+             (set BENCH_SOURCE to a directory of PBM pages to run it)"
+        );
+        return;
+    }
 
     let mut pbm_files: Vec<PathBuf> = std::fs::read_dir(&source_dir)
         .unwrap()

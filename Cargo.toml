@@ -50,6 +50,10 @@ refine = []
 halftone_bin = ["dep:image"]
 parallel = ["dep:rayon"]
 profiling = ["dep:pprof"]
+# Opt-in benchmark that links the C jbig2enc bridge (tests/headsup_c_vs_rust.rs).
+# Empty because the bridge is provided via build-script/linker flags at bench
+# time; the feature just gates compilation of that test target.
+c-encoder-bench = []
 
 [[bin]]
 name = "halftone_tester"
