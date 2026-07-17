@@ -33,6 +33,10 @@ pub enum UnsupportedFeature {
     TypicalPrediction,
     #[error("striped page")]
     StripedPage,
+    #[error("transposed text region")]
+    TransposedTextRegion,
+    #[error("symbol dictionary refinement / aggregate coding")]
+    SymbolRefinement,
 }
 
 /// Which resource limit ([`DecodeLimits`]) was exceeded.
@@ -99,6 +103,18 @@ pub enum DecodeError {
 
     #[error("integer overflow while decoding {operation}")]
     Overflow { operation: &'static str },
+
+    #[error("malformed stream: {reason}")]
+    Malformed { reason: &'static str },
+
+    #[error("duplicate segment number {number}")]
+    DuplicateSegment { number: u32 },
+
+    #[error("segment {segment} refers to missing segment {referred}")]
+    MissingReferredSegment { segment: u32, referred: u32 },
+
+    #[error("segment {segment} refers to segment {referred} of the wrong type")]
+    WrongReferredSegmentType { segment: u32, referred: u32 },
 
     #[error("unsupported JBIG2 feature: {0}")]
     Unsupported(#[from] UnsupportedFeature),
