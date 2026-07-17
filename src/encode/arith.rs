@@ -8,7 +8,6 @@
 
 use anyhow::Result;
 use anyhow::anyhow;
-use once_cell::sync::Lazy;
 #[cfg(debug_assertions)]
 use std::collections::HashMap;
 
@@ -186,92 +185,33 @@ pub enum IntProc {
     Iari,
 }
 
-#[allow(clippy::unreadable_literal)]
-#[rustfmt::skip]
-macro_rules! s {
-    ( $qe:expr, $nmps:expr, $nlps:expr, $sw:expr ) => {
-        State { qe: $qe, nmps: $nmps, nlps: $nlps, switch: $sw != 0 }
-    };
-}
+/// Table E.1 – indices 0 … 46 (MPS = 0 half).
+///
+/// Derived from the canonical rows in [`crate::shared::mq_table`] so the
+/// encoder and decoder share one source of truth (Phase 0 / §10). The values
+/// are identical to the historical literal table.
+pub const BASE: [State; 47] = build_base();
 
-/// Table E.1 – indices 0 … 46 (MPS = 0 half)
-pub const BASE: [State; 47] = [
-    s!(0x5601, 1, 1, 1),
-    s!(0x3401, 2, 6, 0),
-    s!(0x1801, 3, 9, 0),
-    s!(0x0AC1, 4, 12, 0),
-    s!(0x0521, 5, 29, 0),
-    s!(0x0221, 38, 33, 0),
-    s!(0x5601, 7, 6, 1),
-    s!(0x5401, 8, 14, 0),
-    s!(0x4801, 9, 14, 0),
-    s!(0x3801, 10, 14, 0),
-    s!(0x3001, 11, 17, 0),
-    s!(0x2401, 12, 18, 0),
-    s!(0x1C01, 13, 20, 0),
-    s!(0x1601, 29, 21, 0),
-    s!(0x5601, 15, 14, 1),
-    s!(0x5401, 16, 14, 0),
-    s!(0x5101, 17, 15, 0),
-    s!(0x4801, 18, 16, 0),
-    s!(0x3801, 19, 17, 0),
-    s!(0x3401, 20, 18, 0),
-    s!(0x3001, 21, 19, 0),
-    s!(0x2801, 22, 19, 0),
-    s!(0x2401, 23, 20, 0),
-    s!(0x2201, 24, 21, 0),
-    s!(0x1C01, 25, 22, 0),
-    s!(0x1801, 26, 23, 0),
-    s!(0x1601, 27, 24, 0),
-    s!(0x1401, 28, 25, 0),
-    s!(0x1201, 29, 26, 0),
-    s!(0x1101, 30, 27, 0),
-    s!(0x0AC1, 31, 28, 0),
-    s!(0x09C1, 32, 29, 0),
-    s!(0x08A1, 33, 30, 0),
-    s!(0x0521, 34, 31, 0),
-    s!(0x0441, 35, 32, 0),
-    s!(0x02A1, 36, 33, 0),
-    s!(0x0221, 37, 34, 0),
-    s!(0x0141, 38, 35, 0),
-    s!(0x0111, 39, 36, 0),
-    s!(0x0085, 40, 37, 0),
-    s!(0x0049, 41, 38, 0),
-    s!(0x0025, 42, 39, 0),
-    s!(0x0015, 43, 40, 0),
-    s!(0x0009, 44, 41, 0),
-    s!(0x0005, 45, 42, 0),
-    s!(0x0001, 45, 43, 0),
-    s!(0x5601, 46, 46, 0), // dummy “all done” state
-];
-
-/// Build the 94-state table at start-up.
-pub(crate) static FULL: Lazy<[State; 94]> = Lazy::new(|| {
-    let mut t = [BASE[0]; 94];
-
-    for i in 0..47 {
-        let s = BASE[i];
-
-        // Lower half: MPS = 0
+const fn build_base() -> [State; 47] {
+    let mut t = [State {
+        qe: 0,
+        nmps: 0,
+        nlps: 0,
+        switch: false,
+    }; 47];
+    let mut i = 0;
+    while i < 47 {
+        let (qe, nmps, nlps, switch) = crate::shared::mq_table::BASE_ROWS[i];
         t[i] = State {
-            qe: s.qe,
-            nmps: s.nmps, // stays in lower half
-            nlps: if s.switch { s.nlps + 47 } else { s.nlps },
-            switch: s.switch,
+            qe,
+            nmps,
+            nlps,
+            switch,
         };
-
-        // Upper half: MPS = 1
-        t[i + 47] = State {
-            qe: s.qe,
-            nmps: s.nmps + 47, // stays in upper half
-            // If LPS flips the MPS we must leave the upper half
-            nlps: if s.switch { s.nlps } else { s.nlps + 47 },
-            switch: s.switch,
-        };
+        i += 1;
     }
-
     t
-});
+}
 
 /// Context-adaptive arithmetic encoder for JBIG2.
 const NUM_REFINEMENT_CONTEXTS: usize = 1 << 13; // 8192 for GRTEMPLATE=0 (13-bit context)
@@ -469,7 +409,7 @@ impl Jbig2ArithCoder {
 
     #[inline(always)]
     fn encode_bit_with_state_idx(&mut self, state_idx: usize, d: bool) -> usize {
-        let state = FULL[state_idx];
+        let state = crate::shared::mq_table::MQ_STATES[state_idx];
         let qe = state.qe;
         let mps_val = state_idx >= 47;
         let mut next_state = state_idx;
@@ -482,7 +422,7 @@ impl Jbig2ArithCoder {
             } else {
                 self.a = qe;
             }
-            next_state = state.nlps as usize;
+            next_state = state.next_lps as usize;
             renorm_needed = true;
         } else {
             self.a = self.a.wrapping_sub(qe);
@@ -492,7 +432,7 @@ impl Jbig2ArithCoder {
                 } else {
                     self.c = self.c.wrapping_add(qe as u32);
                 }
-                next_state = state.nmps as usize;
+                next_state = state.next_mps as usize;
                 renorm_needed = true;
             } else {
                 self.c = self.c.wrapping_add(qe as u32);
