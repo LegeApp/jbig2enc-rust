@@ -166,24 +166,10 @@ const INT_ENC_RANGE: [IntEncRange; 13] = [
     },
 ];
 
-/// Integer encoding procedure types, corresponding to JBIG2_IA* enums.
-#[derive(Clone, Copy, Debug)]
-#[repr(usize)]
-pub enum IntProc {
-    Iaai = 0,
-    Iadh,
-    Iads,
-    Iadt,
-    Iadw,
-    Iaex,
-    Iafs,
-    Iait,
-    Iardh,
-    Iardw,
-    Iardx,
-    Iardy,
-    Iari,
-}
+// `IntProc` is shared protocol data (the JBIG2 IA* procedure identifiers) and
+// now lives in the shared module. Re-exported to keep the historical
+// `crate::jbig2arith::IntProc` path working (Phase 0 / §11).
+pub use crate::shared::int_proc::IntProc;
 
 /// Table E.1 – indices 0 … 46 (MPS = 0 half).
 ///
