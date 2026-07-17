@@ -1,4 +1,8 @@
 //! This module contains the main JBIG2 encoder logic.
+//!
+//! (Was `encode/jbig2enc/mod.rs`; renamed to `encode/document.rs` in the
+//! Phase 0 restructure. Its `symbol` subdirectory stays a child module at
+//! `encode/document/symbol/` — see Gap A.)
 mod symbol;
 
 #[allow(unused_imports)]

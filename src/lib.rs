@@ -122,23 +122,24 @@ pub mod encode;
 pub mod shared;
 
 // Compatibility re-exports of the historical top-level module paths, so
-// existing users (`jbig2enc_rust::jbig2arith::...`) keep compiling. Remove
-// once dependents migrate to the `encode::` paths.
-pub use encode::jbig2;
-pub use encode::jbig2arith;
+// existing users (`jbig2enc_rust::jbig2arith::...`) keep compiling after the
+// Phase 0 module rename (Gap A). Remove once dependents migrate to the
+// `encode::` paths.
+pub use encode::api as jbig2;
+pub use encode::arith as jbig2arith;
 #[cfg(feature = "symboldict")]
-pub use encode::jbig2cc;
-pub use encode::jbig2classify;
-pub use encode::jbig2comparator;
-pub use encode::jbig2context;
-pub use encode::jbig2cost;
-pub use encode::jbig2enc;
-pub use encode::jbig2halftone;
-pub use encode::jbig2shared;
-pub(crate) use encode::jbig2simd;
-pub use encode::jbig2structs;
-pub use encode::jbig2sym;
-pub use encode::jbig2unify;
+pub use encode::cc as jbig2cc;
+pub use encode::classify as jbig2classify;
+pub use encode::comparator as jbig2comparator;
+pub use encode::context as jbig2context;
+pub use encode::cost as jbig2cost;
+pub use encode::document as jbig2enc;
+pub use encode::halftone as jbig2halftone;
+pub use encode::shared as jbig2shared;
+pub(crate) use encode::simd as jbig2simd;
+pub use encode::structs as jbig2structs;
+pub use encode::sym as jbig2sym;
+pub use encode::unify as jbig2unify;
 
 // Re-export the main encode functions and config
 pub use crate::jbig2arith::Jbig2ArithCoder;

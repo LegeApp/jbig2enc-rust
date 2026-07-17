@@ -1,21 +1,22 @@
 //! The encoder half of the crate.
 //!
-//! Module names retain their historical `jbig2*` prefixes for now; they are
-//! renamed as part of the Phase 0 shared-module refactor (see
-//! `jbig2dec-gaps-plan.md`, Gap A).
+//! Modules were renamed from their historical `jbig2*` prefixes as part of
+//! the Phase 0 restructure (see `jbig2dec-gaps-plan.md`, Gap A). The old
+//! top-level paths remain available through compatibility re-exports in
+//! `lib.rs`.
 
-pub mod jbig2;
-pub mod jbig2arith;
+pub mod api;
+pub mod arith;
 #[cfg(feature = "symboldict")]
-pub mod jbig2cc;
-pub mod jbig2classify;
-pub mod jbig2comparator;
-pub mod jbig2context;
-pub mod jbig2cost;
-pub mod jbig2enc;
-pub mod jbig2halftone;
-pub mod jbig2shared;
-pub(crate) mod jbig2simd;
-pub mod jbig2structs;
-pub mod jbig2sym;
-pub mod jbig2unify;
+pub mod cc;
+pub mod classify;
+pub mod comparator;
+pub mod context;
+pub mod cost;
+pub mod document;
+pub mod halftone;
+pub mod shared;
+pub(crate) mod simd;
+pub mod structs;
+pub mod sym;
+pub mod unify;
