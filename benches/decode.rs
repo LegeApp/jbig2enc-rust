@@ -171,6 +171,7 @@ fn bench_decode_refined_symbol_page(c: &mut Criterion) {
 /// Synthesise a grayscale-ramp bilevel page and encode it as a halftone
 /// document (pattern dictionary + halftone region with arithmetic gray planes),
 /// then benchmark decoding it (Gap D, Phase 4).
+#[allow(clippy::field_reassign_with_default)]
 fn bench_decode_halftone_page(c: &mut Criterion) {
     let (w, h) = (1240u32, 1754u32);
     let mut img = BitImage::new(w, h).expect("halftone bitmap");

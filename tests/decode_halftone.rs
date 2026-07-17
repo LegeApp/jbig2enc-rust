@@ -55,6 +55,7 @@ fn gradient_bitimage(w: u32, h: u32) -> BitImage {
     img
 }
 
+#[allow(clippy::field_reassign_with_default)]
 fn halftone_config(dict_mmr: bool, gray_mmr: bool, lossless: bool) -> Jbig2Config {
     let mut cfg = Jbig2Config::default();
     cfg.want_full_headers = true;

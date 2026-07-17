@@ -16,6 +16,7 @@ use jbig2enc_rust::{
 
 /// A halftone stream (pattern dictionary + halftone region with MMR gray
 /// planes) for the Phase 4 halftone chaos gate.
+#[allow(clippy::field_reassign_with_default)]
 fn halftone_stream() -> Vec<u8> {
     let (w, h) = (48u32, 36u32);
     let mut img = BitImage::new(w, h).unwrap();
