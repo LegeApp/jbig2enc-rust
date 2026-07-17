@@ -752,14 +752,24 @@ impl CCImage {
     ///
     /// 1. `make_ccids_by_analysis()` — union-find labeling
     /// 2. `make_ccs_from_ccids()` — build descriptors
-    /// 3. `sort_in_reading_order()` — reading-order sort
+    /// 3. `erase_tiny_ccs()` — remove noise (only if `losslevel > 0`)
+    /// 4. `sort_in_reading_order()` — reading-order sort
     ///
     /// After this, iterate `0..self.ccs.len()` and call
     /// `get_bitmap_for_cc(i)` to extract symbol bitmaps.
     pub fn analyze(&mut self, losslevel: i32) {
-        let _ = losslevel;
         self.make_ccids_by_analysis();
         self.make_ccs_from_ccids();
+
+        // Noise removal: when the caller opts into lossy cleaning
+        // (`losslevel > 0`), isolated specks up to `tinysize` pixels are
+        // erased. This call was accidentally dropped when `losslevel` was
+        // stubbed out during the pipeline rewrite, regressing
+        // `test_tiny_cc_removal`.
+        if losslevel > 0 {
+            self.erase_tiny_ccs();
+        }
+
         self.sort_in_reading_order();
     }
 
