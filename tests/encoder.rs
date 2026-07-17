@@ -6,6 +6,7 @@ use std::process::Command;
 use std::time::Instant;
 use tempfile::TempDir;
 
+use jbig2enc_rust as jbig2;
 use jbig2::jbig2arith::{BASE, Jbig2ArithCoder, State};
 use jbig2::jbig2sym::{BitImage, Symbol};
 // Import the common test utilities
@@ -62,13 +63,16 @@ macro_rules! debug_with_time {
 /// Helper: quick & dirty PBM-binary (P4) reader into BitImage
 fn read_pbm(path: &std::path::Path) -> BitImage {
     let data = std::fs::read(path).expect("read pbm");
-    let mut parts = data.splitn(4, |&b| b == b'\n');
+    // Raw PBM (P4) is `P4\n<w> <h>\n` followed immediately by packed bit rows.
+    // There is no maxval line (that is PGM/PPM only), and the binary payload
+    // may legitimately contain no 0x0A bytes, so split off exactly the two
+    // header lines and treat the remainder as the bitmap.
+    let mut parts = data.splitn(3, |&b| b == b'\n');
     assert_eq!(parts.next().unwrap(), b"P4");
     let dims = std::str::from_utf8(parts.next().unwrap()).unwrap();
     let mut it = dims.split_whitespace();
     let w: usize = it.next().unwrap().parse().unwrap();
     let h: usize = it.next().unwrap().parse().unwrap();
-    let _max = parts.next().unwrap(); // PBM has no maxval but jbig2dec writes one blank line
     let bitmap = parts.next().unwrap();
 
     let mut img = BitImage::new(w as u32, h as u32).unwrap();
@@ -264,7 +268,9 @@ fn encode_and_decode(img: &BitImage, temp_dir: &TempDir) -> Result<(), Box<dyn E
             let byte = img.as_bytes()[byte_idx];
             let expected = ((byte >> bit) & 1) != 0;
             let byte = decoded.as_bytes()[byte_idx];
-            let actual = (byte & (1 << (7 - bit))) != 0;
+            // `decoded` is a BitImage, whose as_bytes() is MSB-first just like
+            // the source image, so extract the same bit position.
+            let actual = ((byte >> bit) & 1) != 0;
             if expected != actual {
                 return Err(Box::new(TestError::MismatchError(
                     x as u32, y as u32, expected, actual,
@@ -309,7 +315,7 @@ fn empty_symbol_list_returns_error() {
     let err = encode_symbol_dict(&[], &cfg, /* page_number: */ 1).unwrap_err();
     // we expect the encoder to reject an empty symbol slice
     assert!(
-        err.to_string().contains("no symbols"),
+        err.to_string().contains("no valid symbols"),
         "got unexpected error: {}",
         err
     );

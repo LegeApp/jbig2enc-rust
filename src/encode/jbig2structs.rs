@@ -314,7 +314,7 @@ impl TryFrom<u8> for SegmentType {
 /// Represents the JBIG2 file header as per the specification (§D.4.1)
 #[derive(Debug)]
 pub struct FileHeader {
-    pub organisation_type: bool, // 1 bit: 0 = sequential, 1 = random-access
+    pub organisation_type: bool, // false = sequential, true = random-access (T.88 §D.4.2 bit 0: 1=sequential)
     pub unknown_n_pages: bool,   // 1 bit: 1 = number of pages unknown
     pub n_pages: u32,            // Number of pages (big-endian), omitted if unknown_n_pages is true
 }
@@ -325,8 +325,14 @@ impl FileHeader {
         let mut buf = Vec::with_capacity(8 + 1 + if self.unknown_n_pages { 0 } else { 4 });
         buf.extend_from_slice(MAGIC);
 
+        // T.88 §D.4.2 file-header flags. Bit 0 is the file organisation type,
+        // where 1 = sequential and 0 = random-access. This crate always emits
+        // segments in sequential layout (header immediately followed by its
+        // data), so the bit must be set whenever the file is NOT random-access.
+        // (jbig2dec 0.20 rejects sequentially-laid-out data flagged as
+        // random-access with "page has no image, cannot be completed".)
         let mut flags = 0u8;
-        if self.organisation_type {
+        if !self.organisation_type {
             flags |= 0x01;
         }
         if self.unknown_n_pages {
