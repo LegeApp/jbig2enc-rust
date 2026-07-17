@@ -48,5 +48,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "refinement_region"
+path = "fuzz_targets/refinement_region.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

@@ -13,7 +13,11 @@ use crate::decode::error::{DecodeError, LimitError, ParseError, UnsupportedFeatu
 use crate::decode::file::{ParsedDocument, ParsedSegment};
 use crate::decode::generic::{decode_generic_region, parse_generic_region};
 use crate::decode::globals::DecodedGlobals;
-use crate::decode::refinement::REFINEMENT_CONTEXT_COUNT;
+use crate::decode::refinement::{
+    decode_refinement_region, page_reference_window, parse_refinement_region,
+    REFINEMENT_CONTEXT_COUNT,
+};
+use crate::decode::arith::ArithmeticDecoder;
 use crate::decode::store::{DecodedSegment, SegmentStore};
 use crate::decode::symbol_dictionary::{decode_symbol_dictionary, SymbolDictionary};
 use crate::decode::text_region::decode_text_region;
@@ -260,10 +264,59 @@ pub fn process_document_with_globals(
                 return Err(DecodeError::Unsupported(UnsupportedFeature::HalftoneCoding));
             }
             Some(
-                SegmentType::IntermediateGenericRefinementRegion
-                | SegmentType::ImmediateGenericRefinementRegion
+                SegmentType::ImmediateGenericRefinementRegion
                 | SegmentType::ImmediateLosslessGenericRefinementRegion,
             ) => {
+                // T.88 §7.4.7: an *immediate* generic refinement region with no
+                // referred region segment refines the page buffer in place; the
+                // reference is the page-buffer window under the region box
+                // (§7.4.7.4) and the external combination operator is REPLACE.
+                // Refinement regions that refer to another region segment reuse a
+                // retained intermediate/auxiliary buffer, which the Phase 3
+                // decoder does not keep — those stay Unsupported (Phase 5).
+                if !seg.header.referred_to.is_empty() {
+                    return Err(DecodeError::Unsupported(
+                        UnsupportedFeature::RefinementRegion,
+                    ));
+                }
+                let region = parse_refinement_region(seg.data)
+                    .map_err(|source| annotate(seg.header.number, source))?;
+                let target =
+                    resolve_page(&mut pages, current, seg.header.page_association)?;
+                let reference = page_reference_window(
+                    &pages[target].bitmap,
+                    region.x,
+                    region.y,
+                    region.width,
+                    region.height,
+                    limits,
+                )?;
+                // §7.4.7.5 step 2: reset all arithmetic statistics to zero. Each
+                // refinement region segment starts with a fresh context bank.
+                let refine_ctx = ctx.refinement_contexts();
+                let mut dec = ArithmeticDecoder::new(region.data);
+                let refined = decode_refinement_region(
+                    &mut dec,
+                    &reference,
+                    region.width,
+                    region.height,
+                    0,
+                    0,
+                    region.grat,
+                    refine_ctx,
+                    limits,
+                )
+                .map_err(|source| annotate(seg.header.number, source))?;
+                compose_region(
+                    &mut pages[target].bitmap,
+                    refined,
+                    region.x,
+                    region.y,
+                    // §7.4.7.5 step 1: no referred region => REPLACE.
+                    4,
+                );
+            }
+            Some(SegmentType::IntermediateGenericRefinementRegion) => {
                 return Err(DecodeError::Unsupported(
                     UnsupportedFeature::RefinementRegion,
                 ));

@@ -136,5 +136,40 @@ fn bench_decode_symbol_page(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_decode_generic_a4, bench_decode_symbol_page);
+/// Same glyph page, but encoded with SBREFINE=1 per-instance refinement
+/// (`text_refine`), so decoding drives the generic-refinement path once per
+/// refined instance. Cheap add-on to guard the refinement decode hot loop.
+fn bench_decode_refined_symbol_page(c: &mut Criterion) {
+    let (w, h) = (1240u32, 1754u32);
+    let px = synth_glyph_page(w, h);
+
+    let mut cfg = Jbig2Config::text();
+    cfg.text_refine = true;
+    let ctx = Jbig2Context::with_config(cfg, false);
+    let encoded = encode_single_image_with_config(&px, w, h, ctx)
+        .expect("encode refined symbol page")
+        .page_data;
+    eprintln!("encoded refined symbol page stream = {} bytes", encoded.len());
+
+    let opts = DecodeOptions::default();
+    let mut dctx = DecoderContext::new();
+
+    let mut group = c.benchmark_group("decode_refined_symbol_page");
+    group.sample_size(20);
+    group.bench_function("decode", |b| {
+        b.iter(|| {
+            let doc =
+                decode_file_with_context(black_box(&encoded), &opts, &mut dctx).expect("decode");
+            black_box(doc.pages.len());
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_decode_generic_a4,
+    bench_decode_symbol_page,
+    bench_decode_refined_symbol_page
+);
 criterion_main!(benches);

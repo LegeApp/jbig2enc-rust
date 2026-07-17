@@ -58,6 +58,45 @@ fn symbol_stream() -> Vec<u8> {
     .page_data
 }
 
+/// A refine-mode page (SBREFINE=1 text region whose instances carry non-zero
+/// RDW per-instance refinements): variable-width "H" glyphs, some one pixel
+/// wider, so the clusterer refines width-8 instances onto a width-7 prototype.
+/// This exercises the inline generic-refinement decode path under mutation.
+fn refine_stream() -> Vec<u8> {
+    let (cols, rows) = (6u32, 4u32);
+    let (pitch_x, pitch_y) = (12u32, 13u32);
+    let w = 4 + cols * pitch_x;
+    let h = 4 + rows * pitch_y;
+    let mut px = vec![0u8; (w * h) as usize];
+    for ry in 0..rows {
+        for rx in 0..cols {
+            let ox = 2 + rx * pitch_x;
+            let oy = 2 + ry * pitch_y;
+            let wide = (rx + ry) % 2 == 1;
+            let mut set = |gx: u32, gy: u32| {
+                if ox + gx < w {
+                    px[((oy + gy) * w + (ox + gx)) as usize] = 1;
+                }
+            };
+            for gy in 0..10 {
+                set(0, gy);
+                set(6, gy);
+            }
+            for gx in 1..6 {
+                set(gx, 5);
+            }
+            if wide {
+                set(7, 5);
+            }
+        }
+    }
+    let mut cfg = Jbig2Config::text();
+    cfg.text_refine = true;
+    encode_single_image_with_config(&px, w, h, Jbig2Context::with_config(cfg, false))
+        .unwrap()
+        .page_data
+}
+
 /// Tight limits so a mutated size field cannot make the symbol chaos gate slow
 /// by attempting a large (still under the generous default) decode.
 fn tight_opts() -> DecodeOptions {
@@ -79,17 +118,18 @@ fn tight_opts() -> DecodeOptions {
 #[test]
 fn symbol_stream_single_byte_mutations_never_panic() {
     let opts = tight_opts();
-    let stream = symbol_stream();
-    for pos in 0..stream.len() {
-        for &val in &[0x00u8, 0x01, 0x80, 0xFF, 0xAA] {
-            let mut m = stream.clone();
-            m[pos] = val;
-            let _ = decode_file(&m, &opts);
-            let _ = decode_embedded(None, &m, &opts);
+    for stream in [symbol_stream(), refine_stream()] {
+        for pos in 0..stream.len() {
+            for &val in &[0x00u8, 0x01, 0x80, 0xFF, 0xAA] {
+                let mut m = stream.clone();
+                m[pos] = val;
+                let _ = decode_file(&m, &opts);
+                let _ = decode_embedded(None, &m, &opts);
+            }
         }
-    }
-    for cut in 0..=stream.len() {
-        let _ = decode_file(&stream[..cut], &opts);
+        for cut in 0..=stream.len() {
+            let _ = decode_file(&stream[..cut], &opts);
+        }
     }
 }
 

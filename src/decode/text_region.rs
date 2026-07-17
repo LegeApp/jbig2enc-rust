@@ -248,8 +248,12 @@ pub fn decode_text_region(
                     });
                 }
                 // §6.3.5.3: GRREFERENCEDX/DY = floor(RDW/2)+RDX, floor(RDH/2)+RDY.
-                let grdx = (rdw as i32).div_euclid(2) + rdx;
-                let grdy = (rdh as i32).div_euclid(2) + rdy;
+                // RDW/RDH are bounded by the grw/grh range check above, but RDX/RDY
+                // are unbounded decoded integers, so a malformed stream can drive
+                // the sum past i32. Saturate: an out-of-range offset just makes the
+                // reference window read as all-zero (a bounded, if wrong, bitmap).
+                let grdx = (rdw.div_euclid(2) as i32).saturating_add(rdx);
+                let grdy = (rdh.div_euclid(2) as i32).saturating_add(rdy);
                 let refined = decode_refinement_region(
                     &mut dec,
                     symbol,

@@ -12,13 +12,119 @@
 //! per instance — the caller resets it once per text-region segment.
 
 use crate::decode::arith::ArithmeticDecoder;
-use crate::decode::error::DecodeError;
+use crate::decode::error::{DecodeError, LimitError, UnsupportedFeature};
 use crate::shared::bitmap::MonoBitmap;
 use crate::shared::limits::DecodeLimits;
 use crate::shared::mq_table::MqContext;
+use crate::shared::reader::Reader;
 
 /// The number of GRTEMPLATE-0 refinement contexts (13-bit context).
 pub const REFINEMENT_CONTEXT_COUNT: usize = 1 << 13;
+
+/// A parsed standalone generic-refinement-region segment header (T.88 §7.4.7),
+/// plus the arithmetic-coded payload that follows it.
+pub struct RefinementRegionSegment<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub x: u32,
+    pub y: u32,
+    /// External combination operator (region-info flags low 3 bits).
+    pub comb_operator: u8,
+    /// GRAT1 (target adaptive-template pixel), nominally `(-1, -1)`.
+    pub grat: (i8, i8),
+    pub data: &'a [u8],
+}
+
+/// Parse a generic refinement region segment data header (T.88 §7.4.7.1–7.4.7.3).
+///
+/// Rejects the features the Phase 3 decoder does not implement with typed
+/// `Unsupported` errors: GRTEMPLATE-1 and TPGRON (typical prediction). The
+/// encoder emits neither, and PDFs in the wild that carry standalone refinement
+/// regions use GRTEMPLATE-0 without TPGRON.
+pub fn parse_refinement_region(payload: &[u8]) -> Result<RefinementRegionSegment<'_>, DecodeError> {
+    let mut r = Reader::new(payload);
+    // §7.4.1 region segment information field.
+    let width = r.read_u32_be()?;
+    let height = r.read_u32_be()?;
+    let x = r.read_u32_be()?;
+    let y = r.read_u32_be()?;
+    let region_flags = r.read_u8()?;
+    let comb_operator = region_flags & 0x07;
+
+    // §7.4.7.2 generic refinement region segment flags.
+    let flags = r.read_u8()?;
+    let grtemplate = flags & 0x01;
+    let tpgron = flags & 0x02 != 0;
+
+    if grtemplate != 0 {
+        // GRTEMPLATE-1 refinement is deferred (Phase 5).
+        return Err(DecodeError::Unsupported(UnsupportedFeature::RefinementRegion));
+    }
+    if tpgron {
+        // Typical prediction for generic refinement is deferred (Phase 5).
+        return Err(DecodeError::Unsupported(UnsupportedFeature::RefinementRegion));
+    }
+
+    // §7.4.7.3 AT flags: present only when GRTEMPLATE=0 (two AT pairs, 4 bytes).
+    // Only GRAT1 is used by the template-0 context.
+    let g1x = r.read_i8()?;
+    let g1y = r.read_i8()?;
+    let _g2x = r.read_i8()?;
+    let _g2y = r.read_i8()?;
+
+    let data = &payload[r.position()..];
+    Ok(RefinementRegionSegment {
+        width,
+        height,
+        x,
+        y,
+        comb_operator,
+        grat: (g1x, g1y),
+        data,
+    })
+}
+
+/// Extract the page-buffer sub-region `[x, y, width, height]` as a fresh bitmap,
+/// the `GRREFERENCE` for a standalone refinement region with no referred region
+/// segment (T.88 §7.4.7.4). Pixels of the box that fall outside the page are 0.
+pub fn page_reference_window(
+    page: &MonoBitmap,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    limits: &DecodeLimits,
+) -> Result<MonoBitmap, DecodeError> {
+    let pixels = (width as u64)
+        .checked_mul(height as u64)
+        .ok_or(DecodeError::Overflow { operation: "refinement window pixels" })?;
+    if pixels > limits.max_page_pixels {
+        return Err(DecodeError::limit(LimitError::Pixels {
+            what: "refinement window",
+            value: pixels,
+            limit: limits.max_page_pixels,
+        }));
+    }
+    let mut window = MonoBitmap::new(width, height, false, limits)?;
+    let pw = page.width();
+    let ph = page.height();
+    for wy in 0..height {
+        let py = match y.checked_add(wy) {
+            Some(v) if v < ph => v,
+            _ => continue,
+        };
+        for wx in 0..width {
+            let px = match x.checked_add(wx) {
+                Some(v) if v < pw => v,
+                _ => continue,
+            };
+            if page.get(px, py) {
+                window.set(wx, wy, true);
+            }
+        }
+    }
+    Ok(window)
+}
 
 /// Read a reference/target pixel at signed coordinates, zero outside the bitmap.
 #[inline]

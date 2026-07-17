@@ -256,6 +256,49 @@ diff, runs the checklist, and only then does the next phase start.
 
 ---
 
+## Phase 3 findings (refinement completion + hardening)
+
+* **Encoder S-advance bug — CONFIRMED and FIXED.** T.88 §6.4.5 step 3c v)/xi):
+  `CURS` advances by `WI - 1` where `WI` is the width of the bitmap *actually
+  placed* (`IBI`), i.e. the refined width `GRW = WOI + RDWI` for `RI=1`
+  instances (§6.4.11, Table 12). The decoder (and jbig2dec 0.20) advance by the
+  refined placed width. The encoder's `encode_text_region_with_refinement`
+  advanced by the *prototype* width, so whenever `RDW != 0` the encoded `IADS`
+  deltas desynced S for every later instance in the strip. Fixed by advancing
+  `CURS` by the refined trimmed width. Evidence (test_image1, native == jbig2dec
+  throughout): native-decode-vs-source pixel diffs dropped symbol 2348→175,
+  sym_unify 2984→1215, refine 19897→175; a synthetic RDW=+1 page went 3912→0
+  (pixel-exact vs source). The residual (e.g. 175) is lossy `RI=0` substitution,
+  a separate matching-policy question, not S-advance. The encoder byte change is
+  isolated in a dedicated `encode_hashes.txt` regeneration commit (only
+  test_image1 page streams changed; globals unchanged — the fix is text-region
+  S-coordinate only). Note: `RDW != 0` only arises when `config.text_refine` is
+  set (dim tolerance 2); default `text()` matching requires exact dims
+  (`evaluate_symbol_match` `dim_limit = 0`), so `RDW` is always 0 there.
+
+* **Standalone immediate generic refinement regions (types 42/43) — decoded.**
+  T.88 §7.4.7: an immediate refinement region with no referred region segment
+  refines the page buffer in place; the reference is the page-buffer window under
+  the region box (§7.4.7.4), `GRREFERENCEDX/DY = 0`, external combop REPLACE.
+  Contexts reset per region segment (§7.4.7.5 step 2). Intermediate (type 40) and
+  any refinement region that *refers to another region segment* (retained
+  auxiliary buffer reuse) stay typed-`Unsupported` (Phase 5). GRTEMPLATE-1 and
+  TPGRON also stay typed-`Unsupported` (the encoder emits neither).
+
+* **jbig2dec 0.20 quirk (documented, not a native bug).** For a standalone
+  refinement region whose reference is the page buffer, jbig2dec extracts the
+  reference window from the page origin regardless of the region's `(x, y)`, so
+  it desyncs for non-zero region offsets. The native decoder follows §7.4.7.4
+  (window offset by `(x, y)`) and is validated vs the intended target;
+  `standalone_refinement_region_vs_jbig2dec` compares vs jbig2dec only at offset
+  `(0, 0)` where both agree.
+
+* **Robustness fix.** `decode_text_region` computed
+  `GRREFERENCEDX = floor(RDW/2) + RDX` with an unchecked `i32` add; `RDX`/`RDY`
+  are unbounded decoded integers, so a malformed stream overflowed. Now
+  saturating (an out-of-range offset just reads the reference window as zero).
+  Found by extending the chaos gate to a refine-mode stream.
+
 ## Gap F: Out of scope for now (explicitly deferred)
 
 * Product B / Phase 5 (Huffman, striped pages, random access, templates
