@@ -238,7 +238,7 @@ fn pdf_fragment_roundtrip_wide_bitmap() {
         pixels[d * w as usize + (w as usize - 1 - d)] = 1;
     }
     for x in (0..w as usize).step_by(4) {
-        pixels[0 * w as usize + x] = 1;
+        pixels[x] = 1;
         pixels[(h as usize - 1) * w as usize + x] = 1;
     }
 
