@@ -68,15 +68,11 @@ pub fn decode_symbol_dictionary(
     if sdrefagg {
         return Err(DecodeError::Unsupported(UnsupportedFeature::SymbolRefinement));
     }
-    if sdtemplate != 0 {
-        return Err(DecodeError::Unsupported(UnsupportedFeature::GenericTemplate(
-            sdtemplate,
-        )));
-    }
-
-    // §7.4.2.1.2 SDAT: template 0 with SDHUFF=0 carries 4 adaptive pixels.
+    // §7.4.2.1.2 SDAT: template 0 (SDHUFF=0) carries 4 adaptive pixels;
+    // templates 1–3 carry a single adaptive pixel.
     let mut at = [(0i8, 0i8); 4];
-    for slot in at.iter_mut() {
+    let at_count = if sdtemplate == 0 { 4 } else { 1 };
+    for slot in at.iter_mut().take(at_count) {
         let ax = r.read_i8()?;
         let ay = r.read_i8()?;
         *slot = (ax, ay);
@@ -193,6 +189,7 @@ pub fn decode_symbol_dictionary(
                 &mut dec,
                 sym_width as u32,
                 hc_height as u32,
+                sdtemplate,
                 at,
                 generic_ctx,
                 limits,

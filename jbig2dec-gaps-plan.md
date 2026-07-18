@@ -335,6 +335,40 @@ diff, runs the checklist, and only then does the next phase start.
 * **Both encoder fixes from the ledger below are now DONE** (referred-segment
   width boundary; refinement_layout test) — see the entries.
 
+## Phase 5a findings (generic templates 1–3 + TPGDON)
+
+* **All four arithmetic generic templates and TPGDON decode pixel-exact vs
+  jbig2dec 0.20.** `src/decode/generic.rs` now dispatches on `(template, at,
+  tpgdon)`: the verified fast rolling path for nominal template-0 AT (with
+  TPGDON row-duplication added), a general per-pixel template-0 path, and new
+  per-pixel decoders for templates 1–3 in T.88/jbig2dec context numbering.
+  `decode_generic_bitmap` gained a `template` parameter, wired through the
+  symbol dictionary (SDTEMPLATE), pattern dictionary (HDTEMPLATE), and halftone
+  gray planes (all previously rejected non-zero templates). The
+  `GenericTemplate` and `TypicalPrediction` `UnsupportedFeature` variants are
+  deleted — nothing returns them.
+
+* **Context numbering is a relabelling; only the SLTP magic needs care.** The
+  MQ stream depends only on the pixel *partition*, not the context index
+  labels, so the pre-existing template-0 path (custom numbering) and the new
+  templates 1–3 (spec numbering) both produce/consume jbig2dec-identical bytes.
+  The one place numbering matters is the TPGDON SLTP pseudo-pixel, a reserved
+  context slot: templates 1–3 use the literal spec constants (0x0795/0x00E5/
+  0x0195); template 0 uses 0xB325, the spec's 0x9B25 pattern re-expressed in
+  this crate's template-0 bit layout. The oracle round-trip tests confirm all
+  four values against jbig2dec.
+
+* **Pre-existing AT-count bug fixed.** `parse_generic_region` read 0 AT pixels
+  for templates 2 and 3 (`_ => 0`); T.88 §7.4.6.3 gives templates 1–3 one AT
+  pixel each. Never exercised before because templates 1–3 were unsupported;
+  found immediately by the template-2/3 round-trip.
+
+* **Test-only stream writer** (`tests/common/writer.rs`): drives the encoder's
+  MQ coder to emit generic-region page streams for forms the encoder never
+  produces. `tests/decode_generic_templates.rs` checks every template × TPGDON
+  both as a native round-trip and against jbig2dec (odd-width matrix, banded
+  and all-duplicate-row images for the LTP=1 path). Reused by later sub-phases.
+
 ## Gap F: Out of scope for now (explicitly deferred)
 
 * Product B / Phase 5 (Huffman, striped pages, random access, templates

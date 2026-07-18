@@ -11,11 +11,11 @@
 //! * a general per-pixel path for arbitrary valid AT positions, which reduces
 //!   to exactly the same context values for nominal AT (asserted by a test).
 //!
-//! MMR generic, TPGDON/typical prediction, and templates 1–3 are parsed and
-//! returned as typed `Unsupported` errors (later phases).
+//! All four arithmetic templates (0–3) and TPGDON typical prediction are
+//! supported (Phase 5a). MMR generic regions are handled by [`crate::decode::mmr`].
 
 use crate::decode::arith::ArithmeticDecoder;
-use crate::decode::error::{DecodeError, ParseError, UnsupportedFeature};
+use crate::decode::error::{DecodeError, ParseError};
 use crate::shared::bitmap::MonoBitmap;
 use crate::shared::limits::DecodeLimits;
 use crate::shared::mq_table::MqContext;
@@ -24,6 +24,22 @@ use crate::shared::reader::Reader;
 /// Nominal template-0 adaptive-template offsets (T.88 §6.2.5.3): AT1 (3,-1),
 /// AT2 (-3,-1), AT3 (2,-2), AT4 (-2,-2). Also this crate's encoder default.
 pub const NOMINAL_AT0: [(i8, i8); 4] = [(3, -1), (-3, -1), (2, -2), (-2, -2)];
+
+/// Nominal AT1 offset for templates 1–3 (T.88 §6.2.5.3 Figures 5–7): template 1
+/// uses (3,-1); templates 2 and 3 use (2,-1).
+pub const NOMINAL_AT1: [(i8, i8); 3] = [(3, -1), (2, -1), (2, -1)];
+
+// SLTP pseudo-pixel contexts for TPGDON (T.88 §6.2.5.7, Figure 8). These are the
+// canonical spec/jbig2dec context values *except* for template 0, whose value is
+// re-expressed in this crate's template-0 context numbering (the 0x9B25 spec
+// pattern mapped through `decode_template0_general`'s bit layout gives 0xB325 —
+// verified against jbig2dec by the TPGDON round-trip tests). Templates 1–3 use
+// this crate's spec-matching numbering, so their values are the literal spec
+// constants.
+const SLTP_CTX_T0: usize = 0xB325;
+const SLTP_CTX_T1: usize = 0x0795;
+const SLTP_CTX_T2: usize = 0x00E5;
+const SLTP_CTX_T3: usize = 0x0195;
 
 /// A parsed generic-region segment: geometry, coding flags, and the coded data.
 #[derive(Clone, Debug)]
@@ -60,15 +76,11 @@ pub fn parse_generic_region<'a>(payload: &'a [u8]) -> Result<GenericRegion<'a>, 
     let template = (flags >> 1) & 0x03;
     let tpgdon = flags & 0x08 != 0;
 
-    // AT pixels: template 0 has 4, template 1 has 1, templates 2/3 have 0.
+    // AT pixels (T.88 §7.4.6.3): template 0 has 4, templates 1–3 have 1 each.
     // (Only present for arithmetic coding, i.e. when MMR is off.)
     let mut at = [(0i8, 0i8); 4];
     if !mmr {
-        let at_count = match template {
-            0 => 4,
-            1 => 1,
-            _ => 0,
-        };
+        let at_count = if template == 0 { 4 } else { 1 };
         for slot in at.iter_mut().take(at_count) {
             let ax = r.read_i8()?;
             let ay = r.read_i8()?;
@@ -111,14 +123,6 @@ pub fn decode_generic_region(
             limits,
         );
     }
-    if region.tpgdon {
-        return Err(DecodeError::Unsupported(UnsupportedFeature::TypicalPrediction));
-    }
-    if region.template != 0 {
-        return Err(DecodeError::Unsupported(UnsupportedFeature::GenericTemplate(
-            region.template,
-        )));
-    }
     if (contexts.len() as u64) < (1u64 << 16) {
         return Err(DecodeError::Overflow {
             operation: "generic region context array too small",
@@ -131,11 +135,14 @@ pub fn decode_generic_region(
     }
 
     let mut decoder = ArithmeticDecoder::new(region.data);
-    if region.at == NOMINAL_AT0 {
-        decode_template0_nominal(&mut bitmap, &mut decoder, contexts);
-    } else {
-        decode_template0_general(&mut bitmap, &mut decoder, contexts, region.at);
-    }
+    decode_into(
+        &mut bitmap,
+        &mut decoder,
+        region.template,
+        region.at,
+        region.tpgdon,
+        contexts,
+    );
     Ok(bitmap)
 }
 
@@ -150,6 +157,7 @@ pub fn decode_generic_bitmap(
     decoder: &mut ArithmeticDecoder<'_>,
     width: u32,
     height: u32,
+    template: u8,
     at: [(i8, i8); 4],
     contexts: &mut [MqContext],
     limits: &DecodeLimits,
@@ -163,12 +171,30 @@ pub fn decode_generic_bitmap(
     if width == 0 || height == 0 {
         return Ok(bitmap);
     }
-    if at == NOMINAL_AT0 {
-        decode_template0_nominal(&mut bitmap, decoder, contexts);
-    } else {
-        decode_template0_general(&mut bitmap, decoder, contexts, at);
-    }
+    // Symbol-dictionary and refinement generic bitmaps never use TPGDON.
+    decode_into(&mut bitmap, decoder, template, at, false, contexts);
     Ok(bitmap)
+}
+
+/// Dispatch to the correct template decoder. `template` selects the pixel
+/// neighbourhood (0–3); values outside that range are clamped to 3's behaviour
+/// by the parser (the flags field is only 2 bits wide, so `template <= 3`
+/// always holds).
+fn decode_into(
+    bitmap: &mut MonoBitmap,
+    decoder: &mut ArithmeticDecoder<'_>,
+    template: u8,
+    at: [(i8, i8); 4],
+    tpgdon: bool,
+    contexts: &mut [MqContext],
+) {
+    match template {
+        0 if at == NOMINAL_AT0 => decode_template0_nominal(bitmap, decoder, contexts, tpgdon),
+        0 => decode_template0_general(bitmap, decoder, contexts, at, tpgdon),
+        1 => decode_template1(bitmap, decoder, contexts, at[0], tpgdon),
+        2 => decode_template2(bitmap, decoder, contexts, at[0], tpgdon),
+        _ => decode_template3(bitmap, decoder, contexts, at[0], tpgdon),
+    }
 }
 
 #[inline(always)]
@@ -181,19 +207,32 @@ fn sample(row: &[u32], width: u32, x: i64) -> u32 {
     (row[x >> 5] >> (31 - (x & 31) as u32)) & 1
 }
 
-/// Fast rolling path for nominal AT (mirrors the encoder exactly).
+/// Fast rolling path for nominal AT (mirrors the encoder exactly). `tpgdon`
+/// enables typical prediction (T.88 §6.2.5.7): an SLTP pseudo-pixel decoded
+/// before each row toggles the LTP flag; while LTP is set, the row is copied
+/// verbatim from the row above (all-zero for the first row).
 fn decode_template0_nominal(
     bitmap: &mut MonoBitmap,
     decoder: &mut ArithmeticDecoder<'_>,
     contexts: &mut [MqContext],
+    tpgdon: bool,
 ) {
     let width = bitmap.width();
     let height = bitmap.height();
     let stride = bitmap.stride_words() as usize;
     let zero_row = vec![0u32; stride];
     let mut cur = vec![0u32; stride];
+    let mut ltp = false;
 
     for y in 0..height {
+        if tpgdon {
+            let sltp = decoder.decode_bit(&mut contexts[SLTP_CTX_T0]);
+            ltp ^= sltp;
+            if ltp {
+                copy_prev_row(bitmap, y, &mut cur);
+                continue;
+            }
+        }
         for w in cur.iter_mut() {
             *w = 0;
         }
@@ -228,6 +267,21 @@ fn decode_template0_nominal(
     }
 }
 
+/// Copy row `y-1` into row `y` (a TPGDON duplicated row). `scratch` is a stride
+/// sized buffer used to break the aliasing borrow. For `y == 0` the copied row
+/// is all-zero.
+#[inline]
+fn copy_prev_row(bitmap: &mut MonoBitmap, y: u32, scratch: &mut [u32]) {
+    if y >= 1 {
+        scratch.copy_from_slice(bitmap.row(y - 1));
+    } else {
+        for w in scratch.iter_mut() {
+            *w = 0;
+        }
+    }
+    bitmap.row_mut(y).copy_from_slice(scratch);
+}
+
 /// General per-pixel path for arbitrary AT positions. Produces identical
 /// context values to the rolling path when `at == NOMINAL_AT0`.
 fn decode_template0_general(
@@ -235,12 +289,14 @@ fn decode_template0_general(
     decoder: &mut ArithmeticDecoder<'_>,
     contexts: &mut [MqContext],
     at: [(i8, i8); 4],
+    tpgdon: bool,
 ) {
     let width = bitmap.width();
     let height = bitmap.height();
     let stride = bitmap.stride_words() as usize;
     let zero_row = vec![0u32; stride];
     let mut cur = vec![0u32; stride];
+    let mut ltp = false;
 
     // Context bit layout (MSB..LSB), matching the encoder's tval arrangement.
     // Fixed pixels and the four AT slots (nominal offsets in comments):
@@ -254,6 +310,14 @@ fn decode_template0_general(
     let (a4x, a4y) = (at[3].0 as i64, at[3].1 as i64);
 
     for y in 0..height {
+        if tpgdon {
+            let sltp = decoder.decode_bit(&mut contexts[SLTP_CTX_T0]);
+            ltp ^= sltp;
+            if ltp {
+                copy_prev_row(bitmap, y, &mut cur);
+                continue;
+            }
+        }
         for w in cur.iter_mut() {
             *w = 0;
         }
@@ -302,6 +366,208 @@ fn decode_template0_general(
             if bit {
                 let xi = x as usize;
                 cur[xi >> 5] |= 1u32 << (31 - (xi & 31));
+            }
+        }
+        bitmap.row_mut(y).copy_from_slice(&cur);
+    }
+}
+
+/// Sample an adaptive-template pixel at `(x+dx, y+dy)` relative to the pixel
+/// being decoded, reading only causal (already-decoded) data. `dy` in
+/// `{0, -1, -2}` covers every position a valid generic-region AT pixel can
+/// reference; anything further out returns 0 (matches the causal-window
+/// convention used by the fixed template pixels).
+#[inline(always)]
+fn at_pixel(
+    cur: &[u32],
+    prev1: &[u32],
+    prev2: &[u32],
+    width: u32,
+    x: i64,
+    dx: i64,
+    dy: i64,
+) -> u32 {
+    let xx = x + dx;
+    match dy {
+        0 => {
+            if xx < 0 || xx >= x {
+                0
+            } else {
+                sample(cur, width, xx)
+            }
+        }
+        -1 => sample(prev1, width, xx),
+        -2 => sample(prev2, width, xx),
+        _ => 0,
+    }
+}
+
+/// Generic template 1 (T.88 §6.2.5.3, Figure 5): 13-bit context, one AT pixel.
+/// Context numbering matches T.88/jbig2dec so the SLTP constant is the literal
+/// spec value.
+fn decode_template1(
+    bitmap: &mut MonoBitmap,
+    decoder: &mut ArithmeticDecoder<'_>,
+    contexts: &mut [MqContext],
+    at1: (i8, i8),
+    tpgdon: bool,
+) {
+    let width = bitmap.width();
+    let height = bitmap.height();
+    let stride = bitmap.stride_words() as usize;
+    let zero_row = vec![0u32; stride];
+    let mut cur = vec![0u32; stride];
+    let mut ltp = false;
+    let (a1x, a1y) = (at1.0 as i64, at1.1 as i64);
+
+    for y in 0..height {
+        if tpgdon {
+            let sltp = decoder.decode_bit(&mut contexts[SLTP_CTX_T1]);
+            ltp ^= sltp;
+            if ltp {
+                copy_prev_row(bitmap, y, &mut cur);
+                continue;
+            }
+        }
+        for w in cur.iter_mut() {
+            *w = 0;
+        }
+        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { &zero_row };
+        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { &zero_row };
+
+        for x in 0..width {
+            let xi = x as i64;
+            let mut t = 0u32;
+            t |= sample(&cur, width, xi - 1);
+            t |= sample(&cur, width, xi - 2) << 1;
+            t |= sample(&cur, width, xi - 3) << 2;
+            t |= at_pixel(&cur, prev1, prev2, width, xi, a1x, a1y) << 3;
+            t |= sample(prev1, width, xi + 2) << 4;
+            t |= sample(prev1, width, xi + 1) << 5;
+            t |= sample(prev1, width, xi) << 6;
+            t |= sample(prev1, width, xi - 1) << 7;
+            t |= sample(prev1, width, xi - 2) << 8;
+            t |= sample(prev2, width, xi + 2) << 9;
+            t |= sample(prev2, width, xi + 1) << 10;
+            t |= sample(prev2, width, xi) << 11;
+            t |= sample(prev2, width, xi - 1) << 12;
+
+            let bit = decoder.decode_bit(&mut contexts[t as usize]);
+            if bit {
+                let xu = x as usize;
+                cur[xu >> 5] |= 1u32 << (31 - (xu & 31));
+            }
+        }
+        bitmap.row_mut(y).copy_from_slice(&cur);
+    }
+}
+
+/// Generic template 2 (T.88 §6.2.5.3, Figure 6): 10-bit context, one AT pixel.
+fn decode_template2(
+    bitmap: &mut MonoBitmap,
+    decoder: &mut ArithmeticDecoder<'_>,
+    contexts: &mut [MqContext],
+    at1: (i8, i8),
+    tpgdon: bool,
+) {
+    let width = bitmap.width();
+    let height = bitmap.height();
+    let stride = bitmap.stride_words() as usize;
+    let zero_row = vec![0u32; stride];
+    let mut cur = vec![0u32; stride];
+    let mut ltp = false;
+    let (a1x, a1y) = (at1.0 as i64, at1.1 as i64);
+
+    for y in 0..height {
+        if tpgdon {
+            let sltp = decoder.decode_bit(&mut contexts[SLTP_CTX_T2]);
+            ltp ^= sltp;
+            if ltp {
+                copy_prev_row(bitmap, y, &mut cur);
+                continue;
+            }
+        }
+        for w in cur.iter_mut() {
+            *w = 0;
+        }
+        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { &zero_row };
+        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { &zero_row };
+
+        for x in 0..width {
+            let xi = x as i64;
+            let mut t = 0u32;
+            t |= sample(&cur, width, xi - 1);
+            t |= sample(&cur, width, xi - 2) << 1;
+            t |= at_pixel(&cur, prev1, prev2, width, xi, a1x, a1y) << 2;
+            t |= sample(prev1, width, xi + 1) << 3;
+            t |= sample(prev1, width, xi) << 4;
+            t |= sample(prev1, width, xi - 1) << 5;
+            t |= sample(prev1, width, xi - 2) << 6;
+            t |= sample(prev2, width, xi + 1) << 7;
+            t |= sample(prev2, width, xi) << 8;
+            t |= sample(prev2, width, xi - 1) << 9;
+
+            let bit = decoder.decode_bit(&mut contexts[t as usize]);
+            if bit {
+                let xu = x as usize;
+                cur[xu >> 5] |= 1u32 << (31 - (xu & 31));
+            }
+        }
+        bitmap.row_mut(y).copy_from_slice(&cur);
+    }
+}
+
+/// Generic template 3 (T.88 §6.2.5.3, Figure 7): 10-bit context, one AT pixel,
+/// two rows only (no `y-2` line).
+fn decode_template3(
+    bitmap: &mut MonoBitmap,
+    decoder: &mut ArithmeticDecoder<'_>,
+    contexts: &mut [MqContext],
+    at1: (i8, i8),
+    tpgdon: bool,
+) {
+    let width = bitmap.width();
+    let height = bitmap.height();
+    let stride = bitmap.stride_words() as usize;
+    let zero_row = vec![0u32; stride];
+    let mut cur = vec![0u32; stride];
+    let mut ltp = false;
+    let (a1x, a1y) = (at1.0 as i64, at1.1 as i64);
+
+    for y in 0..height {
+        if tpgdon {
+            let sltp = decoder.decode_bit(&mut contexts[SLTP_CTX_T3]);
+            ltp ^= sltp;
+            if ltp {
+                copy_prev_row(bitmap, y, &mut cur);
+                continue;
+            }
+        }
+        for w in cur.iter_mut() {
+            *w = 0;
+        }
+        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { &zero_row };
+        // Template 3 uses only rows y and y-1; prev2 is never referenced but the
+        // shared AT sampler expects a slice, so pass the zero row.
+
+        for x in 0..width {
+            let xi = x as i64;
+            let mut t = 0u32;
+            t |= sample(&cur, width, xi - 1);
+            t |= sample(&cur, width, xi - 2) << 1;
+            t |= sample(&cur, width, xi - 3) << 2;
+            t |= sample(&cur, width, xi - 4) << 3;
+            t |= at_pixel(&cur, prev1, &zero_row, width, xi, a1x, a1y) << 4;
+            t |= sample(prev1, width, xi + 1) << 5;
+            t |= sample(prev1, width, xi) << 6;
+            t |= sample(prev1, width, xi - 1) << 7;
+            t |= sample(prev1, width, xi - 2) << 8;
+            t |= sample(prev1, width, xi - 3) << 9;
+
+            let bit = decoder.decode_bit(&mut contexts[t as usize]);
+            if bit {
+                let xu = x as usize;
+                cur[xu >> 5] |= 1u32 << (31 - (xu & 31));
             }
         }
         bitmap.row_mut(y).copy_from_slice(&cur);
@@ -388,41 +654,13 @@ mod tests {
         let mut bm_fast = MonoBitmap::new(37, 20, false, &limits).unwrap();
         let mut d1 = ArithmeticDecoder::new(&data);
         let mut c1 = contexts();
-        decode_template0_nominal(&mut bm_fast, &mut d1, &mut c1);
+        decode_template0_nominal(&mut bm_fast, &mut d1, &mut c1, false);
 
         let mut bm_gen = MonoBitmap::new(37, 20, false, &limits).unwrap();
         let mut d2 = ArithmeticDecoder::new(&data);
         let mut c2 = contexts();
-        decode_template0_general(&mut bm_gen, &mut d2, &mut c2, NOMINAL_AT0);
+        decode_template0_general(&mut bm_gen, &mut d2, &mut c2, NOMINAL_AT0, false);
 
         assert_eq!(bm_fast, bm_gen);
-    }
-
-    #[test]
-    fn unsupported_surfaces() {
-        let limits = DecodeLimits::default();
-        let mut ctx = contexts();
-        let base = GenericRegion {
-            width: 8,
-            height: 8,
-            x: 0,
-            y: 0,
-            comb_operator: 0,
-            mmr: false,
-            template: 0,
-            tpgdon: false,
-            at: NOMINAL_AT0,
-            data: &[0u8; 4],
-        };
-        let tp = GenericRegion { tpgdon: true, ..base.clone() };
-        assert!(matches!(
-            decode_generic_region(&tp, &limits, &mut ctx),
-            Err(DecodeError::Unsupported(UnsupportedFeature::TypicalPrediction))
-        ));
-        let t2 = GenericRegion { template: 2, ..base.clone() };
-        assert!(matches!(
-            decode_generic_region(&t2, &limits, &mut ctx),
-            Err(DecodeError::Unsupported(UnsupportedFeature::GenericTemplate(2)))
-        ));
     }
 }

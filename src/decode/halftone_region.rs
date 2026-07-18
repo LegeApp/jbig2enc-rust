@@ -130,13 +130,8 @@ pub fn decode_halftone_region(
     generic_ctx: &mut [MqContext],
 ) -> Result<MonoBitmap, DecodeError> {
     if region.enable_skip {
-        // The encoder never emits HENABLESKIP; skip masks are deferred.
+        // HENABLESKIP skip masks are deferred to Phase 5e.
         return Err(DecodeError::Unsupported(UnsupportedFeature::HalftoneCoding));
-    }
-    if !region.mmr && region.template != 0 {
-        return Err(DecodeError::Unsupported(UnsupportedFeature::GenericTemplate(
-            region.template,
-        )));
     }
 
     // §6.6.5 step 1: fill HTREG with HDEFPIXEL.
@@ -201,7 +196,8 @@ pub fn decode_halftone_region(
         // (the encoder codes them with a single coder, contexts carried across).
         let mut dec = ArithmeticDecoder::new(region.data);
         for j in (0..hbpp as usize).rev() {
-            planes[j] = decode_generic_bitmap(&mut dec, hgw, hgh, at, generic_ctx, limits)?;
+            planes[j] =
+                decode_generic_bitmap(&mut dec, hgw, hgh, region.template, at, generic_ctx, limits)?;
         }
     }
 

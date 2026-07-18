@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use crate::decode::arith::ArithmeticDecoder;
-use crate::decode::error::{DecodeError, LimitError, UnsupportedFeature};
+use crate::decode::error::{DecodeError, LimitError};
 use crate::decode::generic::decode_generic_bitmap;
 use crate::decode::mmr::decode_mmr_bitmap;
 use crate::shared::bitmap::MonoBitmap;
@@ -138,13 +138,8 @@ pub fn decode_pattern_dictionary(
     let collective = if hdr.mmr {
         decode_mmr_bitmap(data, collective_width, collective_height, limits)?
     } else {
-        if hdr.template != 0 {
-            // The arithmetic generic decoder only implements template 0 so far.
-            return Err(DecodeError::Unsupported(UnsupportedFeature::GenericTemplate(
-                hdr.template,
-            )));
-        }
-        // §6.7.5 fixed AT pixels for the pattern-dictionary collective bitmap.
+        // §6.7.5 fixed AT pixels for the pattern-dictionary collective bitmap
+        // (GBTEMPLATE = HDTEMPLATE). AT1 = (-HDPW, 0); templates 1–3 use AT1 only.
         let hdpw_i8 = i8::try_from(hdr.hdpw).unwrap_or(i8::MIN);
         let at = [(-hdpw_i8, 0i8), (-3, -1), (2, -2), (-2, -2)];
         if generic_ctx.len() < (1usize << 16) {
@@ -160,6 +155,7 @@ pub fn decode_pattern_dictionary(
             &mut dec,
             collective_width,
             collective_height,
+            hdr.template,
             at,
             generic_ctx,
             limits,

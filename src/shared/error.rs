@@ -27,10 +27,6 @@ pub enum UnsupportedFeature {
     RefinementRegion,
     #[error("segment type {0} not handled in this phase")]
     SegmentType(u8),
-    #[error("generic region template {0}")]
-    GenericTemplate(u8),
-    #[error("typical prediction (TPGDON)")]
-    TypicalPrediction,
     #[error("striped page")]
     StripedPage,
     #[error("transposed text region")]
