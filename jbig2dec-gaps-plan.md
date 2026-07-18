@@ -441,6 +441,47 @@ diff, runs the checklist, and only then does the next phase start.
 * Oracle: `tests/decode_striped.rs` checks both forms native == source ==
   jbig2dec.
 
+## Phase 5e/5f findings (refinement, transposed, random access)
+
+* **GRTEMPLATE-1 refinement + TPGRON** (§6.3): both refinement templates and
+  typical prediction now decode pixel-exact vs jbig2dec. The template figures
+  (T.88 2000 ed., Figures 12–16, supplied as PDF) resolved the exact partitions;
+  the SLTP pseudo-pixel contexts were pinned by a 20-image jbig2dec sweep —
+  GR0 = 0x010 (centre-reference bit, matching Figure 14 in this crate's
+  numbering), GR1 = 0x040 (this crate's template-1 numbering is a
+  TPGRON-invisible transposition of jbig2dec's, so the naive 0x080 desynced).
+
+* **Transposed text regions** (TRANSPOSED=1, §6.4.5): `place_symbol` now handles
+  both orientations × all four reference corners; the arithmetic and Huffman
+  text paths share it. Verified vs jbig2dec via the Huffman writer's transposed
+  mode.
+
+* **Random-access file organisation** (§D.2): `file.rs` parses all segment
+  headers up to the end-of-file terminator, then the data blocks in order.
+  Verified vs jbig2dec on a hand-built random-access generic page.
+
+* Variants deleted: `TransposedTextRegion`, `RandomAccessOrganisation`.
+
+## Phase 5 remaining (documented deferrals)
+
+These are the rarest / most infrastructural items; each is a typed
+`Unsupported` and needs a dedicated test-writer to verify against jbig2dec:
+
+* **SDREFAGG=1 refinement/aggregate symbol dictionaries** (§6.5.8.2) — the
+  REFAGGNINST=1 fast path reuses the now-complete refinement decoder, but needs
+  a refinement-coded-dictionary writer for oracle coverage; REFAGGNINST>1
+  (true aggregates via an internal text region) is the rarest form.
+* **HENABLESKIP halftone skip** (§6.6.5.1) — needs a skip-aware generic
+  gray-plane decoder (touches the verified hot loop) and is an encoder
+  optimisation never emitted here.
+* **Huffman + refinement text regions** (SBHUFF=1 ∧ SBREFINE=1) — needs the
+  §6.4.11.5 Huffman refinement-size handling.
+* **Retained arithmetic contexts across segments** (§7.4.4.3 SDUSEDCTX) — the
+  `RetainedArithmeticContexts` storage from plan §16.
+* **Intermediate regions (types 36/40) + auxiliary-buffer reuse**,
+  `DecodeStrictness::Compatible` recovery mode, the `decode_embedded_into`
+  zero-alloc API, and the wild-PDF corpus (5b) with fuzz/perf gates.
+
 ## Gap F: Out of scope for now (explicitly deferred)
 
 * Product B / Phase 5 (Huffman, striped pages, random access, templates

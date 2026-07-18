@@ -4,7 +4,7 @@
 //! locates segment boundaries and slices payloads; nothing is decoded here.
 
 use crate::decode::error::{DecodeError, ParseError, UnsupportedFeature};
-use crate::decode::segment::{SegmentHeader, parse_segment_header};
+use crate::decode::segment::{SegmentHeader, ensure_known_length, parse_segment_header};
 use crate::shared::limits::DecodeLimits;
 use crate::shared::reader::Reader;
 use crate::shared::segment::SegmentType;
@@ -54,21 +54,79 @@ pub fn parse_file<'a>(
     let flags = reader.read_u8()?;
     let sequential = flags & 0x01 != 0;
     let unknown_pages = flags & 0x02 != 0;
-    if !sequential {
-        return Err(DecodeError::Unsupported(
-            UnsupportedFeature::RandomAccessOrganisation,
-        ));
-    }
     if !unknown_pages {
         // 4-byte number of pages; parsed but unused here.
         let _n_pages = reader.read_u32_be()?;
     }
 
-    let segments = parse_segment_sequence(&mut reader, limits)?;
-    Ok(ParsedDocument {
-        organization: FileOrganization::Sequential,
-        segments,
-    })
+    if sequential {
+        let segments = parse_segment_sequence(&mut reader, limits)?;
+        Ok(ParsedDocument {
+            organization: FileOrganization::Sequential,
+            segments,
+        })
+    } else {
+        let segments = parse_random_access(&mut reader, limits)?;
+        Ok(ParsedDocument {
+            organization: FileOrganization::Sequential,
+            segments,
+        })
+    }
+}
+
+/// Parse the random-access organisation (T.88 §D.2): all segment headers first
+/// (the last must be an end-of-file segment), then every segment's data in the
+/// same order.
+fn parse_random_access<'a>(
+    reader: &mut Reader<'a>,
+    limits: &DecodeLimits,
+) -> Result<Vec<ParsedSegment<'a>>, DecodeError> {
+    // 1) Read segment headers up to and including the end-of-file header.
+    let mut headers: Vec<SegmentHeader> = Vec::new();
+    loop {
+        if headers.len() >= limits.max_segments {
+            return Err(DecodeError::limit(crate::decode::error::LimitError::Count {
+                what: "segments",
+                value: headers.len() as u64,
+                limit: limits.max_segments as u64,
+            }));
+        }
+        let header = parse_segment_header(reader).map_err(DecodeError::Parse)?;
+        if header.referred_to.len() > limits.max_referred_segments {
+            return Err(DecodeError::limit(crate::decode::error::LimitError::Count {
+                what: "referred-to segments",
+                value: header.referred_to.len() as u64,
+                limit: limits.max_referred_segments as u64,
+            }));
+        }
+        let is_eof = matches!(header.segment_type(), Some(SegmentType::EndOfFile));
+        headers.push(header);
+        if is_eof {
+            break;
+        }
+        if reader.is_empty() {
+            // No end-of-file header was found: the boundary between headers and
+            // data cannot be determined (§D.2).
+            return Err(DecodeError::Malformed {
+                reason: "random-access file has no end-of-file segment",
+            });
+        }
+    }
+
+    // 2) The data section follows the last header, one block per header in order.
+    let mut segments = Vec::with_capacity(headers.len());
+    for header in headers {
+        let len = ensure_known_length(&header).map_err(DecodeError::Unsupported)?;
+        let len = usize::try_from(len).map_err(|_| DecodeError::Overflow {
+            operation: "segment data length to usize",
+        })?;
+        let data = reader.take(len).map_err(|source| DecodeError::Segment {
+            segment: header.number,
+            source,
+        })?;
+        segments.push(ParsedSegment { header, data });
+    }
+    Ok(segments)
 }
 
 /// Parse a bare embedded/PDF segment sequence (no file header).
@@ -248,16 +306,56 @@ mod tests {
         ));
     }
 
+    /// A minimal random-access file (§D.2): magic + flags (random access) +
+    /// n_pages + [page-info header][EOF header] + [page-info data].
+    fn minimal_random_access_file() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&FILE_MAGIC);
+        v.push(0x00); // random access, number of pages known
+        v.extend_from_slice(&1u32.to_be_bytes()); // n_pages
+        // Header for segment 0: page info, 4 bytes data.
+        v.extend_from_slice(&0u32.to_be_bytes());
+        v.push(48); // page info
+        v.push(0); // no refs
+        v.push(1); // page
+        v.extend_from_slice(&4u32.to_be_bytes()); // data length
+        // Header for segment 1: EOF, 0 bytes data.
+        v.extend_from_slice(&1u32.to_be_bytes());
+        v.push(51);
+        v.push(0);
+        v.push(0);
+        v.extend_from_slice(&0u32.to_be_bytes());
+        // Data section: segment 0's four bytes (segment 1 has none).
+        v.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        v
+    }
+
     #[test]
-    fn random_access_is_unsupported() {
-        let mut bytes = minimal_file();
-        bytes[8] = 0x00; // clear sequential bit
-        assert!(matches!(
-            parse_file(&bytes, &limits()),
-            Err(DecodeError::Unsupported(
-                UnsupportedFeature::RandomAccessOrganisation
-            ))
-        ));
+    fn random_access_parses_headers_then_data() {
+        let bytes = minimal_random_access_file();
+        let doc = parse_file(&bytes, &limits()).unwrap();
+        assert_eq!(doc.segments.len(), 2);
+        assert_eq!(
+            doc.segments[0].header.segment_type(),
+            Some(SegmentType::PageInformation)
+        );
+        assert_eq!(doc.segments[0].data, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(
+            doc.segments[1].header.segment_type(),
+            Some(SegmentType::EndOfFile)
+        );
+        assert!(doc.segments[1].data.is_empty());
+    }
+
+    #[test]
+    fn random_access_without_eof_is_malformed() {
+        let mut bytes = minimal_random_access_file();
+        // Turn the EOF segment (type 51) into a non-EOF type so no terminator
+        // header is found and the header/data boundary is undeterminable.
+        // The EOF header's flags byte is at: 8+1+4 (file hdr) + 11 (seg0 hdr) + 4
+        // (seg1 number) = 28.
+        bytes[28] = 48; // page info instead of EOF
+        assert!(parse_file(&bytes, &limits()).is_err());
     }
 
     #[test]

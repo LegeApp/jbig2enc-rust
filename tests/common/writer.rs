@@ -394,6 +394,39 @@ pub fn standalone_file(embedded: &[u8]) -> Vec<u8> {
     v
 }
 
+/// A single-generic-region page in the random-access organisation (§D.2): all
+/// segment headers first (page-info, generic region, end-of-page, end-of-file),
+/// then the data blocks in the same order.
+pub fn random_access_generic_file(
+    bm: &TestBitmap,
+    template: u8,
+    at: &[(i8, i8); 4],
+    tpgdon: bool,
+) -> Vec<u8> {
+    // Build (header, data) pairs.
+    let page_data = page_info_payload(bm.width, bm.height);
+    let region = generic_region_payload(bm, template, at, tpgdon, 0);
+    let segs: [(u32, u8, Vec<u32>, Vec<u8>); 4] = [
+        (0, 48, vec![], page_data),
+        (1, 38, vec![], region),
+        (2, 49, vec![], vec![]),
+        (3, 51, vec![], vec![]), // end of file (terminates the header section)
+    ];
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&[0x97, 0x4A, 0x42, 0x32, 0x0D, 0x0A, 0x1A, 0x0A]);
+    file.push(0x02); // bit0 = 0 random access, bit1 = 1 page count unknown
+    // Header section.
+    for (num, ty, refs, data) in &segs {
+        file.extend_from_slice(&segment_header(*num, *ty, refs, 1, data.len() as u32));
+    }
+    // Data section, same order.
+    for (_, _, _, data) in &segs {
+        file.extend_from_slice(data);
+    }
+    file
+}
+
 // ------------------------------------------------------------------------
 // Huffman writer (Phase 5c oracle support)
 // ------------------------------------------------------------------------

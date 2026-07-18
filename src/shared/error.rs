@@ -11,8 +11,6 @@
 /// from "valid but unimplemented".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum UnsupportedFeature {
-    #[error("random-access file organisation")]
-    RandomAccessOrganisation,
     #[error("unknown segment data length")]
     UnknownSegmentLength,
     #[error("MMR (Group 4) coding")]
