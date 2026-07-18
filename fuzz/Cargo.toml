@@ -69,5 +69,19 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "embedded_document"
+path = "fuzz_targets/embedded_document.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "huffman_table"
+path = "fuzz_targets/huffman_table.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
