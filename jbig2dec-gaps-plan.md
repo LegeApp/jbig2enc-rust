@@ -471,21 +471,40 @@ diff, runs the checklist, and only then does the next phase start.
 
 * Variants deleted: `TransposedTextRegion`, `RandomAccessOrganisation`.
 
-## Phase 5 remaining (documented deferrals)
+## Phase 5e completeness (aggregate / Huffman-refine / retained contexts)
 
-Every JBIG2 *coding feature* the spec defines now decodes and is verified
-pixel-exact against jbig2dec 0.20. What remains is rare-variant or
-infrastructural, each still a typed `Unsupported` where reachable:
+* **REFAGGNINST>1 true aggregate dictionary symbols** (§6.5.8.2 step 2): a new
+  symbol coded as an internal text region over the imported + already-decoded
+  symbols. The arithmetic text-region loop was extracted
+  (`decode_text_region_arith`) to serve both segments and aggregates; a latent
+  bug (early return mid-strip skipping the terminating IADS OOB) was fixed —
+  harmless for a segment, fatal to an aggregate's shared stream. Verified vs
+  jbig2dec.
 
-* **REFAGGNINST>1 true aggregate dictionary symbols** (§6.5.8.2, an internal
-  text-region invocation) — the rarest symbol form.
-* **Huffman + refinement text regions** (SBHUFF=1 ∧ SBREFINE=1) — needs the
-  §6.4.11.5 Huffman refinement-size handling.
-* **Retained arithmetic contexts across segments** (§7.4.4.3 SDUSEDCTX) — the
-  `RetainedArithmeticContexts` storage from plan §16.
+* **Huffman + refinement text regions** (SBHUFF=1 ∧ SBREFINE=1, §6.4.11.5):
+  Huffman-coded RI/RDW/RDH/RDX/RDY + SBHUFFRSIZE size, then a byte-aligned
+  arithmetic refinement block (fresh GR stats per block). **Native round-trip
+  only** — jbig2dec 0.20's Huffman refine path does not consume the SBRAT field
+  and mis-reads the symbol-ID runcode table (its arithmetic refine path is
+  fine); this decoder follows the documented Figure-35 field order.
+
+* **Retained arithmetic contexts** (§6.5.5 steps 3/7, the "bitmap coding context
+  used/retained" flags): generic + refinement statistics are saved by a
+  retaining dictionary and imported by a later one instead of resetting.
+  **Native round-trip only** — jbig2dec 0.20 reports this NYI and aborts. The
+  native check is strong: dict B's bitmaps are coded from dict A's warmed
+  contexts, so they only decode when the import happens.
+
+## Phase 5 remaining (infrastructural)
+
+Every JBIG2 *coding feature* the spec defines now decodes. What remains is
+infrastructural rather than a coding form:
+
 * **Intermediate regions (types 36/40) + auxiliary-buffer reuse**,
   `DecodeStrictness::Compatible` recovery mode, the `decode_embedded_into`
   zero-alloc API, and the wild-PDF corpus (5b) with fuzz/perf gates.
+* A Huffman refinement/aggregate *dictionary* (SDHUFF=1 ∧ SDREFAGG=1, the
+  Figure-25 layout) is a distinct rare combination left as typed `Unsupported`.
 
 ## Gap F: Out of scope for now (explicitly deferred)
 
