@@ -1147,6 +1147,192 @@ pub fn halftone_skip_page(
     stream
 }
 
+/// Build a Huffman refinement/aggregate dictionary payload (SDHUFF=1,
+/// SDREFAGG=1, REFAGGNINST=1): each new symbol `targets[i]` is coded as a
+/// refinement (RDX=RDY=0) of `imported[refs[i]]`. One height class; widths
+/// non-decreasing. Every new symbol is exported.
+pub fn huffman_refagg_dict_payload(
+    imported: &[TestBitmap],
+    refs: &[usize],
+    targets: &[TestBitmap],
+) -> Vec<u8> {
+    let num_new = targets.len();
+    let total = imported.len() + num_new;
+    let code_len = log2_ceil(total).max(1);
+    let height = targets[0].height;
+
+    let dh = standard_table(4).unwrap();
+    let dw = standard_table(2).unwrap();
+    let agg = standard_table(1).unwrap();
+    let b15 = standard_table(15).unwrap();
+    let b1 = standard_table(1).unwrap();
+
+    let mut w = BitWriter::new();
+    emit_value(&mut w, &dh, height as i32); // HCDH
+    let mut prev = 0i32;
+    for (i, t) in targets.iter().enumerate() {
+        emit_value(&mut w, &dw, t.width as i32 - prev);
+        prev = t.width as i32;
+        emit_value(&mut w, &agg, 1); // REFAGGNINST = 1
+        w.write_bits(refs[i] as u64, code_len); // symbol id (equal-length code)
+        emit_value(&mut w, &b15, 0); // RDX
+        emit_value(&mut w, &b15, 0); // RDY
+        let refine = refinement_arith_data(t, &imported[refs[i]], 0, false);
+        emit_value(&mut w, &b1, refine.len() as i32); // BMSIZE
+        w.align();
+        for b in &refine {
+            w.write_bits(*b as u64, 8);
+        }
+    }
+    emit_oob(&mut w, &dw); // end of height class
+    emit_value(&mut w, &b1, imported.len() as i32); // export: not-exported run
+    emit_value(&mut w, &b1, num_new as i32); // export: exported run
+    let data = w.into_bytes();
+
+    let mut payload = Vec::new();
+    // flags: SDHUFF=1, SDREFAGG=1, SDTEMPLATE=0, SDRTEMPLATE=0, all tables std.
+    payload.extend_from_slice(&0x0003u16.to_be_bytes());
+    // SDRAT (SDREFAGG=1, SDRTEMPLATE=0): nominal (-1,-1),(-1,-1).
+    for b in [(-1i8) as u8; 4] {
+        payload.push(b);
+    }
+    payload.extend_from_slice(&(num_new as u32).to_be_bytes()); // SDNUMEXSYMS
+    payload.extend_from_slice(&(num_new as u32).to_be_bytes()); // SDNUMNEWSYMS
+    payload.extend_from_slice(&data);
+    payload
+}
+
+/// Build a Huffman aggregate dictionary payload (SDHUFF=1, SDREFAGG=1) defining
+/// ONE aggregate symbol (REFAGGNINST>1): an internal Huffman text region of
+/// `instances` (base_id, s), RI=0, TOPLEFT, SBSTRIPS=1, into a `sym_width`
+/// bitmap.
+pub fn huffman_aggregate_dict_payload(
+    imported: &[TestBitmap],
+    instances: &[(usize, i32)],
+    sym_width: u32,
+) -> Vec<u8> {
+    let total = imported.len() + 1;
+    let code_len = log2_ceil(total).max(1);
+    let height = imported[0].height;
+
+    let dh = standard_table(4).unwrap();
+    let dw = standard_table(2).unwrap();
+    let agg = standard_table(1).unwrap();
+    let fs = standard_table(6).unwrap();
+    let ds = standard_table(8).unwrap();
+    let dt = standard_table(11).unwrap();
+    let b1 = standard_table(1).unwrap();
+
+    let mut w = BitWriter::new();
+    emit_value(&mut w, &dh, height as i32); // HCDH
+    emit_value(&mut w, &dw, sym_width as i32); // DW (single new symbol)
+    emit_value(&mut w, &agg, instances.len() as i32); // REFAGGNINST
+    // Internal text region (SBSTRIPS=1): DT0=1, DT=1 -> strip T = 0.
+    emit_value(&mut w, &dt, 1);
+    emit_value(&mut w, &dt, 1);
+    let (id0, s0) = instances[0];
+    emit_value(&mut w, &fs, s0);
+    w.write_bits(id0 as u64, code_len);
+    w.write_bit(0); // RI = 0
+    let mut cur_s = s0 + imported[id0].width as i32 - 1;
+    for &(id, s) in &instances[1..] {
+        emit_value(&mut w, &ds, s - cur_s);
+        w.write_bits(id as u64, code_len);
+        w.write_bit(0);
+        cur_s = s + imported[id].width as i32 - 1;
+    }
+    emit_oob(&mut w, &ds); // end of strip
+    emit_oob(&mut w, &dw); // end of height class
+    emit_value(&mut w, &b1, imported.len() as i32);
+    emit_value(&mut w, &b1, 1);
+    let data = w.into_bytes();
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0x0003u16.to_be_bytes()); // SDHUFF=1, SDREFAGG=1
+    for b in [(-1i8) as u8; 4] {
+        payload.push(b);
+    }
+    payload.extend_from_slice(&1u32.to_be_bytes()); // SDNUMEXSYMS
+    payload.extend_from_slice(&1u32.to_be_bytes()); // SDNUMNEWSYMS
+    payload.extend_from_slice(&data);
+    payload
+}
+
+/// A page: Huffman base dict (seg 1), a Huffman aggregate dict defining one
+/// aggregate symbol (seg 2), and a Huffman text region placing it (seg 3).
+pub fn huffman_aggregate_page(
+    page_w: u32,
+    page_h: u32,
+    base: &[TestBitmap],
+    instances: &[(usize, i32)],
+    sym_width: u32,
+    sym_height: u32,
+    placements: &[(usize, i32)],
+) -> Vec<u8> {
+    let mut stream = Vec::new();
+    let page_data = page_info_payload(page_w, page_h);
+    stream.extend_from_slice(&segment_header(0, 48, &[], 1, page_data.len() as u32));
+    stream.extend_from_slice(&page_data);
+
+    let base_dict = huffman_symbol_dict_payload(base);
+    stream.extend_from_slice(&segment_header(1, 0, &[], 1, base_dict.len() as u32));
+    stream.extend_from_slice(&base_dict);
+
+    let agg = huffman_aggregate_dict_payload(base, instances, sym_width);
+    stream.extend_from_slice(&segment_header(2, 0, &[1], 1, agg.len() as u32));
+    stream.extend_from_slice(&agg);
+
+    let region = huffman_text_region_payload(
+        page_w,
+        page_h,
+        1,
+        &[sym_width],
+        &[sym_height],
+        placements,
+        false,
+    );
+    stream.extend_from_slice(&segment_header(3, 6, &[2], 1, region.len() as u32));
+    stream.extend_from_slice(&region);
+
+    stream.extend_from_slice(&segment_header(4, 49, &[], 1, 0));
+    stream
+}
+
+/// A page: Huffman base dictionary (seg 1), a Huffman refinement/aggregate
+/// dictionary refining the base symbols (seg 2), and a Huffman text region
+/// placing the refined symbols (seg 3).
+pub fn huffman_refagg_page(
+    page_w: u32,
+    page_h: u32,
+    base: &[TestBitmap],
+    refs: &[usize],
+    targets: &[TestBitmap],
+    placements: &[(usize, i32)],
+) -> Vec<u8> {
+    let mut stream = Vec::new();
+    let page_data = page_info_payload(page_w, page_h);
+    stream.extend_from_slice(&segment_header(0, 48, &[], 1, page_data.len() as u32));
+    stream.extend_from_slice(&page_data);
+
+    let base_dict = huffman_symbol_dict_payload(base);
+    stream.extend_from_slice(&segment_header(1, 0, &[], 1, base_dict.len() as u32));
+    stream.extend_from_slice(&base_dict);
+
+    let refagg = huffman_refagg_dict_payload(base, refs, targets);
+    stream.extend_from_slice(&segment_header(2, 0, &[1], 1, refagg.len() as u32));
+    stream.extend_from_slice(&refagg);
+
+    let widths: Vec<u32> = targets.iter().map(|s| s.width).collect();
+    let heights: Vec<u32> = targets.iter().map(|s| s.height).collect();
+    let region =
+        huffman_text_region_payload(page_w, page_h, targets.len(), &widths, &heights, placements, false);
+    stream.extend_from_slice(&segment_header(3, 6, &[2], 1, region.len() as u32));
+    stream.extend_from_slice(&region);
+
+    stream.extend_from_slice(&segment_header(4, 49, &[], 1, 0));
+    stream
+}
+
 /// A page with a Huffman base dictionary (seg 1) and a Huffman text region
 /// (seg 2, SBHUFF=1 ∧ SBREFINE=1) placing each instance as a refinement of a
 /// base symbol. `instances` are `(base_id, s, target)`; each target has the same

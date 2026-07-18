@@ -432,7 +432,7 @@ fn decoded_globals_is_send_sync() {
     fn _assert<T: Send + Sync>() {}
     _assert::<DecodedGlobals>();
     // Also confirm a still-reachable Unsupported variant type-checks.
-    let _ = UnsupportedFeature::SymbolRefinement;
+    let _ = UnsupportedFeature::SymbolCoding;
 }
 
 #[test]

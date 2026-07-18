@@ -15,12 +15,8 @@ pub enum UnsupportedFeature {
     UnknownSegmentLength,
     #[error("symbol dictionary / text region segment")]
     SymbolCoding,
-    #[error("pattern dictionary / halftone region segment")]
-    HalftoneCoding,
     #[error("segment type {0} not handled in this phase")]
     SegmentType(u8),
-    #[error("symbol dictionary refinement / aggregate coding")]
-    SymbolRefinement,
 }
 
 /// Which resource limit ([`DecodeLimits`]) was exceeded.

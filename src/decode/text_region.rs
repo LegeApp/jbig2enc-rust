@@ -597,29 +597,105 @@ fn decode_text_region_huffman(
     // the current byte position (§7.4.3.1.5 then the strip data).
     let bit_start = r.position();
     let mut br = BitReader::new(&payload[bit_start..]);
-    let sb_num_syms = symbols.len();
-    let sym_table = decode_symbol_id_table(&mut br, sb_num_syms, limits)?;
+    let sym_table = decode_symbol_id_table(&mut br, symbols.len(), limits)?;
 
-    let sb_strips: i64 = 1i64 << (tf.log_strips & 0x03);
-    let log_strips = (tf.log_strips & 0x03) as u32;
-    let symbol_op = comb_op(tf.sb_comb_op);
-    let mut bitmap = MonoBitmap::new(geom.width, geom.height, tf.sb_def_pixel, limits)?;
+    let tables = HuffTextTables {
+        sym: &sym_table,
+        fs: fs_table.get(),
+        ds: ds_table.get(),
+        dt: dt_table.get(),
+        rdw: rdw_table.get(),
+        rdh: rdh_table.get(),
+        rdx: rdx_table.get(),
+        rdy: rdy_table.get(),
+        rsize: rsize_table.get(),
+    };
+    let params = HuffTextParams {
+        width: geom.width,
+        height: geom.height,
+        num_instances,
+        log_strips: tf.log_strips,
+        ref_corner: tf.ref_corner,
+        transposed: tf.transposed,
+        sb_comb_op: tf.sb_comb_op,
+        sb_def_pixel: tf.sb_def_pixel,
+        sb_ds_offset: tf.sb_ds_offset,
+        sbrefine: tf.sbrefine,
+        sb_rtemplate: tf.sb_rtemplate,
+        grat,
+    };
+    let bitmap = decode_huffman_text_core(&mut br, &tables, &params, symbols, refine_ctx, limits)?;
+    Ok(TextRegionResult {
+        bitmap,
+        x: geom.x,
+        y: geom.y,
+        comb_operator: geom.ext_comb,
+    })
+}
+
+/// Explicit parameters for the Huffman text-region core, so it can serve both a
+/// text-region segment and a Huffman aggregate dictionary symbol (§6.5.8.2).
+pub(crate) struct HuffTextParams {
+    pub width: u32,
+    pub height: u32,
+    pub num_instances: u32,
+    pub log_strips: u8,
+    pub ref_corner: u8,
+    pub transposed: bool,
+    pub sb_comb_op: u8,
+    pub sb_def_pixel: bool,
+    pub sb_ds_offset: i32,
+    pub sbrefine: bool,
+    pub sb_rtemplate: u8,
+    pub grat: (i8, i8),
+}
+
+/// The Huffman tables a text region reads from (already resolved to concrete
+/// tables). `sym` is SBSYMCODES.
+pub(crate) struct HuffTextTables<'a> {
+    pub sym: &'a HuffmanTable,
+    pub fs: &'a HuffmanTable,
+    pub ds: &'a HuffmanTable,
+    pub dt: &'a HuffmanTable,
+    pub rdw: &'a HuffmanTable,
+    pub rdh: &'a HuffmanTable,
+    pub rdx: &'a HuffmanTable,
+    pub rdy: &'a HuffmanTable,
+    pub rsize: &'a HuffmanTable,
+}
+
+/// The Huffman text-region strip/placement loop (T.88 §6.4.5, SBHUFF=1),
+/// decoding from an existing bit reader and pre-selected tables. Refinement
+/// bitmaps are byte-aligned arithmetic blocks with fresh GR statistics each
+/// (§6.4.11.5).
+pub(crate) fn decode_huffman_text_core(
+    br: &mut BitReader<'_>,
+    tables: &HuffTextTables<'_>,
+    p: &HuffTextParams,
+    symbols: &[Arc<MonoBitmap>],
+    refine_ctx: &mut [MqContext],
+    limits: &DecodeLimits,
+) -> Result<MonoBitmap, DecodeError> {
+    let sb_strips: i64 = 1i64 << (p.log_strips & 0x03);
+    let log_strips = (p.log_strips & 0x03) as u32;
+    let symbol_op = comb_op(p.sb_comb_op);
+    let mut bitmap = MonoBitmap::new(p.width, p.height, p.sb_def_pixel, limits)?;
 
     // §6.4.5 2) initial STRIPT = -(DT0 * SBSTRIPS); FIRSTS = 0.
-    let dt0 = huff_value(dt_table.get().decode(&mut br)?)? as i64;
+    let dt0 = huff_value(tables.dt.decode(br)?)? as i64;
     let mut strip_t: i64 = -(dt0 * sb_strips);
     let mut first_s: i64 = 0;
     let mut n_inst: u32 = 0;
 
-    while n_inst < num_instances {
+    while n_inst < p.num_instances {
         // §6.4.5 4b) strip delta T.
-        let dt = huff_value(dt_table.get().decode(&mut br)?)? as i64;
+        let dt = huff_value(tables.dt.decode(br)?)? as i64;
         strip_t = strip_t
             .checked_add(dt * sb_strips)
             .ok_or(DecodeError::Overflow { operation: "strip T" })?;
 
         // §6.4.5 4c i) first S coordinate.
-        let dfs = huff_value(fs_table.get().decode(&mut br)?)? as i64;
+        let dfs = huff_value(tables.fs.decode(br)?)? as i64;
         first_s = first_s
             .checked_add(dfs)
             .ok_or(DecodeError::Overflow { operation: "first S" })?;
@@ -629,18 +705,18 @@ fn decode_text_region_huffman(
         loop {
             if !first_in_strip {
                 // §6.4.5 4c ii) subsequent S; OOB ends the strip.
-                match ds_table.get().decode(&mut br)? {
+                match tables.ds.decode(br)? {
                     HuffmanValue::Oob => break,
                     HuffmanValue::Value(ids) => {
                         cur_s = cur_s
-                            .checked_add(ids as i64 + tf.sb_ds_offset as i64)
+                            .checked_add(ids as i64 + p.sb_ds_offset as i64)
                             .ok_or(DecodeError::Overflow { operation: "S coordinate" })?;
                     }
                 }
             }
             first_in_strip = false;
 
-            if n_inst >= num_instances {
+            if n_inst >= p.num_instances {
                 return Err(DecodeError::Malformed {
                     reason: "more text instances than SBNUMINSTANCES",
                 });
@@ -657,7 +733,7 @@ fn decode_text_region_huffman(
                 .ok_or(DecodeError::Overflow { operation: "T coordinate" })?;
 
             // §6.4.5 4c iv) symbol ID via SBSYMCODES.
-            let id = match sym_table.decode(&mut br)? {
+            let id = match tables.sym.decode(br)? {
                 HuffmanValue::Value(v) => v as usize,
                 HuffmanValue::Oob => {
                     return Err(DecodeError::Malformed {
@@ -670,14 +746,14 @@ fn decode_text_region_huffman(
             })?;
 
             // §6.4.11 refinement indicator (one bit when SBHUFF=1).
-            let ri = if tf.sbrefine { br.read_bit() } else { 0 };
+            let ri = if p.sbrefine { br.read_bit() } else { 0 };
             let (placed, placed_w, placed_h): (PlacedSymbol<'_>, i64, i64) = if ri != 0 {
-                let rdw = huff_value(rdw_table.get().decode(&mut br)?)? as i64;
-                let rdh = huff_value(rdh_table.get().decode(&mut br)?)? as i64;
-                let rdx = huff_value(rdx_table.get().decode(&mut br)?)?;
-                let rdy = huff_value(rdy_table.get().decode(&mut br)?)?;
+                let rdw = huff_value(tables.rdw.decode(br)?)? as i64;
+                let rdh = huff_value(tables.rdh.decode(br)?)? as i64;
+                let rdx = huff_value(tables.rdx.decode(br)?)?;
+                let rdy = huff_value(tables.rdy.decode(br)?)?;
                 // §6.4.11.5 refinement bitmap data size, then byte-align.
-                let bmsize = match rsize_table.get().decode(&mut br)? {
+                let bmsize = match tables.rsize.decode(br)? {
                     HuffmanValue::Value(v) if v >= 0 => v as usize,
                     _ => {
                         return Err(DecodeError::Malformed {
@@ -699,8 +775,6 @@ fn decode_text_region_huffman(
                 }
                 let grdx = (rdw.div_euclid(2) as i32).saturating_add(rdx);
                 let grdy = (rdh.div_euclid(2) as i32).saturating_add(rdy);
-                // The refinement is a byte-aligned arithmetic block; per §6.4.11
-                // the Huffman GR statistics are fresh for each such block.
                 for c in refine_ctx.iter_mut() {
                     *c = MqContext(0);
                 }
@@ -718,9 +792,9 @@ fn decode_text_region_huffman(
                     grh as u32,
                     grdx,
                     grdy,
-                    tf.sb_rtemplate,
+                    p.sb_rtemplate,
                     false,
-                    grat,
+                    p.grat,
                     refine_ctx,
                     limits,
                 )?;
@@ -741,8 +815,8 @@ fn decode_text_region_huffman(
             place_symbol(
                 &mut bitmap,
                 placed.bitmap(),
-                tf.ref_corner,
-                tf.transposed,
+                p.ref_corner,
+                p.transposed,
                 &mut cur_s,
                 t_i,
                 placed_w,
@@ -753,13 +827,7 @@ fn decode_text_region_huffman(
             n_inst += 1;
         }
     }
-
-    Ok(TextRegionResult {
-        bitmap,
-        x: geom.x,
-        y: geom.y,
-        comb_operator: geom.ext_comb,
-    })
+    Ok(bitmap)
 }
 
 /// Symbol placement (T.88 §6.4.5 4c vi–xi) for all four reference corners and

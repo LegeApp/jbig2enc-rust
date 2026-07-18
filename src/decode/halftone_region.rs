@@ -14,7 +14,7 @@
 //! typed `Unsupported` error.
 
 use crate::decode::arith::ArithmeticDecoder;
-use crate::decode::error::{DecodeError, ParseError, UnsupportedFeature};
+use crate::decode::error::{DecodeError, ParseError};
 use crate::decode::generic::decode_generic_bitmap;
 use crate::decode::mmr::decode_mmr_plane;
 use crate::decode::pattern_dictionary::PatternDictionary;
@@ -161,11 +161,6 @@ pub fn decode_halftone_region(
     limits: &DecodeLimits,
     generic_ctx: &mut [MqContext],
 ) -> Result<MonoBitmap, DecodeError> {
-    if region.enable_skip && region.mmr {
-        // HENABLESKIP with MMR gray planes is a rare combination not modelled.
-        return Err(DecodeError::Unsupported(UnsupportedFeature::HalftoneCoding));
-    }
-
     // §6.6.5 step 1: fill HTREG with HDEFPIXEL.
     let mut htreg = MonoBitmap::new(region.width, region.height, region.default_pixel, limits)?;
     if region.width == 0 || region.height == 0 {
@@ -187,8 +182,11 @@ pub fn decode_halftone_region(
     }
 
     // §6.6.5.1 HSKIP: a cell whose pattern placement falls entirely outside the
-    // region is skipped in the gray-scale decoding.
-    let skip = if region.enable_skip {
+    // region is skipped in the gray-scale decoding. Per Annex C.5 GSUSESKIP
+    // applies only to the *arithmetic* gray planes; MMR planes are coded whole
+    // (the outside cells are handled by render-time clipping), so no skip bitmap
+    // is needed for them.
+    let skip = if region.enable_skip && !region.mmr {
         Some(compute_skip(region, patterns, hgw, hgh, limits)?)
     } else {
         None

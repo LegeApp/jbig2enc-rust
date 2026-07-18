@@ -529,10 +529,31 @@ cannot decode them (not this decoder's limitation):
 Each native check is content-dependent (it fails if the feature is a no-op), so
 it is a genuine end-to-end verification against a spec-compliant writer.
 
-## Phase 5 remaining
+## Full decode-spec coverage (final coding gaps closed)
 
-* A Huffman refinement/aggregate *dictionary* (SDHUFF=1 ∧ SDREFAGG=1, the
-  distinct Figure-25 layout) is left as typed `Unsupported`.
+* **Huffman refinement/aggregate dictionary** (SDHUFF=1 ∧ SDREFAGG=1, Figure 25,
+  §6.5.8.2): the Huffman text-region strip loop was extracted
+  (`decode_huffman_text_core`) to serve both a segment and this dictionary.
+  New symbols decode as a refinement (REFAGGNINST=1: Huffman RDX/RDY = B.15,
+  BMSIZE = B.1, byte-aligned arithmetic block) or an internal Huffman text
+  region (REFAGGNINST>1, equal-length SBSYMCODES per §6.5.8.2.3). Native
+  round-trip verified (jbig2dec 0.20 cannot decode the Huffman refine path).
+
+* **HENABLESKIP + MMR gray planes**: no longer rejected. Per Annex C.5 GSUSESKIP
+  applies only to arithmetic gray planes; MMR planes are coded whole and the
+  outside cells are dropped by render-time clipping, so an MMR halftone with
+  HENABLESKIP decodes identically to one without (covered by the MMR halftone
+  tests).
+
+**Every JBIG2 coding form the spec defines now decodes.** The `SymbolRefinement`
+and `HalftoneCoding` `UnsupportedFeature` variants are deleted. The only
+remaining `Unsupported` returns are for non-coding cases: an unknown/unassigned
+segment type code, an unknown data length on a non-generic segment (§7.2.7
+allows it only for immediate generic regions), a region/page segment misplaced
+in a globals stream, and a symbol-ID width above 24 bits (a resource limit).
+
+## Non-coding follow-ups (optimisation / tooling)
+
 * Reducing steady-state decode to zero heap allocations (pool the parse /
   segment-store / region scratch) — an optimisation, not a coding gap.
 * A wild-PDF corpus from commercial encoders, if any can be identified.

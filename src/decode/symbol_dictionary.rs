@@ -15,14 +15,17 @@
 use std::sync::Arc;
 
 use crate::decode::arith::ArithmeticDecoder;
-use crate::decode::error::{DecodeError, LimitError, UnsupportedFeature, usize_from_u32};
+use crate::decode::error::{DecodeError, LimitError, usize_from_u32};
 use crate::decode::generic::decode_generic_bitmap;
 use crate::decode::huffman::{standard_table, BitReader, HuffmanTable, HuffmanValue};
 use crate::decode::iaid::IaidContexts;
 use crate::decode::integer::{DecodedInteger, IntegerContexts};
 use crate::decode::mmr::decode_mmr_bitmap;
 use crate::decode::refinement::{decode_refinement_region_templated, REFINEMENT_CONTEXT_COUNT};
-use crate::decode::text_region::{decode_text_region_arith, TextArithParams};
+use crate::decode::text_region::{
+    decode_huffman_text_core, decode_text_region_arith, HuffTextParams, HuffTextTables,
+    TextArithParams,
+};
 use crate::shared::bitmap::MonoBitmap;
 use crate::shared::int_proc::IntProc;
 use crate::shared::limits::DecodeLimits;
@@ -137,10 +140,21 @@ pub fn decode_symbol_dictionary(
     let data = &payload[r.position()..];
 
     if sdhuff && sdrefagg {
-        // A Huffman refinement/aggregate dictionary (Figure 25 layout with
-        // Huffman-coded offsets, §6.5.8.2) is a rare combination not modelled;
-        // the Huffman path below assumes SDREFAGG=0 (Figure 24).
-        return Err(DecodeError::Unsupported(UnsupportedFeature::SymbolRefinement));
+        // Huffman refinement/aggregate dictionary (Figure 25 layout with
+        // Huffman-coded deltas and byte-aligned arithmetic refinement blocks).
+        return decode_symbol_dictionary_huffman_refagg(
+            data,
+            flags,
+            imported,
+            huffman_tables,
+            refine_ctx,
+            num_new,
+            num_ex_usize,
+            total,
+            sdrtemplate,
+            sdrat,
+            limits,
+        );
     }
     if sdhuff {
         return decode_symbol_dictionary_huffman(
@@ -443,6 +457,247 @@ impl TableRef {
             TableRef::Shared(t) => t,
         }
     }
+}
+
+/// Decode a Huffman refinement/aggregate symbol dictionary (SDHUFF=1,
+/// SDREFAGG=1; T.88 §6.5 Figure 25 with §6.5.8.2). Height-class delta heights
+/// and symbol delta widths are Huffman-coded; each new symbol is a refinement
+/// (REFAGGNINST=1, §6.5.8.2.2) or an aggregate text region (REFAGGNINST>1,
+/// Table 17) whose refinement bitmaps are byte-aligned arithmetic blocks.
+#[allow(clippy::too_many_arguments)]
+fn decode_symbol_dictionary_huffman_refagg(
+    data: &[u8],
+    flags: u16,
+    imported: &[Arc<MonoBitmap>],
+    huffman_tables: &[Arc<HuffmanTable>],
+    refine_ctx: &mut [MqContext],
+    num_new: usize,
+    num_ex: usize,
+    total: usize,
+    sdrtemplate: u8,
+    sdrat: (i8, i8),
+    limits: &DecodeLimits,
+) -> Result<SymbolDictionary, DecodeError> {
+    // §7.4.2.1.6 table selection, custom tables consumed in field order:
+    // SDHUFFDH, SDHUFFDW, SDHUFFBMSIZE (unused here but still consumed),
+    // SDHUFFAGGINST.
+    let mut custom = huffman_tables.iter();
+    let dh_sel = ((flags >> 2) & 0x0003) as u32;
+    let dw_sel = ((flags >> 4) & 0x0003) as u32;
+    let bmsize_sel = (flags >> 6) & 0x0001 != 0;
+    let agg_sel = (flags >> 7) & 0x0001 != 0;
+    let dh_table = select_table(dh_sel, 4, 5, &mut custom)?;
+    let dw_table = select_table(dw_sel, 2, 3, &mut custom)?;
+    let _bmsize_table = select_table_bit(bmsize_sel, &mut custom)?;
+    let agg_table = select_table_bit(agg_sel, &mut custom)?;
+
+    // Standard tables for the refinement offsets/size and the aggregate text
+    // region (§6.5.8.2.2, Table 17): RDX/RDY = B.15, RSIZE = B.1, FS = B.6,
+    // DS = B.8, DT = B.11, RDW/RDH = B.15.
+    let b1 = standard_table(1)?;
+    let b6 = standard_table(6)?;
+    let b8 = standard_table(8)?;
+    let b11 = standard_table(11)?;
+    let b15 = standard_table(15)?;
+
+    // §6.5.8.2.3: SBSYMCODES are equal-length codes, length
+    // max(ceil(log2(SDNUMINSYMS + SDNUMNEWSYMS)), 1), code[I] = I.
+    let code_len = ceil_log2(total as u32).max(1);
+    let sym_table = HuffmanTable::from_code_lengths(&vec![code_len; total])?;
+
+    let mut r = BitReader::new(data);
+    let mut new_symbols: Vec<Arc<MonoBitmap>> = Vec::with_capacity(num_new.min(4096));
+    let mut hc_height: i64 = 0;
+    let mut total_pixels: u64 = 0;
+
+    while new_symbols.len() < num_new {
+        let hcdh = match dh_table.get().decode(&mut r)? {
+            HuffmanValue::Value(v) => v as i64,
+            HuffmanValue::Oob => {
+                return Err(DecodeError::Malformed {
+                    reason: "OOB where height-class delta expected",
+                });
+            }
+        };
+        hc_height = hc_height.checked_add(hcdh).ok_or(DecodeError::Overflow {
+            operation: "height class height",
+        })?;
+        if hc_height <= 0 || hc_height > limits.max_height as i64 {
+            return Err(DecodeError::Malformed {
+                reason: "non-positive or oversized height class",
+            });
+        }
+
+        let mut sym_width: i64 = 0;
+        loop {
+            match dw_table.get().decode(&mut r)? {
+                HuffmanValue::Oob => break,
+                HuffmanValue::Value(dw) => {
+                    sym_width =
+                        sym_width.checked_add(dw as i64).ok_or(DecodeError::Overflow {
+                            operation: "symbol width",
+                        })?;
+                }
+            }
+            if sym_width <= 0 || sym_width > limits.max_width as i64 {
+                return Err(DecodeError::Malformed {
+                    reason: "non-positive or oversized symbol width",
+                });
+            }
+            if new_symbols.len() >= num_new {
+                return Err(DecodeError::Malformed {
+                    reason: "more symbols coded than SDNUMNEWSYMS",
+                });
+            }
+            let px = (sym_width as u64)
+                .checked_mul(hc_height as u64)
+                .ok_or(DecodeError::Overflow {
+                    operation: "symbol pixel count",
+                })?;
+            if px > limits.max_symbol_pixels {
+                return Err(DecodeError::limit(LimitError::Pixels {
+                    what: "symbol",
+                    value: px,
+                    limit: limits.max_symbol_pixels,
+                }));
+            }
+            total_pixels = total_pixels.checked_add(px).ok_or(DecodeError::Overflow {
+                operation: "dictionary pixel total",
+            })?;
+            if total_pixels > limits.max_total_dictionary_pixels {
+                return Err(DecodeError::limit(LimitError::Pixels {
+                    what: "dictionary",
+                    value: total_pixels,
+                    limit: limits.max_total_dictionary_pixels,
+                }));
+            }
+
+            // §6.5.8.2.1 number of instances in the aggregation.
+            let refagg_ninst = match agg_table.get().decode(&mut r)? {
+                HuffmanValue::Value(v) if v >= 0 => v,
+                _ => {
+                    return Err(DecodeError::Malformed {
+                        reason: "invalid REFAGGNINST",
+                    });
+                }
+            };
+
+            let bitmap = if refagg_ninst == 1 {
+                // §6.5.8.2.2 with SBHUFF=1: symbol id, RDX/RDY (B.15), BMSIZE
+                // (B.1), byte-align, arithmetic refinement block, byte-align.
+                let id = match sym_table.decode(&mut r)? {
+                    HuffmanValue::Value(v) => v as usize,
+                    HuffmanValue::Oob => {
+                        return Err(DecodeError::Malformed {
+                            reason: "OOB decoding refinement symbol id",
+                        });
+                    }
+                };
+                let rdx = match b15.decode(&mut r)? {
+                    HuffmanValue::Value(v) => v,
+                    HuffmanValue::Oob => {
+                        return Err(DecodeError::Malformed { reason: "OOB for RDX" });
+                    }
+                };
+                let rdy = match b15.decode(&mut r)? {
+                    HuffmanValue::Value(v) => v,
+                    HuffmanValue::Oob => {
+                        return Err(DecodeError::Malformed { reason: "OOB for RDY" });
+                    }
+                };
+                let bmsize = match b1.decode(&mut r)? {
+                    HuffmanValue::Value(v) if v >= 0 => v as usize,
+                    _ => {
+                        return Err(DecodeError::Malformed {
+                            reason: "invalid refinement bitmap size",
+                        });
+                    }
+                };
+                r.align_to_byte();
+                let reference = if id < imported.len() {
+                    &imported[id]
+                } else if id - imported.len() < new_symbols.len() {
+                    &new_symbols[id - imported.len()]
+                } else {
+                    return Err(DecodeError::Malformed {
+                        reason: "refinement symbol id out of range",
+                    });
+                };
+                for c in refine_ctx.iter_mut() {
+                    *c = MqContext(0);
+                }
+                let refine_bytes = r.remaining_from_byte();
+                let block = if bmsize > 0 && bmsize <= refine_bytes.len() {
+                    &refine_bytes[..bmsize]
+                } else {
+                    refine_bytes
+                };
+                let mut rdec = ArithmeticDecoder::new(block);
+                let refined = decode_refinement_region_templated(
+                    &mut rdec,
+                    reference,
+                    sym_width as u32,
+                    hc_height as u32,
+                    rdx,
+                    rdy,
+                    sdrtemplate,
+                    false,
+                    sdrat,
+                    refine_ctx,
+                    limits,
+                )?;
+                for _ in 0..bmsize {
+                    let _ = r.read_bits(8);
+                }
+                r.align_to_byte();
+                refined
+            } else if refagg_ninst > 1 {
+                // §6.5.8.2 step 2 / Table 17: an internal Huffman text region.
+                let mut combined: Vec<Arc<MonoBitmap>> =
+                    Vec::with_capacity(imported.len() + new_symbols.len());
+                combined.extend(imported.iter().cloned());
+                combined.extend(new_symbols.iter().cloned());
+                let tables = HuffTextTables {
+                    sym: &sym_table,
+                    fs: &b6,
+                    ds: &b8,
+                    dt: &b11,
+                    rdw: &b15,
+                    rdh: &b15,
+                    rdx: &b15,
+                    rdy: &b15,
+                    rsize: &b1,
+                };
+                let params = HuffTextParams {
+                    width: sym_width as u32,
+                    height: hc_height as u32,
+                    num_instances: refagg_ninst as u32,
+                    log_strips: 0,
+                    ref_corner: 1, // TOPLEFT
+                    transposed: false,
+                    sb_comb_op: 0, // OR
+                    sb_def_pixel: false,
+                    sb_ds_offset: 0,
+                    sbrefine: true,
+                    sb_rtemplate: sdrtemplate,
+                    grat: sdrat,
+                };
+                decode_huffman_text_core(&mut r, &tables, &params, &combined, refine_ctx, limits)?
+            } else {
+                return Err(DecodeError::Malformed {
+                    reason: "REFAGGNINST is zero",
+                });
+            };
+            new_symbols.push(Arc::new(bitmap));
+        }
+    }
+
+    let export_table = standard_table(1)?;
+    let exported =
+        export_symbols_huffman(&mut r, &export_table, imported, &new_symbols, total, num_ex)?;
+    Ok(SymbolDictionary {
+        exported_symbols: exported.into_boxed_slice(),
+    })
 }
 
 /// Decode a Huffman-coded symbol dictionary (SDHUFF=1, SDREFAGG=0; T.88 §6.5
