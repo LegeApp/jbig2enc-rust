@@ -124,3 +124,24 @@ pub fn decode_embedded_with_globals(
     }
     Ok(pages.remove(0).bitmap)
 }
+
+/// Decode a single embedded page stream **into** a caller-provided bitmap,
+/// reusing its backing allocation when the page fits (jbig2decplan.md §5, the
+/// zero-alloc renderer API). The `target` is overwritten with the first page;
+/// pair with a reused [`DecoderContext`] for a steady state that does not grow
+/// its allocations across same-size pages.
+pub fn decode_embedded_into(
+    target: &mut MonoBitmap,
+    globals: Option<&[u8]>,
+    page_data: &[u8],
+    options: &DecodeOptions,
+    ctx: &mut DecoderContext,
+) -> Result<(), DecodeError> {
+    let decoded_globals = match globals {
+        Some(g) if !g.is_empty() => Some(decode_globals(g, options)?),
+        _ => None,
+    };
+    let bitmap = decode_embedded_with_globals(decoded_globals.as_ref(), page_data, options, ctx)?;
+    target.assign_from(&bitmap);
+    Ok(())
+}

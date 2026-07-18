@@ -154,6 +154,18 @@ impl MonoBitmap {
         Ok(())
     }
 
+    /// Overwrite `self` with the contents of `src`, **reusing** `self`'s backing
+    /// allocation when its capacity already suffices (the zero-alloc steady state
+    /// for `decode_embedded_into`). Only reallocates when `src` is larger than
+    /// `self`'s current capacity.
+    pub fn assign_from(&mut self, src: &MonoBitmap) {
+        self.width = src.width;
+        self.height = src.height;
+        self.stride_words = src.stride_words;
+        self.words.clear();
+        self.words.extend_from_slice(&src.words);
+    }
+
     #[inline]
     pub fn width(&self) -> u32 {
         self.width
