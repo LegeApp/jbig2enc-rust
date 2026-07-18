@@ -172,6 +172,55 @@ pub fn decode_generic_region(
     Ok(bitmap)
 }
 
+/// Decode a generic region **into** a caller-provided bitmap, reusing its
+/// backing allocation (the zero-alloc `decode_embedded_into` path). `dest` must
+/// already be sized to `region.width` × `region.height` and all-white, as
+/// produced by the context's bitmap pool. Behaviour otherwise matches
+/// [`decode_generic_region`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_generic_region_into(
+    region: &GenericRegion<'_>,
+    limits: &DecodeLimits,
+    contexts: &mut [MqContext],
+    scratch: &mut GenericScratch,
+    dest: &mut MonoBitmap,
+) -> Result<(), DecodeError> {
+    debug_assert_eq!(dest.width(), region.width);
+    debug_assert_eq!(dest.height(), region.height);
+    if region.mmr {
+        // MMR has no reusable-buffer decoder; decode into a temporary and copy
+        // into `dest` (reusing `dest`'s allocation). MMR generic regions are not
+        // the zero-alloc target.
+        let bm = crate::decode::mmr::decode_mmr_bitmap(
+            region.data,
+            region.width,
+            region.height,
+            limits,
+        )?;
+        dest.assign_from(&bm);
+        return Ok(());
+    }
+    if (contexts.len() as u64) < (1u64 << 16) {
+        return Err(DecodeError::Overflow {
+            operation: "generic region context array too small",
+        });
+    }
+    if region.width == 0 || region.height == 0 {
+        return Ok(());
+    }
+    let mut decoder = ArithmeticDecoder::new(region.data);
+    decode_into(
+        dest,
+        &mut decoder,
+        region.template,
+        region.at,
+        region.tpgdon,
+        contexts,
+        scratch,
+    );
+    Ok(())
+}
+
 /// Decode a single template-0 generic bitmap from an *existing* arithmetic
 /// decoder, without resetting `contexts` (jbig2decplan.md §16).
 ///

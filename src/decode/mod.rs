@@ -141,7 +141,16 @@ pub fn decode_embedded_into(
         Some(g) if !g.is_empty() => Some(decode_globals(g, options)?),
         _ => None,
     };
-    let bitmap = decode_embedded_with_globals(decoded_globals.as_ref(), page_data, options, ctx)?;
-    target.assign_from(&bitmap);
+    let doc = file::parse_auto_with(page_data, &options.limits, options.strictness)?;
+    let produced = page::process_document_into(
+        &doc,
+        decoded_globals.as_ref(),
+        &options.limits,
+        ctx,
+        target,
+    )?;
+    if !produced {
+        return Err(DecodeError::InvalidFileHeader);
+    }
     Ok(())
 }

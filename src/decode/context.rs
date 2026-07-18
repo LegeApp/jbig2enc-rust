@@ -100,6 +100,13 @@ pub struct DecoderContext {
     pub segment_store: crate::decode::store::SegmentStore,
     /// Per-document "unknown height" flags (one per page), pooled likewise.
     pub unknown_height_scratch: Vec<bool>,
+    /// Pooled `DecodedPage` list for the zero-copy `decode_embedded_into` path,
+    /// swapped out and drained back each call so the `Vec` allocation is reused.
+    pub pages_scratch: Vec<crate::decode::page::DecodedPage>,
+    /// Pool of recyclable page/region bitmaps for the zero-copy
+    /// `decode_embedded_into` path. Page and region buffers are drawn from here
+    /// and returned after each decode, so the steady state does not reallocate.
+    pub bitmap_pool: Vec<MonoBitmap>,
     /// Malformations tolerated during the last decode in
     /// [`DecodeStrictness::Compatible`] mode (jbig2decplan.md §20). Cleared at
     /// the start of each decode.
@@ -168,6 +175,13 @@ impl DecoderContext {
     pub fn trim_to(&mut self, retained_words: usize) {
         if self.generic_contexts.capacity() > GENERIC_CONTEXT_COUNT.saturating_mul(2) {
             self.generic_contexts = Vec::new();
+        }
+        // A pathological page can leave many recyclable bitmaps pooled; cap the
+        // pool so it does not permanently inflate a worker.
+        const MAX_POOLED_BITMAPS: usize = 8;
+        if self.bitmap_pool.len() > MAX_POOLED_BITMAPS {
+            self.bitmap_pool.truncate(MAX_POOLED_BITMAPS);
+            self.bitmap_pool.shrink_to_fit();
         }
         let _ = retained_words;
     }

@@ -61,6 +61,28 @@ impl MonoBitmap {
         fill_black: bool,
         limits: &DecodeLimits,
     ) -> Result<Self, DecodeError> {
+        let mut bm = Self {
+            width: 0,
+            height: 0,
+            stride_words: 0,
+            words: Vec::new(),
+        };
+        bm.reset(width, height, fill_black, limits)?;
+        Ok(bm)
+    }
+
+    /// Reset this bitmap to a fresh `width` × `height` all-white (or all-black
+    /// if `fill_black`) bitmap, **reusing** the backing allocation when its
+    /// capacity already suffices. Recycles a pooled page/region bitmap for the
+    /// zero-alloc `decode_embedded_into` path. Dimensions are checked against
+    /// `limits` exactly as [`MonoBitmap::new`].
+    pub fn reset(
+        &mut self,
+        width: u32,
+        height: u32,
+        fill_black: bool,
+        limits: &DecodeLimits,
+    ) -> Result<(), DecodeError> {
         if width > limits.max_width {
             return Err(DecodeError::limit(LimitError::Dimension {
                 dimension: "width",
@@ -98,17 +120,15 @@ impl MonoBitmap {
             operation: "bitmap word count to usize",
         })?;
 
-        let mut words = vec![0u32; total_words];
+        self.words.clear();
+        self.words.resize(total_words, 0);
         if fill_black && width > 0 {
-            fill_black_rows(&mut words, width, stride_words);
+            fill_black_rows(&mut self.words, width, stride_words);
         }
-
-        Ok(Self {
-            width,
-            height,
-            stride_words,
-            words,
-        })
+        self.width = width;
+        self.height = height;
+        self.stride_words = stride_words;
+        Ok(())
     }
 
     /// Grow the bitmap to at least `new_height` rows, preserving existing

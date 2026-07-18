@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::decode::context::DecoderContext;
 use crate::decode::error::{DecodeError, LimitError, ParseError, UnsupportedFeature};
 use crate::decode::file::{ParsedDocument, ParsedSegment};
-use crate::decode::generic::{decode_generic_region, parse_generic_region};
+use crate::decode::generic::{decode_generic_region_into, parse_generic_region};
 use crate::decode::globals::DecodedGlobals;
 use crate::decode::halftone_region::{decode_halftone_region, parse_halftone_region};
 use crate::decode::pattern_dictionary::{decode_pattern_dictionary, PatternDictionary};
@@ -222,6 +222,36 @@ fn annotate(segment: u32, err: DecodeError) -> DecodeError {
     }
 }
 
+/// Reusable per-document scratch threaded through [`run_segments`]. The page
+/// list, height-flags, segment store, and recyclable-bitmap pool are pooled in
+/// the [`DecoderContext`] for the zero-copy `decode_embedded_into` path, or
+/// created fresh for the by-value entry points.
+struct SegmentScratch {
+    pages: Vec<DecodedPage>,
+    unknown_height: Vec<bool>,
+    store: SegmentStore,
+    bitmap_pool: Vec<MonoBitmap>,
+}
+
+/// Draw a `width` × `height` bitmap from `pool`, recycling a pooled buffer when
+/// one is free, otherwise allocating. The recycled buffer is reset to all-white
+/// (or all-black if `fill_black`).
+fn acquire_bitmap(
+    pool: &mut Vec<MonoBitmap>,
+    width: u32,
+    height: u32,
+    fill_black: bool,
+    limits: &DecodeLimits,
+) -> Result<MonoBitmap, DecodeError> {
+    match pool.pop() {
+        Some(mut bm) => {
+            bm.reset(width, height, fill_black, limits)?;
+            Ok(bm)
+        }
+        None => MonoBitmap::new(width, height, fill_black, limits),
+    }
+}
+
 /// Process a parsed document, resolving referred symbol dictionaries against an
 /// optional set of shared globals (jbig2decplan.md §6, §16, §17).
 pub fn process_document_with_globals(
@@ -230,17 +260,119 @@ pub fn process_document_with_globals(
     limits: &DecodeLimits,
     ctx: &mut DecoderContext,
 ) -> Result<Vec<DecodedPage>, DecodeError> {
-    let mut pages: Vec<DecodedPage> = Vec::new();
-    // Parallel to `pages`: whether each page's height was originally unknown
-    // (0xFFFFFFFF) and so grows stripe-by-stripe (T.88 §7.4.8.5). Pooled in the
-    // context (swapped out, reused, swapped back) so a reused worker does not
-    // reallocate it per document.
-    let mut unknown_height: Vec<bool> = std::mem::take(&mut ctx.unknown_height_scratch);
+    // By-value entry point: pool the store and height flags across documents,
+    // but allocate page bitmaps fresh (they are moved out to the caller) — the
+    // empty pool makes `acquire_bitmap` always allocate.
+    let mut unknown_height = std::mem::take(&mut ctx.unknown_height_scratch);
     unknown_height.clear();
-    let mut current: Option<usize> = None;
-    // Likewise pool the segment store across documents.
     let mut store = std::mem::take(&mut ctx.segment_store);
     store.clear();
+    let scratch = run_segments(
+        doc,
+        globals,
+        limits,
+        ctx,
+        SegmentScratch {
+            pages: Vec::new(),
+            unknown_height,
+            store,
+            bitmap_pool: Vec::new(),
+        },
+    )?;
+    let SegmentScratch {
+        pages,
+        mut unknown_height,
+        mut store,
+        bitmap_pool: _,
+    } = scratch;
+    store.clear();
+    ctx.segment_store = store;
+    unknown_height.clear();
+    ctx.unknown_height_scratch = unknown_height;
+    Ok(pages)
+}
+
+/// Decode a document straight into a caller-provided page bitmap, pooling every
+/// intermediate buffer in `ctx` so the steady state does not allocate
+/// (jbig2decplan.md §13, the zero-alloc renderer API). The first page's content
+/// is swapped into `target` (reusing its backing allocation); all page bitmaps
+/// are recycled into the context pool for the next call. Returns `false` when
+/// the document produced no page.
+pub fn process_document_into(
+    doc: &ParsedDocument<'_>,
+    globals: Option<&DecodedGlobals>,
+    limits: &DecodeLimits,
+    ctx: &mut DecoderContext,
+    target: &mut MonoBitmap,
+) -> Result<bool, DecodeError> {
+    let mut pages = std::mem::take(&mut ctx.pages_scratch);
+    let mut bitmap_pool = std::mem::take(&mut ctx.bitmap_pool);
+    // Recycle any page bitmaps left over from a prior error path.
+    for p in pages.drain(..) {
+        bitmap_pool.push(p.bitmap);
+    }
+    let mut unknown_height = std::mem::take(&mut ctx.unknown_height_scratch);
+    unknown_height.clear();
+    let mut store = std::mem::take(&mut ctx.segment_store);
+    store.clear();
+
+    let scratch = run_segments(
+        doc,
+        globals,
+        limits,
+        ctx,
+        SegmentScratch {
+            pages,
+            unknown_height,
+            store,
+            bitmap_pool,
+        },
+    )?;
+    let SegmentScratch {
+        mut pages,
+        mut unknown_height,
+        mut store,
+        mut bitmap_pool,
+    } = scratch;
+
+    let produced = !pages.is_empty();
+    if produced {
+        // Swap the first page's content into the caller's buffer (reusing the
+        // caller's backing allocation for the pool), then recycle every page
+        // bitmap for the next decode.
+        std::mem::swap(target, &mut pages[0].bitmap);
+    }
+    for p in pages.drain(..) {
+        bitmap_pool.push(p.bitmap);
+    }
+
+    ctx.pages_scratch = pages;
+    ctx.bitmap_pool = bitmap_pool;
+    store.clear();
+    ctx.segment_store = store;
+    unknown_height.clear();
+    ctx.unknown_height_scratch = unknown_height;
+    Ok(produced)
+}
+
+/// The per-segment decoding loop shared by [`process_document_with_globals`] and
+/// [`process_document_into`]. Takes ownership of the [`SegmentScratch`] so the
+/// loop body works on plain locals, and hands it back on success (an early error
+/// return drops the scratch — off the happy path, pooling does not matter).
+fn run_segments(
+    doc: &ParsedDocument<'_>,
+    globals: Option<&DecodedGlobals>,
+    limits: &DecodeLimits,
+    ctx: &mut DecoderContext,
+    scratch: SegmentScratch,
+) -> Result<SegmentScratch, DecodeError> {
+    let SegmentScratch {
+        mut pages,
+        mut unknown_height,
+        mut store,
+        mut bitmap_pool,
+    } = scratch;
+    let mut current: Option<usize> = None;
     let globals_store = globals.map(|g| g.store());
 
     // Surface any parse-time recoveries (Compatible mode, jbig2decplan.md §20).
@@ -278,7 +410,7 @@ pub fn process_document_with_globals(
                     seg.data, &symbols, &tables, limits, int_ctx, iaid_ctx, refine_ctx,
                 )
                 .map_err(|source| annotate(seg.header.number, source))?;
-                place_or_store(
+                if let Some(spare) = place_or_store(
                     matches!(ty, Some(SegmentType::IntermediateTextRegion)),
                     seg.header.number,
                     &mut store,
@@ -291,7 +423,9 @@ pub fn process_document_with_globals(
                     result.y,
                     result.comb_operator,
                     limits,
-                )?;
+                )? {
+                    bitmap_pool.push(spare);
+                }
                 continue;
             }
             _ => {}
@@ -309,8 +443,13 @@ pub fn process_document_with_globals(
                 if !is_unknown {
                     check_page_pixels(&info, limits)?;
                 }
-                let bitmap =
-                    MonoBitmap::new(info.width, init_height, info.default_pixel, limits)?;
+                let bitmap = acquire_bitmap(
+                    &mut bitmap_pool,
+                    info.width,
+                    init_height,
+                    info.default_pixel,
+                    limits,
+                )?;
                 pages.push(DecodedPage {
                     page_number: seg.header.page_association,
                     bitmap,
@@ -350,9 +489,11 @@ pub fn process_document_with_globals(
                     region.height = row_count;
                     region.data = &region.data[..dlen - 4];
                 }
+                let mut region_bm =
+                    acquire_bitmap(&mut bitmap_pool, region.width, region.height, false, limits)?;
                 let (gctx, scr) = ctx.generic_and_scratch();
-                let region_bm = decode_generic_region(&region, limits, gctx, scr)?;
-                place_or_store(
+                decode_generic_region_into(&region, limits, gctx, scr, &mut region_bm)?;
+                if let Some(spare) = place_or_store(
                     matches!(ty, Some(SegmentType::IntermediateGenericRegion)),
                     seg.header.number,
                     &mut store,
@@ -365,7 +506,9 @@ pub fn process_document_with_globals(
                     region.y,
                     region.comb_operator,
                     limits,
-                )?;
+                )? {
+                    bitmap_pool.push(spare);
+                }
             }
             // §7.4.10 end of stripe: a 4-byte end row. For an unknown-height
             // page this communicates the page size, so grow to include it.
@@ -425,7 +568,7 @@ pub fn process_document_with_globals(
                     scratch,
                 )
                 .map_err(|source| annotate(seg.header.number, source))?;
-                place_or_store(
+                if let Some(spare) = place_or_store(
                     matches!(ty, Some(SegmentType::IntermediateHalftoneRegion)),
                     seg.header.number,
                     &mut store,
@@ -438,7 +581,9 @@ pub fn process_document_with_globals(
                     region.y,
                     region.comb_operator,
                     limits,
-                )?;
+                )? {
+                    bitmap_pool.push(spare);
+                }
             }
             Some(
                 SegmentType::ImmediateGenericRefinementRegion
@@ -503,7 +648,7 @@ pub fn process_document_with_globals(
                     limits,
                 )
                 .map_err(|source| annotate(seg.header.number, source))?;
-                place_or_store(
+                if let Some(spare) = place_or_store(
                     intermediate,
                     seg.header.number,
                     &mut store,
@@ -516,7 +661,9 @@ pub fn process_document_with_globals(
                     region.y,
                     ext_comb,
                     limits,
-                )?;
+                )? {
+                    bitmap_pool.push(spare);
+                }
             }
             Some(SegmentType::Tables) => {
                 decode_tables_into(seg, &mut store, limits)?;
@@ -530,15 +677,12 @@ pub fn process_document_with_globals(
         }
     }
 
-    // Return the pooled scratch to the context (with capacity retained, data
-    // dropped) for the next document. Early `?` returns above simply drop the
-    // local buffers — an error path, where pooling does not matter.
-    store.clear();
-    ctx.segment_store = store;
-    unknown_height.clear();
-    ctx.unknown_height_scratch = unknown_height;
-
-    Ok(pages)
+    Ok(SegmentScratch {
+        pages,
+        unknown_height,
+        store,
+        bitmap_pool,
+    })
 }
 
 fn check_page_pixels(info: &PageInformation, limits: &DecodeLimits) -> Result<(), DecodeError> {
@@ -576,13 +720,16 @@ fn resolve_page(
 /// Composite a decoded region onto a page. When the region exactly covers a
 /// blank page at the origin with an OR/REPLACE operator, move it in with no
 /// per-word combine.
+/// Compose `region` onto `page` and return the now-spare bitmap for recycling:
+/// the region buffer after a combine, or (for the full-cover fast path that
+/// swaps the region in) the page's former buffer.
 fn compose_region(
     page: &mut MonoBitmap,
-    region: MonoBitmap,
+    mut region: MonoBitmap,
     x: u32,
     y: u32,
     comb_operator: u8,
-) {
+) -> MonoBitmap {
     let op = combination_operator(comb_operator);
     let full_cover = x == 0
         && y == 0
@@ -591,10 +738,13 @@ fn compose_region(
     let movable = matches!(op, CombinationOperator::Or | CombinationOperator::Replace)
         && page_is_blank(page);
     if full_cover && movable {
-        *page = region;
-        return;
+        // Swap rather than assign so the page's old buffer is returned for reuse
+        // instead of dropped.
+        std::mem::swap(page, &mut region);
+        return region;
     }
     page.combine(&region, x as i32, y as i32, op);
+    region
 }
 
 /// Whether a region segment type is *intermediate* (its bitmap is retained as an
@@ -626,9 +776,10 @@ fn place_or_store(
     y: u32,
     comb: u8,
     limits: &DecodeLimits,
-) -> Result<(), DecodeError> {
+) -> Result<Option<MonoBitmap>, DecodeError> {
     if intermediate {
         store.insert(seg_number, DecodedSegment::Region(Arc::new(region_bm)))?;
+        Ok(None)
     } else {
         let target = resolve_page(pages, current, page_association)?;
         grow_if_unknown(
@@ -638,9 +789,14 @@ fn place_or_store(
             region_bm.height(),
             limits,
         )?;
-        compose_region(&mut pages[target].bitmap, region_bm, x, y, comb);
+        Ok(Some(compose_region(
+            &mut pages[target].bitmap,
+            region_bm,
+            x,
+            y,
+            comb,
+        )))
     }
-    Ok(())
 }
 
 /// Grow an unknown-height page so a region of height `h` placed at row `y`
