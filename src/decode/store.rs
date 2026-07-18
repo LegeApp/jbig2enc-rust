@@ -55,6 +55,14 @@ impl SegmentStore {
         Self::default()
     }
 
+    /// Drop all decoded segments and retained contexts, keeping the backing
+    /// map capacity so a reused store (pooled in the [`DecoderContext`]) does
+    /// not reallocate on the next document.
+    pub fn clear(&mut self) {
+        self.values.clear();
+        self.retained.clear();
+    }
+
     /// Insert a decoded segment, rejecting a duplicate segment number.
     pub fn insert(&mut self, number: u32, seg: DecodedSegment) -> Result<(), DecodeError> {
         if self.values.contains_key(&number) {

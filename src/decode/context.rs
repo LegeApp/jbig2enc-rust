@@ -94,6 +94,12 @@ pub struct DecoderContext {
     /// Reusable row buffers for the generic decoder, pooled across every region
     /// and dictionary symbol so the hot path allocates them once, not per call.
     pub generic_scratch: crate::decode::generic::GenericScratch,
+    /// Per-document segment store, pooled across pages so a reused worker does
+    /// not reallocate its backing maps. `process_document` swaps this out with
+    /// [`std::mem::take`], clears it, and swaps it back after decoding.
+    pub segment_store: crate::decode::store::SegmentStore,
+    /// Per-document "unknown height" flags (one per page), pooled likewise.
+    pub unknown_height_scratch: Vec<bool>,
     /// Malformations tolerated during the last decode in
     /// [`DecodeStrictness::Compatible`] mode (jbig2decplan.md §20). Cleared at
     /// the start of each decode.

@@ -232,10 +232,15 @@ pub fn process_document_with_globals(
 ) -> Result<Vec<DecodedPage>, DecodeError> {
     let mut pages: Vec<DecodedPage> = Vec::new();
     // Parallel to `pages`: whether each page's height was originally unknown
-    // (0xFFFFFFFF) and so grows stripe-by-stripe (T.88 §7.4.8.5).
-    let mut unknown_height: Vec<bool> = Vec::new();
+    // (0xFFFFFFFF) and so grows stripe-by-stripe (T.88 §7.4.8.5). Pooled in the
+    // context (swapped out, reused, swapped back) so a reused worker does not
+    // reallocate it per document.
+    let mut unknown_height: Vec<bool> = std::mem::take(&mut ctx.unknown_height_scratch);
+    unknown_height.clear();
     let mut current: Option<usize> = None;
-    let mut store = SegmentStore::new();
+    // Likewise pool the segment store across documents.
+    let mut store = std::mem::take(&mut ctx.segment_store);
+    store.clear();
     let globals_store = globals.map(|g| g.store());
 
     // Surface any parse-time recoveries (Compatible mode, jbig2decplan.md §20).
@@ -524,6 +529,14 @@ pub fn process_document_with_globals(
             }
         }
     }
+
+    // Return the pooled scratch to the context (with capacity retained, data
+    // dropped) for the next document. Early `?` returns above simply drop the
+    // local buffers — an error path, where pooling does not matter.
+    store.clear();
+    ctx.segment_store = store;
+    unknown_height.clear();
+    ctx.unknown_height_scratch = unknown_height;
 
     Ok(pages)
 }
