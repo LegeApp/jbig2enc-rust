@@ -91,6 +91,9 @@ pub struct DecoderContext {
     /// Scratch for a temporary region bitmap when a region cannot decode
     /// straight into the page.
     pub temporary_bitmap: MonoBitmap,
+    /// Reusable row buffers for the generic decoder, pooled across every region
+    /// and dictionary symbol so the hot path allocates them once, not per call.
+    pub generic_scratch: crate::decode::generic::GenericScratch,
     /// Malformations tolerated during the last decode in
     /// [`DecodeStrictness::Compatible`] mode (jbig2decplan.md §20). Cleared at
     /// the start of each decode.
@@ -111,6 +114,22 @@ impl DecoderContext {
             *c = MqContext::default();
         }
         &mut self.generic_contexts[..GENERIC_CONTEXT_COUNT]
+    }
+
+    /// A zeroed generic-context slice together with the reusable generic row
+    /// scratch (disjoint fields, borrowed at once). Used by the region decoders,
+    /// which need both.
+    pub fn generic_and_scratch(
+        &mut self,
+    ) -> (&mut [MqContext], &mut crate::decode::generic::GenericScratch) {
+        self.ensure_generic();
+        for c in &mut self.generic_contexts[..GENERIC_CONTEXT_COUNT] {
+            *c = MqContext::default();
+        }
+        (
+            &mut self.generic_contexts[..GENERIC_CONTEXT_COUNT],
+            &mut self.generic_scratch,
+        )
     }
 
     /// Ensure the generic-context buffer holds at least [`GENERIC_CONTEXT_COUNT`]

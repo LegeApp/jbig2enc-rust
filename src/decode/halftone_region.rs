@@ -15,7 +15,7 @@
 
 use crate::decode::arith::ArithmeticDecoder;
 use crate::decode::error::{DecodeError, ParseError};
-use crate::decode::generic::decode_generic_bitmap;
+use crate::decode::generic::{decode_generic_bitmap, GenericScratch};
 use crate::decode::mmr::decode_mmr_plane;
 use crate::decode::pattern_dictionary::PatternDictionary;
 use crate::shared::bitmap::{CombinationOperator, MonoBitmap};
@@ -160,6 +160,7 @@ pub fn decode_halftone_region(
     patterns: &PatternDictionary,
     limits: &DecodeLimits,
     generic_ctx: &mut [MqContext],
+    scratch: &mut GenericScratch,
 ) -> Result<MonoBitmap, DecodeError> {
     // §6.6.5 step 1: fill HTREG with HDEFPIXEL.
     let mut htreg = MonoBitmap::new(region.width, region.height, region.default_pixel, limits)?;
@@ -244,9 +245,10 @@ pub fn decode_halftone_region(
                     generic_ctx,
                     limits,
                     s,
+                    scratch,
                 )?,
                 None => decode_generic_bitmap(
-                    &mut dec, hgw, hgh, region.template, at, generic_ctx, limits,
+                    &mut dec, hgw, hgh, region.template, at, generic_ctx, limits, scratch,
                 )?,
             };
         }

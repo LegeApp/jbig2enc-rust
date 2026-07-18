@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::decode::arith::ArithmeticDecoder;
 use crate::decode::error::{DecodeError, LimitError};
-use crate::decode::generic::decode_generic_bitmap;
+use crate::decode::generic::{decode_generic_bitmap, GenericScratch};
 use crate::decode::mmr::decode_mmr_bitmap;
 use crate::shared::bitmap::MonoBitmap;
 use crate::shared::limits::DecodeLimits;
@@ -92,6 +92,7 @@ pub fn decode_pattern_dictionary(
     payload: &[u8],
     limits: &DecodeLimits,
     generic_ctx: &mut [MqContext],
+    scratch: &mut GenericScratch,
 ) -> Result<PatternDictionary, DecodeError> {
     let mut r = Reader::new(payload);
     let hdr = parse_header(&mut r)?;
@@ -159,6 +160,7 @@ pub fn decode_pattern_dictionary(
             at,
             generic_ctx,
             limits,
+            scratch,
         )?
     };
 

@@ -153,8 +153,10 @@ pub(crate) fn decode_symbol_dict_into(
     let int_ctx = &mut ctx.integer_contexts;
     let iaid_ctx = &mut ctx.iaid_contexts;
     let refine_ctx = &mut ctx.refinement_contexts[..REFINEMENT_CONTEXT_COUNT];
+    let scratch = &mut ctx.generic_scratch;
     let dict = decode_symbol_dictionary(
-        seg.data, &imported, &tables, limits, int_ctx, iaid_ctx, generic, refine_ctx, !ctx_used,
+        seg.data, &imported, &tables, limits, int_ctx, iaid_ctx, generic, refine_ctx, scratch,
+        !ctx_used,
     )
     .map_err(|source| annotate(seg.header.number, source))?;
 
@@ -186,8 +188,8 @@ pub(crate) fn decode_pattern_dict_into(
     limits: &DecodeLimits,
     ctx: &mut DecoderContext,
 ) -> Result<Arc<PatternDictionary>, DecodeError> {
-    let generic = ctx.generic_contexts();
-    let dict = decode_pattern_dictionary(seg.data, limits, generic)
+    let (generic, scratch) = ctx.generic_and_scratch();
+    let dict = decode_pattern_dictionary(seg.data, limits, generic, scratch)
         .map_err(|source| annotate(seg.header.number, source))?;
     let arc = Arc::new(dict);
     local.insert(
@@ -343,8 +345,8 @@ pub fn process_document_with_globals(
                     region.height = row_count;
                     region.data = &region.data[..dlen - 4];
                 }
-                let region_bm =
-                    decode_generic_region(&region, limits, ctx.generic_contexts())?;
+                let (gctx, scr) = ctx.generic_and_scratch();
+                let region_bm = decode_generic_region(&region, limits, gctx, scr)?;
                 place_or_store(
                     matches!(ty, Some(SegmentType::IntermediateGenericRegion)),
                     seg.header.number,
@@ -409,11 +411,13 @@ pub fn process_document_with_globals(
                 let patterns = store
                     .pattern_dictionary(seg.header.number, &seg.header.referred_to, globals_store)?
                     .clone();
+                let (generic, scratch) = ctx.generic_and_scratch();
                 let region_bm = decode_halftone_region(
                     &region,
                     &patterns,
                     limits,
-                    ctx.generic_contexts(),
+                    generic,
+                    scratch,
                 )
                 .map_err(|source| annotate(seg.header.number, source))?;
                 place_or_store(

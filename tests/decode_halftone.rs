@@ -302,7 +302,8 @@ fn pattern_dict_graymax_overflow_is_typed_error() {
 
     let limits = DecodeLimits::default();
     let mut ctx = vec![MqContext::default(); 1 << 16];
-    match decode_pattern_dictionary(&payload, &limits, &mut ctx) {
+    let mut scratch = jbig2enc_rust::decode::generic::GenericScratch::default();
+    match decode_pattern_dictionary(&payload, &limits, &mut ctx, &mut scratch) {
         Err(DecodeError::Limit(_)) | Err(DecodeError::Overflow { .. }) => {}
         Err(other) => panic!("expected a limit/overflow error, got {other:?}"),
         Ok(_) => panic!("expected a limit/overflow error, got Ok"),

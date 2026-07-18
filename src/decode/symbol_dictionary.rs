@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::decode::arith::ArithmeticDecoder;
 use crate::decode::error::{DecodeError, LimitError, usize_from_u32};
-use crate::decode::generic::decode_generic_bitmap;
+use crate::decode::generic::{decode_generic_bitmap, GenericScratch};
 use crate::decode::huffman::{standard_table, BitReader, HuffmanTable, HuffmanValue};
 use crate::decode::iaid::IaidContexts;
 use crate::decode::integer::{DecodedInteger, IntegerContexts};
@@ -78,6 +78,7 @@ pub fn decode_symbol_dictionary(
     iaid_ctx: &mut IaidContexts,
     generic_ctx: &mut [MqContext],
     refine_ctx: &mut [MqContext],
+    scratch: &mut GenericScratch,
     reset_bitmap_ctx: bool,
 ) -> Result<SymbolDictionary, DecodeError> {
     let mut r = Reader::new(payload);
@@ -289,6 +290,7 @@ pub fn decode_symbol_dictionary(
                     at,
                     generic_ctx,
                     limits,
+                    scratch,
                 )?
             };
             new_symbols.push(Arc::new(bitmap));

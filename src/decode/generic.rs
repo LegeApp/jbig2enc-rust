@@ -25,6 +25,30 @@ use crate::shared::reader::Reader;
 /// AT2 (-3,-1), AT3 (2,-2), AT4 (-2,-2). Also this crate's encoder default.
 pub const NOMINAL_AT0: [(i8, i8); 4] = [(3, -1), (-3, -1), (2, -2), (-2, -2)];
 
+/// Reusable row buffers for the generic decoder: a zero row for the top-boundary
+/// rows and the current-row accumulator. Pooled in the [`DecoderContext`] and
+/// reused across every region and every dictionary symbol, so the decode of a
+/// symbol-heavy page allocates these once instead of twice per symbol.
+#[derive(Default)]
+pub struct GenericScratch {
+    zero: Vec<u32>,
+    cur: Vec<u32>,
+}
+
+impl GenericScratch {
+    /// Return a zeroed zero-row and a zeroed current-row buffer of `stride`
+    /// words each, reusing the existing allocations (disjoint fields, so both
+    /// may be borrowed at once).
+    #[inline]
+    fn rows(&mut self, stride: usize) -> (&[u32], &mut [u32]) {
+        self.zero.clear();
+        self.zero.resize(stride, 0);
+        self.cur.clear();
+        self.cur.resize(stride, 0);
+        (&self.zero, &mut self.cur)
+    }
+}
+
 /// Nominal AT1 offset for templates 1–3 (T.88 §6.2.5.3 Figures 5–7): template 1
 /// uses (3,-1); templates 2 and 3 use (2,-1).
 pub const NOMINAL_AT1: [(i8, i8); 3] = [(3, -1), (2, -1), (2, -1)];
@@ -112,6 +136,7 @@ pub fn decode_generic_region(
     region: &GenericRegion<'_>,
     limits: &DecodeLimits,
     contexts: &mut [MqContext],
+    scratch: &mut GenericScratch,
 ) -> Result<MonoBitmap, DecodeError> {
     if region.mmr {
         // MMR (Group 4) generic region: no arithmetic coder, no AT pixels; the
@@ -142,6 +167,7 @@ pub fn decode_generic_region(
         region.at,
         region.tpgdon,
         contexts,
+        scratch,
     );
     Ok(bitmap)
 }
@@ -153,6 +179,7 @@ pub fn decode_generic_region(
 /// bank across every symbol in the dictionary, so this variant neither creates
 /// its own decoder nor zeroes the contexts — the dictionary decoder owns both.
 /// `contexts` must be at least `1 << 16` entries.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_generic_bitmap(
     decoder: &mut ArithmeticDecoder<'_>,
     width: u32,
@@ -161,6 +188,7 @@ pub fn decode_generic_bitmap(
     at: [(i8, i8); 4],
     contexts: &mut [MqContext],
     limits: &DecodeLimits,
+    scratch: &mut GenericScratch,
 ) -> Result<MonoBitmap, DecodeError> {
     if (contexts.len() as u64) < (1u64 << 16) {
         return Err(DecodeError::Overflow {
@@ -172,7 +200,7 @@ pub fn decode_generic_bitmap(
         return Ok(bitmap);
     }
     // Symbol-dictionary and refinement generic bitmaps never use TPGDON.
-    decode_into(&mut bitmap, decoder, template, at, false, contexts);
+    decode_into(&mut bitmap, decoder, template, at, false, contexts, scratch);
     Ok(bitmap)
 }
 
@@ -191,6 +219,7 @@ pub fn decode_generic_bitmap_skip(
     contexts: &mut [MqContext],
     limits: &DecodeLimits,
     skip: &MonoBitmap,
+    scratch: &mut GenericScratch,
 ) -> Result<MonoBitmap, DecodeError> {
     if (contexts.len() as u64) < (1u64 << 16) {
         return Err(DecodeError::Overflow {
@@ -202,26 +231,25 @@ pub fn decode_generic_bitmap_skip(
         return Ok(bitmap);
     }
     let stride = bitmap.stride_words() as usize;
-    let zero_row = vec![0u32; stride];
-    let mut cur = vec![0u32; stride];
+    let (zero_row, cur) = scratch.rows(stride);
     for y in 0..height {
         for w in cur.iter_mut() {
             *w = 0;
         }
-        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { &zero_row };
-        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { &zero_row };
+        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { zero_row };
+        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { zero_row };
         for x in 0..width {
             if skip.get(x, y) {
                 continue; // implicitly 0, no arithmetic bit consumed
             }
-            let ctx = pixel_context(template, &cur, prev1, prev2, width, x as i64, &at);
+            let ctx = pixel_context(template, &*cur, prev1, prev2, width, x as i64, &at);
             let bit = decoder.decode_bit(&mut contexts[ctx]);
             if bit {
                 let xu = x as usize;
                 cur[xu >> 5] |= 1u32 << (31 - (xu & 31));
             }
         }
-        bitmap.row_mut(y).copy_from_slice(&cur);
+        bitmap.row_mut(y).copy_from_slice(cur);
     }
     Ok(bitmap)
 }
@@ -311,6 +339,7 @@ fn pixel_context(
 /// neighbourhood (0–3); values outside that range are clamped to 3's behaviour
 /// by the parser (the flags field is only 2 bits wide, so `template <= 3`
 /// always holds).
+#[allow(clippy::too_many_arguments)]
 fn decode_into(
     bitmap: &mut MonoBitmap,
     decoder: &mut ArithmeticDecoder<'_>,
@@ -318,13 +347,16 @@ fn decode_into(
     at: [(i8, i8); 4],
     tpgdon: bool,
     contexts: &mut [MqContext],
+    scratch: &mut GenericScratch,
 ) {
     match template {
-        0 if at == NOMINAL_AT0 => decode_template0_nominal(bitmap, decoder, contexts, tpgdon),
-        0 => decode_template0_general(bitmap, decoder, contexts, at, tpgdon),
-        1 => decode_template1(bitmap, decoder, contexts, at[0], tpgdon),
-        2 => decode_template2(bitmap, decoder, contexts, at[0], tpgdon),
-        _ => decode_template3(bitmap, decoder, contexts, at[0], tpgdon),
+        0 if at == NOMINAL_AT0 => {
+            decode_template0_nominal(bitmap, decoder, contexts, tpgdon, scratch)
+        }
+        0 => decode_template0_general(bitmap, decoder, contexts, at, tpgdon, scratch),
+        1 => decode_template1(bitmap, decoder, contexts, at[0], tpgdon, scratch),
+        2 => decode_template2(bitmap, decoder, contexts, at[0], tpgdon, scratch),
+        _ => decode_template3(bitmap, decoder, contexts, at[0], tpgdon, scratch),
     }
 }
 
@@ -347,12 +379,12 @@ fn decode_template0_nominal(
     decoder: &mut ArithmeticDecoder<'_>,
     contexts: &mut [MqContext],
     tpgdon: bool,
+    scratch: &mut GenericScratch,
 ) {
     let width = bitmap.width();
     let height = bitmap.height();
     let stride = bitmap.stride_words() as usize;
-    let zero_row = vec![0u32; stride];
-    let mut cur = vec![0u32; stride];
+    let (zero_row, cur) = scratch.rows(stride);
     let mut ltp = false;
 
     for y in 0..height {
@@ -360,7 +392,7 @@ fn decode_template0_nominal(
             let sltp = decoder.decode_bit(&mut contexts[SLTP_CTX_T0]);
             ltp ^= sltp;
             if ltp {
-                copy_prev_row(bitmap, y, &mut cur);
+                copy_prev_row(bitmap, y, cur);
                 continue;
             }
         }
@@ -368,8 +400,8 @@ fn decode_template0_nominal(
             *w = 0;
         }
         // Immutable borrows of previously decoded rows.
-        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { &zero_row };
-        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { &zero_row };
+        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { zero_row };
+        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { zero_row };
 
         let mut c1 = (sample(prev2, width, 0) << 2)
             | (sample(prev2, width, 1) << 1)
@@ -394,7 +426,7 @@ fn decode_template0_nominal(
             c3 = ((c3 << 1) | bit as u32) & 15;
         }
 
-        bitmap.row_mut(y).copy_from_slice(&cur);
+        bitmap.row_mut(y).copy_from_slice(cur);
     }
 }
 
@@ -421,12 +453,12 @@ fn decode_template0_general(
     contexts: &mut [MqContext],
     at: [(i8, i8); 4],
     tpgdon: bool,
+    scratch: &mut GenericScratch,
 ) {
     let width = bitmap.width();
     let height = bitmap.height();
     let stride = bitmap.stride_words() as usize;
-    let zero_row = vec![0u32; stride];
-    let mut cur = vec![0u32; stride];
+    let (zero_row, cur) = scratch.rows(stride);
     let mut ltp = false;
 
     // Context bit layout (MSB..LSB), matching the encoder's tval arrangement.
@@ -445,15 +477,15 @@ fn decode_template0_general(
             let sltp = decoder.decode_bit(&mut contexts[SLTP_CTX_T0]);
             ltp ^= sltp;
             if ltp {
-                copy_prev_row(bitmap, y, &mut cur);
+                copy_prev_row(bitmap, y, &mut *cur);
                 continue;
             }
         }
         for w in cur.iter_mut() {
             *w = 0;
         }
-        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { &zero_row };
-        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { &zero_row };
+        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { zero_row };
+        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { zero_row };
 
         // Read a pixel at (x+dx, y+dy) from already-decoded data.
         let px = |cur: &[u32], x: i64, dx: i64, dy: i64| -> u32 {
@@ -476,22 +508,22 @@ fn decode_template0_general(
         for x in 0..width {
             let x = x as i64;
             let mut t = 0u32;
-            t |= px(&cur, x, a4x, a4y) << 15;
-            t |= px(&cur, x, -1, -2) << 14;
-            t |= px(&cur, x, 0, -2) << 13;
-            t |= px(&cur, x, 1, -2) << 12;
-            t |= px(&cur, x, a3x, a3y) << 11;
-            t |= px(&cur, x, a2x, a2y) << 10;
-            t |= px(&cur, x, -2, -1) << 9;
-            t |= px(&cur, x, -1, -1) << 8;
-            t |= px(&cur, x, 0, -1) << 7;
-            t |= px(&cur, x, 1, -1) << 6;
-            t |= px(&cur, x, 2, -1) << 5;
-            t |= px(&cur, x, a1x, a1y) << 4;
-            t |= px(&cur, x, -4, 0) << 3;
-            t |= px(&cur, x, -3, 0) << 2;
-            t |= px(&cur, x, -2, 0) << 1;
-            t |= px(&cur, x, -1, 0);
+            t |= px(&*cur, x, a4x, a4y) << 15;
+            t |= px(&*cur, x, -1, -2) << 14;
+            t |= px(&*cur, x, 0, -2) << 13;
+            t |= px(&*cur, x, 1, -2) << 12;
+            t |= px(&*cur, x, a3x, a3y) << 11;
+            t |= px(&*cur, x, a2x, a2y) << 10;
+            t |= px(&*cur, x, -2, -1) << 9;
+            t |= px(&*cur, x, -1, -1) << 8;
+            t |= px(&*cur, x, 0, -1) << 7;
+            t |= px(&*cur, x, 1, -1) << 6;
+            t |= px(&*cur, x, 2, -1) << 5;
+            t |= px(&*cur, x, a1x, a1y) << 4;
+            t |= px(&*cur, x, -4, 0) << 3;
+            t |= px(&*cur, x, -3, 0) << 2;
+            t |= px(&*cur, x, -2, 0) << 1;
+            t |= px(&*cur, x, -1, 0);
 
             let bit = decoder.decode_bit(&mut contexts[t as usize]);
             if bit {
@@ -499,7 +531,7 @@ fn decode_template0_general(
                 cur[xi >> 5] |= 1u32 << (31 - (xi & 31));
             }
         }
-        bitmap.row_mut(y).copy_from_slice(&cur);
+        bitmap.row_mut(y).copy_from_slice(cur);
     }
 }
 
@@ -542,12 +574,12 @@ fn decode_template1(
     contexts: &mut [MqContext],
     at1: (i8, i8),
     tpgdon: bool,
+    scratch: &mut GenericScratch,
 ) {
     let width = bitmap.width();
     let height = bitmap.height();
     let stride = bitmap.stride_words() as usize;
-    let zero_row = vec![0u32; stride];
-    let mut cur = vec![0u32; stride];
+    let (zero_row, cur) = scratch.rows(stride);
     let mut ltp = false;
     let (a1x, a1y) = (at1.0 as i64, at1.1 as i64);
 
@@ -556,23 +588,23 @@ fn decode_template1(
             let sltp = decoder.decode_bit(&mut contexts[SLTP_CTX_T1]);
             ltp ^= sltp;
             if ltp {
-                copy_prev_row(bitmap, y, &mut cur);
+                copy_prev_row(bitmap, y, &mut *cur);
                 continue;
             }
         }
         for w in cur.iter_mut() {
             *w = 0;
         }
-        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { &zero_row };
-        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { &zero_row };
+        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { zero_row };
+        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { zero_row };
 
         for x in 0..width {
             let xi = x as i64;
             let mut t = 0u32;
-            t |= sample(&cur, width, xi - 1);
-            t |= sample(&cur, width, xi - 2) << 1;
-            t |= sample(&cur, width, xi - 3) << 2;
-            t |= at_pixel(&cur, prev1, prev2, width, xi, a1x, a1y) << 3;
+            t |= sample(&*cur, width, xi - 1);
+            t |= sample(&*cur, width, xi - 2) << 1;
+            t |= sample(&*cur, width, xi - 3) << 2;
+            t |= at_pixel(&*cur, prev1, prev2, width, xi, a1x, a1y) << 3;
             t |= sample(prev1, width, xi + 2) << 4;
             t |= sample(prev1, width, xi + 1) << 5;
             t |= sample(prev1, width, xi) << 6;
@@ -589,7 +621,7 @@ fn decode_template1(
                 cur[xu >> 5] |= 1u32 << (31 - (xu & 31));
             }
         }
-        bitmap.row_mut(y).copy_from_slice(&cur);
+        bitmap.row_mut(y).copy_from_slice(cur);
     }
 }
 
@@ -600,12 +632,12 @@ fn decode_template2(
     contexts: &mut [MqContext],
     at1: (i8, i8),
     tpgdon: bool,
+    scratch: &mut GenericScratch,
 ) {
     let width = bitmap.width();
     let height = bitmap.height();
     let stride = bitmap.stride_words() as usize;
-    let zero_row = vec![0u32; stride];
-    let mut cur = vec![0u32; stride];
+    let (zero_row, cur) = scratch.rows(stride);
     let mut ltp = false;
     let (a1x, a1y) = (at1.0 as i64, at1.1 as i64);
 
@@ -614,22 +646,22 @@ fn decode_template2(
             let sltp = decoder.decode_bit(&mut contexts[SLTP_CTX_T2]);
             ltp ^= sltp;
             if ltp {
-                copy_prev_row(bitmap, y, &mut cur);
+                copy_prev_row(bitmap, y, &mut *cur);
                 continue;
             }
         }
         for w in cur.iter_mut() {
             *w = 0;
         }
-        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { &zero_row };
-        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { &zero_row };
+        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { zero_row };
+        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { zero_row };
 
         for x in 0..width {
             let xi = x as i64;
             let mut t = 0u32;
-            t |= sample(&cur, width, xi - 1);
-            t |= sample(&cur, width, xi - 2) << 1;
-            t |= at_pixel(&cur, prev1, prev2, width, xi, a1x, a1y) << 2;
+            t |= sample(&*cur, width, xi - 1);
+            t |= sample(&*cur, width, xi - 2) << 1;
+            t |= at_pixel(&*cur, prev1, prev2, width, xi, a1x, a1y) << 2;
             t |= sample(prev1, width, xi + 1) << 3;
             t |= sample(prev1, width, xi) << 4;
             t |= sample(prev1, width, xi - 1) << 5;
@@ -644,7 +676,7 @@ fn decode_template2(
                 cur[xu >> 5] |= 1u32 << (31 - (xu & 31));
             }
         }
-        bitmap.row_mut(y).copy_from_slice(&cur);
+        bitmap.row_mut(y).copy_from_slice(cur);
     }
 }
 
@@ -656,12 +688,12 @@ fn decode_template3(
     contexts: &mut [MqContext],
     at1: (i8, i8),
     tpgdon: bool,
+    scratch: &mut GenericScratch,
 ) {
     let width = bitmap.width();
     let height = bitmap.height();
     let stride = bitmap.stride_words() as usize;
-    let zero_row = vec![0u32; stride];
-    let mut cur = vec![0u32; stride];
+    let (zero_row, cur) = scratch.rows(stride);
     let mut ltp = false;
     let (a1x, a1y) = (at1.0 as i64, at1.1 as i64);
 
@@ -670,25 +702,25 @@ fn decode_template3(
             let sltp = decoder.decode_bit(&mut contexts[SLTP_CTX_T3]);
             ltp ^= sltp;
             if ltp {
-                copy_prev_row(bitmap, y, &mut cur);
+                copy_prev_row(bitmap, y, &mut *cur);
                 continue;
             }
         }
         for w in cur.iter_mut() {
             *w = 0;
         }
-        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { &zero_row };
+        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { zero_row };
         // Template 3 uses only rows y and y-1; prev2 is never referenced but the
         // shared AT sampler expects a slice, so pass the zero row.
 
         for x in 0..width {
             let xi = x as i64;
             let mut t = 0u32;
-            t |= sample(&cur, width, xi - 1);
-            t |= sample(&cur, width, xi - 2) << 1;
-            t |= sample(&cur, width, xi - 3) << 2;
-            t |= sample(&cur, width, xi - 4) << 3;
-            t |= at_pixel(&cur, prev1, &zero_row, width, xi, a1x, a1y) << 4;
+            t |= sample(&*cur, width, xi - 1);
+            t |= sample(&*cur, width, xi - 2) << 1;
+            t |= sample(&*cur, width, xi - 3) << 2;
+            t |= sample(&*cur, width, xi - 4) << 3;
+            t |= at_pixel(&*cur, prev1, zero_row, width, xi, a1x, a1y) << 4;
             t |= sample(prev1, width, xi + 1) << 5;
             t |= sample(prev1, width, xi) << 6;
             t |= sample(prev1, width, xi - 1) << 7;
@@ -701,7 +733,7 @@ fn decode_template3(
                 cur[xu >> 5] |= 1u32 << (31 - (xu & 31));
             }
         }
-        bitmap.row_mut(y).copy_from_slice(&cur);
+        bitmap.row_mut(y).copy_from_slice(cur);
     }
 }
 
@@ -736,7 +768,8 @@ mod tests {
         };
         let limits = DecodeLimits::default();
         let mut ctx = contexts();
-        let bm = decode_generic_region(&region, &limits, &mut ctx).unwrap();
+        let mut scratch = GenericScratch::default();
+        let bm = decode_generic_region(&region, &limits, &mut ctx, &mut scratch).unwrap();
         for y in 0..h {
             for x in 0..w {
                 assert_eq!(
@@ -782,15 +815,16 @@ mod tests {
         let data = Jbig2ArithCoder::encode_generic_payload(&img, 0, &nominal_at0_i8()).unwrap();
         let limits = DecodeLimits::default();
 
+        let mut scratch = GenericScratch::default();
         let mut bm_fast = MonoBitmap::new(37, 20, false, &limits).unwrap();
         let mut d1 = ArithmeticDecoder::new(&data);
         let mut c1 = contexts();
-        decode_template0_nominal(&mut bm_fast, &mut d1, &mut c1, false);
+        decode_template0_nominal(&mut bm_fast, &mut d1, &mut c1, false, &mut scratch);
 
         let mut bm_gen = MonoBitmap::new(37, 20, false, &limits).unwrap();
         let mut d2 = ArithmeticDecoder::new(&data);
         let mut c2 = contexts();
-        decode_template0_general(&mut bm_gen, &mut d2, &mut c2, NOMINAL_AT0, false);
+        decode_template0_general(&mut bm_gen, &mut d2, &mut c2, NOMINAL_AT0, false, &mut scratch);
 
         assert_eq!(bm_fast, bm_gen);
     }
