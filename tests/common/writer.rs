@@ -591,6 +591,164 @@ pub fn huffman_text_region_payload(
     payload
 }
 
+// ------------------------------------------------------------------------
+// Refinement writer (Phase 5e oracle support: GRTEMPLATE-1, TPGRON)
+// ------------------------------------------------------------------------
+
+const SLTP_CTX_GR0: usize = 0x010; // T.88 Figure 14 (centre reference), this crate's numbering
+const SLTP_CTX_GR1: usize = 0x040; // verified vs jbig2dec (see decode::refinement)
+
+fn ref_get(bm: &TestBitmap, x: i64, y: i64) -> u32 {
+    if x < 0 || y < 0 || x >= bm.width as i64 || y >= bm.height as i64 {
+        0
+    } else {
+        bm.get(x as u32, y as u32) as u32
+    }
+}
+
+/// Refinement context (GRDX=GRDY=0, so reference coords equal target coords),
+/// mirroring `decode::refinement::context_gr0`/`context_gr1`.
+fn refine_context(
+    grtemplate: u8,
+    target: &TestBitmap,
+    reference: &TestBitmap,
+    x: i64,
+    y: i64,
+) -> usize {
+    if grtemplate == 0 {
+        let mut cx = 0usize;
+        cx |= ref_get(reference, x - 1, y - 1) as usize;
+        cx |= (ref_get(reference, x, y - 1) as usize) << 1;
+        cx |= (ref_get(reference, x + 1, y - 1) as usize) << 2;
+        cx |= (ref_get(reference, x - 1, y) as usize) << 3;
+        cx |= (ref_get(reference, x, y) as usize) << 4;
+        cx |= (ref_get(reference, x + 1, y) as usize) << 5;
+        cx |= (ref_get(target, x - 1, y) as usize) << 6;
+        cx |= (ref_get(reference, x - 1, y + 1) as usize) << 7;
+        cx |= (ref_get(reference, x, y + 1) as usize) << 8;
+        cx |= (ref_get(reference, x + 1, y + 1) as usize) << 9;
+        cx |= (ref_get(target, x + 1, y - 1) as usize) << 10;
+        cx |= (ref_get(target, x, y - 1) as usize) << 11;
+        cx |= (ref_get(target, x - 1, y - 1) as usize) << 12; // GRAT1 nominal (-1,-1)
+        cx
+    } else {
+        let mut cx = 0usize;
+        cx |= ref_get(target, x - 1, y) as usize;
+        cx |= (ref_get(target, x + 1, y - 1) as usize) << 1;
+        cx |= (ref_get(target, x, y - 1) as usize) << 2;
+        cx |= (ref_get(target, x - 1, y - 1) as usize) << 3;
+        cx |= (ref_get(reference, x + 1, y + 1) as usize) << 4;
+        cx |= (ref_get(reference, x, y + 1) as usize) << 5;
+        cx |= (ref_get(reference, x + 1, y) as usize) << 6;
+        cx |= (ref_get(reference, x, y) as usize) << 7;
+        cx |= (ref_get(reference, x - 1, y) as usize) << 8;
+        cx |= (ref_get(reference, x, y - 1) as usize) << 9;
+        cx
+    }
+}
+
+/// If the reference 3×3 neighbourhood at `(x, y)` is uniform, its value.
+fn ref_typical(reference: &TestBitmap, x: i64, y: i64) -> Option<bool> {
+    let mut sum = 0u32;
+    for dy in -1..=1 {
+        for dx in -1..=1 {
+            sum += ref_get(reference, x + dx, y + dy);
+        }
+    }
+    match sum {
+        0 => Some(false),
+        9 => Some(true),
+        _ => None,
+    }
+}
+
+/// Arithmetic data for a refinement region refining `reference` into `target`
+/// (same size, offset 0), with the given template and TPGRON flag.
+pub fn refinement_arith_data(
+    target: &TestBitmap,
+    reference: &TestBitmap,
+    grtemplate: u8,
+    tpgron: bool,
+) -> Vec<u8> {
+    let mut coder = Jbig2ArithCoder::new();
+    let sltp_ctx = if grtemplate == 0 { SLTP_CTX_GR0 } else { SLTP_CTX_GR1 };
+    let mut ltp = false;
+    for y in 0..target.height {
+        if tpgron {
+            // A row can use LTP=1 only if every typical pixel already matches its
+            // predicted value in `target`.
+            let mut desired = true;
+            for x in 0..target.width {
+                if let Some(v) = ref_typical(reference, x as i64, y as i64) {
+                    if target.get(x, y) != v {
+                        desired = false;
+                        break;
+                    }
+                }
+            }
+            let sltp = desired ^ ltp;
+            coder.encode_bit(sltp_ctx, sltp);
+            ltp = desired;
+        }
+        for x in 0..target.width {
+            if tpgron && ltp && ref_typical(reference, x as i64, y as i64).is_some() {
+                continue; // typical pixel copied by the decoder; not coded
+            }
+            let ctx = refine_context(grtemplate, target, reference, x as i64, y as i64);
+            coder.encode_bit(ctx, target.get(x, y));
+        }
+    }
+    coder.flush(true);
+    coder.as_bytes().to_vec()
+}
+
+/// A page that first paints `reference` with a generic region, then refines it
+/// into `target` with an immediate generic refinement region (type 42).
+pub fn refinement_page(
+    reference: &TestBitmap,
+    target: &TestBitmap,
+    grtemplate: u8,
+    tpgron: bool,
+) -> Vec<u8> {
+    assert_eq!(reference.width, target.width);
+    assert_eq!(reference.height, target.height);
+    let w = reference.width;
+    let h = reference.height;
+    let mut stream = Vec::new();
+
+    let page_data = page_info_payload(w, h);
+    stream.extend_from_slice(&segment_header(0, 48, &[], 1, page_data.len() as u32));
+    stream.extend_from_slice(&page_data);
+
+    // Generic region painting the reference.
+    let gen_region = generic_region_payload(reference, 0, &nominal_at(0), false, 0);
+    stream.extend_from_slice(&segment_header(1, 38, &[], 1, gen_region.len() as u32));
+    stream.extend_from_slice(&gen_region);
+
+    // Immediate generic refinement region (type 42), no referred segment.
+    let mut region = Vec::new();
+    region.extend_from_slice(&w.to_be_bytes());
+    region.extend_from_slice(&h.to_be_bytes());
+    region.extend_from_slice(&0u32.to_be_bytes()); // x
+    region.extend_from_slice(&0u32.to_be_bytes()); // y
+    region.push(4); // region flags: external combination operator = REPLACE
+    let refine_flags = (grtemplate & 0x01) | ((tpgron as u8) << 1);
+    region.push(refine_flags);
+    if grtemplate == 0 {
+        // AT: GRAT1 nominal (-1,-1), GRAT2 (-1,-1).
+        region.push((-1i8) as u8);
+        region.push((-1i8) as u8);
+        region.push((-1i8) as u8);
+        region.push((-1i8) as u8);
+    }
+    region.extend_from_slice(&refinement_arith_data(target, reference, grtemplate, tpgron));
+    stream.extend_from_slice(&segment_header(2, 42, &[], 1, region.len() as u32));
+    stream.extend_from_slice(&region);
+
+    stream.extend_from_slice(&segment_header(3, 49, &[], 1, 0));
+    stream
+}
+
 fn emit_symbol_id(w: &mut BitWriter, sym_table: &HuffmanTable, id: usize) {
     let (code, len, _, _) = sym_table
         .encode_value(id as i32)

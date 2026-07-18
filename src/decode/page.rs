@@ -16,7 +16,7 @@ use crate::decode::globals::DecodedGlobals;
 use crate::decode::halftone_region::{decode_halftone_region, parse_halftone_region};
 use crate::decode::pattern_dictionary::{decode_pattern_dictionary, PatternDictionary};
 use crate::decode::refinement::{
-    decode_refinement_region, page_reference_window, parse_refinement_region,
+    decode_refinement_region_templated, page_reference_window, parse_refinement_region,
     REFINEMENT_CONTEXT_COUNT,
 };
 use crate::decode::arith::ArithmeticDecoder;
@@ -430,13 +430,15 @@ pub fn process_document_with_globals(
                 // refinement region segment starts with a fresh context bank.
                 let refine_ctx = ctx.refinement_contexts();
                 let mut dec = ArithmeticDecoder::new(region.data);
-                let refined = decode_refinement_region(
+                let refined = decode_refinement_region_templated(
                     &mut dec,
                     &reference,
                     region.width,
                     region.height,
                     0,
                     0,
+                    region.grtemplate,
+                    region.tpgron,
                     region.grat,
                     refine_ctx,
                     limits,
