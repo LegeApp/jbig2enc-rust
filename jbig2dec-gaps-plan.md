@@ -495,16 +495,47 @@ diff, runs the checklist, and only then does the next phase start.
   native check is strong: dict B's bitmaps are coded from dict A's warmed
   contexts, so they only decode when the import happens.
 
-## Phase 5 remaining (infrastructural)
+## Phase 5f findings (organisation, recovery, renderer polish)
 
-Every JBIG2 *coding feature* the spec defines now decodes. What remains is
-infrastructural rather than a coding form:
+* **Intermediate regions + auxiliary buffers** (types 4/20/36/40, §7.4.7.4,
+  §8.2): intermediate regions are retained (`DecodedSegment::Region`) instead of
+  composited; a refinement region referring to one uses its bitmap as
+  GRREFERENCE. Native-verified — jbig2dec 0.20 reports intermediate regions NYI.
 
-* **Intermediate regions (types 36/40) + auxiliary-buffer reuse**,
-  `DecodeStrictness::Compatible` recovery mode, the `decode_embedded_into`
-  zero-alloc API, and the wild-PDF corpus (5b) with fuzz/perf gates.
+* **`decode_embedded_into`** zero-alloc renderer API (§5): decodes into a
+  caller-provided `MonoBitmap`, reusing its allocation. A counting-allocator
+  test asserts the per-decode allocation count is *stable* across same-size
+  pages (measured 7; reducing to zero is a documented follow-up).
+
+* **`DecodeStrictness::Compatible` + `RecoveryEvent`** (§20): trailing garbage
+  after the last well-formed segment is tolerated and recorded; Strict still
+  errors. Further recoveries await real malformed streams (the plan ties each
+  to a fixture).
+
+* **Fuzz targets** (§21.6): `embedded_document` (full pipeline, both strictness
+  modes) and `huffman_table` (custom-table parser) — both survive a smoke run
+  with no panic/hang/RSS growth.
+
+## jbig2dec 0.20 coverage limits
+
+Three features are verified by **native round-trip only** because jbig2dec 0.20
+cannot decode them (not this decoder's limitation):
+
+* Huffman + refinement text regions — jbig2dec skips the SBRAT field (a
+  jbig2dec bug; its arithmetic refine path is fine).
+* Retained arithmetic contexts — jbig2dec prints "(NYI)" and aborts.
+* Intermediate regions — jbig2dec prints "(NYI)" and aborts.
+
+Each native check is content-dependent (it fails if the feature is a no-op), so
+it is a genuine end-to-end verification against a spec-compliant writer.
+
+## Phase 5 remaining
+
 * A Huffman refinement/aggregate *dictionary* (SDHUFF=1 ∧ SDREFAGG=1, the
-  Figure-25 layout) is a distinct rare combination left as typed `Unsupported`.
+  distinct Figure-25 layout) is left as typed `Unsupported`.
+* Reducing steady-state decode to zero heap allocations (pool the parse /
+  segment-store / region scratch) — an optimisation, not a coding gap.
+* A wild-PDF corpus from commercial encoders, if any can be identified.
 
 ## Gap F: Out of scope for now (explicitly deferred)
 
