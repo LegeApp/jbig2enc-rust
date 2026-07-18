@@ -18,13 +18,27 @@ use crate::decode::arith::ArithmeticDecoder;
 use crate::decode::error::{DecodeError, LimitError, UnsupportedFeature, usize_from_u32};
 use crate::decode::generic::decode_generic_bitmap;
 use crate::decode::huffman::{standard_table, BitReader, HuffmanTable, HuffmanValue};
+use crate::decode::iaid::IaidContexts;
 use crate::decode::integer::{DecodedInteger, IntegerContexts};
 use crate::decode::mmr::decode_mmr_bitmap;
+use crate::decode::refinement::{decode_refinement_region_templated, REFINEMENT_CONTEXT_COUNT};
 use crate::shared::bitmap::MonoBitmap;
 use crate::shared::int_proc::IntProc;
 use crate::shared::limits::DecodeLimits;
 use crate::shared::mq_table::MqContext;
 use crate::shared::reader::Reader;
+
+/// `ceil(log2(v))` for symbol-ID code lengths (0 for `v <= 1`).
+#[inline]
+fn ceil_log2(v: u32) -> u32 {
+    if v <= 1 {
+        0
+    } else if v.is_power_of_two() {
+        v.trailing_zeros()
+    } else {
+        32 - (v - 1).leading_zeros()
+    }
+}
 
 /// A decoded symbol dictionary: the exported symbols, shareable across pages.
 pub struct SymbolDictionary {
@@ -57,7 +71,9 @@ pub fn decode_symbol_dictionary(
     huffman_tables: &[Arc<HuffmanTable>],
     limits: &DecodeLimits,
     int_ctx: &mut IntegerContexts,
+    iaid_ctx: &mut IaidContexts,
     generic_ctx: &mut [MqContext],
+    refine_ctx: &mut [MqContext],
 ) -> Result<SymbolDictionary, DecodeError> {
     let mut r = Reader::new(payload);
 
@@ -66,9 +82,7 @@ pub fn decode_symbol_dictionary(
     let sdhuff = flags & 0x0001 != 0;
     let sdrefagg = flags & 0x0002 != 0;
     let sdtemplate = ((flags >> 10) & 0x0003) as u8;
-    if sdrefagg {
-        return Err(DecodeError::Unsupported(UnsupportedFeature::SymbolRefinement));
-    }
+    let sdrtemplate = ((flags >> 12) & 0x0001) as u8;
     // §7.4.2.1.2 SDAT: present only when SDHUFF=0. Template 0 carries 4 adaptive
     // pixels; templates 1–3 carry a single adaptive pixel.
     let mut at = [(0i8, 0i8); 4];
@@ -80,7 +94,16 @@ pub fn decode_symbol_dictionary(
             *slot = (ax, ay);
         }
     }
-    // SDRAT (refinement AT) is only present when SDREFAGG=1, which we rejected.
+    // §7.4.2.1.3 SDRAT: refinement AT, present only when SDREFAGG=1 and
+    // SDRTEMPLATE=0 (GRTEMPLATE-0 uses one target AT pair here).
+    let mut sdrat: (i8, i8) = (-1, -1);
+    if sdrefagg && sdrtemplate == 0 {
+        let x = r.read_i8()?;
+        let y = r.read_i8()?;
+        let _x2 = r.read_i8()?;
+        let _y2 = r.read_i8()?;
+        sdrat = (x, y);
+    }
 
     // §7.4.2.1.5/.6 exported and new symbol counts.
     let num_ex = r.read_u32_be()?;
@@ -124,10 +147,24 @@ pub fn decode_symbol_dictionary(
         );
     }
 
-    // Fresh coder state: zero the reused context banks.
+    // Fresh coder state: zero the reused context banks (§7.4.4.3: each
+    // dictionary segment starts every arithmetic statistic at zero).
     int_ctx.reset();
     for c in generic_ctx.iter_mut() {
         *c = MqContext(0);
+    }
+    // SBSYMCODELEN for the refinement symbol-ID (§6.5.8.2.3).
+    let code_len = ceil_log2(total as u32) as u8;
+    if sdrefagg {
+        iaid_ctx.reset_for_bits(code_len)?;
+        if refine_ctx.len() < REFINEMENT_CONTEXT_COUNT {
+            return Err(DecodeError::Overflow {
+                operation: "refinement context array too small",
+            });
+        }
+        for c in refine_ctx.iter_mut() {
+            *c = MqContext(0);
+        }
     }
 
     let mut dec = ArithmeticDecoder::new(data);
@@ -201,15 +238,32 @@ pub fn decode_symbol_dictionary(
                 }));
             }
 
-            let bitmap = decode_generic_bitmap(
-                &mut dec,
-                sym_width as u32,
-                hc_height as u32,
-                sdtemplate,
-                at,
-                generic_ctx,
-                limits,
-            )?;
+            let bitmap = if sdrefagg {
+                decode_refagg_symbol(
+                    &mut dec,
+                    int_ctx,
+                    iaid_ctx,
+                    refine_ctx,
+                    imported,
+                    &new_symbols,
+                    code_len,
+                    sdrtemplate,
+                    sdrat,
+                    sym_width as u32,
+                    hc_height as u32,
+                    limits,
+                )?
+            } else {
+                decode_generic_bitmap(
+                    &mut dec,
+                    sym_width as u32,
+                    hc_height as u32,
+                    sdtemplate,
+                    at,
+                    generic_ctx,
+                    limits,
+                )?
+            };
             new_symbols.push(Arc::new(bitmap));
         }
     }
@@ -221,6 +275,79 @@ pub fn decode_symbol_dictionary(
     Ok(SymbolDictionary {
         exported_symbols: exported.into_boxed_slice(),
     })
+}
+
+/// Decode one refinement/aggregate-coded new symbol (SDREFAGG=1, arithmetic,
+/// T.88 §6.5.8.2). Only the REFAGGNINST=1 fast path (§6.5.8.2.2) is implemented;
+/// true aggregates (REFAGGNINST>1, an internal text region) are rejected.
+#[allow(clippy::too_many_arguments)]
+fn decode_refagg_symbol(
+    dec: &mut ArithmeticDecoder<'_>,
+    int_ctx: &mut IntegerContexts,
+    iaid_ctx: &mut IaidContexts,
+    refine_ctx: &mut [MqContext],
+    imported: &[Arc<MonoBitmap>],
+    new_symbols: &[Arc<MonoBitmap>],
+    code_len: u8,
+    sdrtemplate: u8,
+    sdrat: (i8, i8),
+    sym_width: u32,
+    hc_height: u32,
+    limits: &DecodeLimits,
+) -> Result<MonoBitmap, DecodeError> {
+    // §6.5.8.2.1 number of instances in the aggregation.
+    let refagg_ninst = match int_ctx.decode(dec, IntProc::Iaai) {
+        DecodedInteger::Value(v) => v,
+        DecodedInteger::OutOfBand => {
+            return Err(DecodeError::Malformed {
+                reason: "OOB where REFAGGNINST expected",
+            });
+        }
+    };
+    if refagg_ninst != 1 {
+        // True aggregate coding (an internal text region) is deferred.
+        return Err(DecodeError::Unsupported(UnsupportedFeature::SymbolRefinement));
+    }
+
+    // §6.5.8.2.2: symbol ID, then refinement offsets, then refine the reference.
+    let id = iaid_ctx.decode(dec, code_len) as usize;
+    let rdx = match int_ctx.decode(dec, IntProc::Iardx) {
+        DecodedInteger::Value(v) => v,
+        DecodedInteger::OutOfBand => {
+            return Err(DecodeError::Malformed { reason: "OOB for RDX" });
+        }
+    };
+    let rdy = match int_ctx.decode(dec, IntProc::Iardy) {
+        DecodedInteger::Value(v) => v,
+        DecodedInteger::OutOfBand => {
+            return Err(DecodeError::Malformed { reason: "OOB for RDY" });
+        }
+    };
+
+    // IBOI = SBSYMS[IDI] = imported ++ already-decoded new symbols.
+    let reference = if id < imported.len() {
+        &imported[id]
+    } else if id - imported.len() < new_symbols.len() {
+        &new_symbols[id - imported.len()]
+    } else {
+        return Err(DecodeError::Malformed {
+            reason: "refinement symbol id out of range",
+        });
+    };
+
+    decode_refinement_region_templated(
+        dec,
+        reference,
+        sym_width,
+        hc_height,
+        rdx,
+        rdy,
+        sdrtemplate,
+        false,
+        sdrat,
+        refine_ctx,
+        limits,
+    )
 }
 
 /// Select the standard or custom Huffman table for a two-bit selection field.

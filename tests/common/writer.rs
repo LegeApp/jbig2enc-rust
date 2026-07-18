@@ -16,6 +16,8 @@
 #![allow(dead_code)]
 
 use jbig2enc_rust::decode::huffman::HuffmanTable;
+use jbig2enc_rust::jbig2sym::BitImage;
+use jbig2enc_rust::shared::int_proc::IntProc;
 use jbig2enc_rust::Jbig2ArithCoder;
 
 /// A simple mutable test bitmap (row-major bool grid, `false` = white).
@@ -792,6 +794,125 @@ pub fn refinement_page(
     stream.extend_from_slice(&region);
 
     stream.extend_from_slice(&segment_header(3, 49, &[], 1, 0));
+    stream
+}
+
+// ------------------------------------------------------------------------
+// SDREFAGG symbol-dictionary writer (Phase 5e oracle support)
+// ------------------------------------------------------------------------
+
+fn to_bitimage(bm: &TestBitmap) -> BitImage {
+    let mut img = BitImage::new(bm.width, bm.height).unwrap();
+    for y in 0..bm.height {
+        for x in 0..bm.width {
+            if bm.get(x, y) {
+                img.set(x, y, true);
+            }
+        }
+    }
+    img
+}
+
+/// Build an SDREFAGG=1 arithmetic symbol-dictionary payload (SDHUFF=0,
+/// SDTEMPLATE=0, SDRTEMPLATE=0, REFAGGNINST=1). Each new symbol `targets[i]`
+/// is coded as a refinement (GRREFERENCEDX/DY = 0) of `imported[refs[i]]`, and
+/// every new symbol is exported. `imported` are the referred dictionary's
+/// exported symbols (the refinement references). All targets share one height
+/// class; widths must be non-decreasing.
+pub fn arith_refagg_dict_payload(
+    imported: &[TestBitmap],
+    refs: &[usize],
+    targets: &[TestBitmap],
+) -> Vec<u8> {
+    assert_eq!(refs.len(), targets.len());
+    let num_new = targets.len();
+    let total = imported.len() + num_new;
+    let code_len = log2_ceil(total).max(1);
+    let height = targets[0].height;
+
+    let mut coder = Jbig2ArithCoder::new();
+    // One height class: HCHEIGHT from 0.
+    coder.encode_integer(IntProc::Iadh, height as i32).unwrap();
+    let mut prev_w = 0i32;
+    for (i, t) in targets.iter().enumerate() {
+        coder
+            .encode_integer(IntProc::Iadw, t.width as i32 - prev_w)
+            .unwrap();
+        prev_w = t.width as i32;
+        // §6.5.8.2: REFAGGNINST=1, symbol id, RDX=RDY=0, refinement.
+        coder.encode_integer(IntProc::Iaai, 1).unwrap();
+        coder.encode_iaid(refs[i] as u32, code_len).unwrap();
+        coder.encode_integer(IntProc::Iardx, 0).unwrap();
+        coder.encode_integer(IntProc::Iardy, 0).unwrap();
+        let tbi = to_bitimage(t);
+        let rbi = to_bitimage(&imported[refs[i]]);
+        coder
+            .encode_refinement_region(&tbi, &rbi, 0, 0, 0, &[(-1, -1)])
+            .unwrap();
+    }
+    coder.encode_oob(IntProc::Iadw).unwrap();
+    // Export: not-exported run over the imported symbols, exported run over new.
+    coder
+        .encode_integer(IntProc::Iaex, imported.len() as i32)
+        .unwrap();
+    coder.encode_integer(IntProc::Iaex, num_new as i32).unwrap();
+    coder.flush(true);
+    let data = coder.as_bytes().to_vec();
+
+    let mut payload = Vec::new();
+    // §7.4.2.1.1 flags: SDREFAGG=1 (bit1), SDHUFF=0, SDTEMPLATE=0, SDRTEMPLATE=0.
+    payload.extend_from_slice(&0x0002u16.to_be_bytes());
+    // §7.4.2.1.2 SDAT (template 0, 4 pairs) nominal.
+    for (ax, ay) in [(3i8, -1i8), (-3, -1), (2, -2), (-2, -2)] {
+        payload.push(ax as u8);
+        payload.push(ay as u8);
+    }
+    // §7.4.2.1.3 SDRAT (SDRTEMPLATE=0, 2 pairs) nominal (-1,-1).
+    for (ax, ay) in [(-1i8, -1i8), (-1, -1)] {
+        payload.push(ax as u8);
+        payload.push(ay as u8);
+    }
+    payload.extend_from_slice(&(num_new as u32).to_be_bytes()); // SDNUMEXSYMS
+    payload.extend_from_slice(&(num_new as u32).to_be_bytes()); // SDNUMNEWSYMS
+    payload.extend_from_slice(&data);
+    payload
+}
+
+/// A page: a Huffman symbol dictionary of base symbols (segment 1), an SDREFAGG
+/// dictionary refining them (segment 2), and a Huffman text region placing the
+/// refined symbols (segment 3).
+pub fn refagg_page(
+    page_w: u32,
+    page_h: u32,
+    base: &[TestBitmap],
+    refs: &[usize],
+    targets: &[TestBitmap],
+    placements: &[(usize, i32)],
+) -> Vec<u8> {
+    let mut stream = Vec::new();
+    let page_data = page_info_payload(page_w, page_h);
+    stream.extend_from_slice(&segment_header(0, 48, &[], 1, page_data.len() as u32));
+    stream.extend_from_slice(&page_data);
+
+    // Segment 1: Huffman symbol dictionary of base symbols.
+    let base_dict = huffman_symbol_dict_payload(base);
+    stream.extend_from_slice(&segment_header(1, 0, &[], 1, base_dict.len() as u32));
+    stream.extend_from_slice(&base_dict);
+
+    // Segment 2: SDREFAGG dictionary refining the base symbols (refers seg 1).
+    let refagg = arith_refagg_dict_payload(base, refs, targets);
+    stream.extend_from_slice(&segment_header(2, 0, &[1], 1, refagg.len() as u32));
+    stream.extend_from_slice(&refagg);
+
+    // Segment 3: Huffman text region placing the refined symbols (refers seg 2).
+    let widths: Vec<u32> = targets.iter().map(|s| s.width).collect();
+    let heights: Vec<u32> = targets.iter().map(|s| s.height).collect();
+    let region =
+        huffman_text_region_payload(page_w, page_h, targets.len(), &widths, &heights, placements, false);
+    stream.extend_from_slice(&segment_header(3, 6, &[2], 1, region.len() as u32));
+    stream.extend_from_slice(&region);
+
+    stream.extend_from_slice(&segment_header(4, 49, &[], 1, 0));
     stream
 }
 

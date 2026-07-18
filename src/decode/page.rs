@@ -124,11 +124,19 @@ pub(crate) fn decode_symbol_dict_into(
     let tables = local.gather_huffman_tables(&seg.header.referred_to, globals);
 
     ctx.ensure_generic();
-    // Disjoint field borrows: generic + integer context banks at once.
+    if ctx.refinement_contexts.len() < REFINEMENT_CONTEXT_COUNT {
+        ctx.refinement_contexts
+            .resize(REFINEMENT_CONTEXT_COUNT, Default::default());
+    }
+    // Disjoint field borrows: generic, integer, IAID, and refinement banks.
     let generic = &mut ctx.generic_contexts[..crate::decode::context::GENERIC_CONTEXT_COUNT];
     let int_ctx = &mut ctx.integer_contexts;
-    let dict = decode_symbol_dictionary(seg.data, &imported, &tables, limits, int_ctx, generic)
-        .map_err(|source| annotate(seg.header.number, source))?;
+    let iaid_ctx = &mut ctx.iaid_contexts;
+    let refine_ctx = &mut ctx.refinement_contexts[..REFINEMENT_CONTEXT_COUNT];
+    let dict = decode_symbol_dictionary(
+        seg.data, &imported, &tables, limits, int_ctx, iaid_ctx, generic, refine_ctx,
+    )
+    .map_err(|source| annotate(seg.header.number, source))?;
 
     let arc = Arc::new(dict);
     local.insert(
