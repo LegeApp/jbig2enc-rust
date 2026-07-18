@@ -75,6 +75,22 @@ impl SegmentStore {
         self.retained.insert(number, Arc::new(ctx));
     }
 
+    /// Resolve an intermediate region's retained bitmap (auxiliary buffer,
+    /// T.88 §7.4.7.4), the first referred region found in `self` then `globals`.
+    pub fn referred_region<'a>(
+        &'a self,
+        referred: &[u32],
+        globals: Option<&'a SegmentStore>,
+    ) -> Option<&'a Arc<MonoBitmap>> {
+        for &rn in referred {
+            match self.values.get(&rn).or_else(|| globals.and_then(|g| g.get(rn))) {
+                Some(DecodedSegment::Region(bm)) => return Some(bm),
+                _ => continue,
+            }
+        }
+        None
+    }
+
     /// The retained contexts of the *last* referred symbol-dictionary segment
     /// that retained them (T.88 §6.5.5 step 3), checking `self` then `globals`.
     pub fn last_retained(

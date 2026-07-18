@@ -267,22 +267,20 @@ pub fn process_document_with_globals(
                     seg.data, &symbols, &tables, limits, int_ctx, iaid_ctx, refine_ctx,
                 )
                 .map_err(|source| annotate(seg.header.number, source))?;
-                let target =
-                    resolve_page(&mut pages, current, seg.header.page_association)?;
-                grow_if_unknown(
-                    &mut pages[target].bitmap,
-                    unknown_height[target],
-                    result.y,
-                    result.bitmap.height(),
-                    limits,
-                )?;
-                compose_region(
-                    &mut pages[target].bitmap,
+                place_or_store(
+                    matches!(ty, Some(SegmentType::IntermediateTextRegion)),
+                    seg.header.number,
+                    &mut store,
+                    &mut pages,
+                    &unknown_height,
+                    current,
+                    seg.header.page_association,
                     result.bitmap,
                     result.x,
                     result.y,
                     result.comb_operator,
-                );
+                    limits,
+                )?;
                 continue;
             }
             _ => {}
@@ -343,21 +341,20 @@ pub fn process_document_with_globals(
                 }
                 let region_bm =
                     decode_generic_region(&region, limits, ctx.generic_contexts())?;
-                let target = resolve_page(&mut pages, current, seg.header.page_association)?;
-                grow_if_unknown(
-                    &mut pages[target].bitmap,
-                    unknown_height[target],
-                    region.y,
-                    region_bm.height(),
-                    limits,
-                )?;
-                compose_region(
-                    &mut pages[target].bitmap,
+                place_or_store(
+                    matches!(ty, Some(SegmentType::IntermediateGenericRegion)),
+                    seg.header.number,
+                    &mut store,
+                    &mut pages,
+                    &unknown_height,
+                    current,
+                    seg.header.page_association,
                     region_bm,
                     region.x,
                     region.y,
                     region.comb_operator,
-                );
+                    limits,
+                )?;
             }
             // §7.4.10 end of stripe: a 4-byte end row. For an unknown-height
             // page this communicates the page size, so grow to include it.
@@ -415,59 +412,68 @@ pub fn process_document_with_globals(
                     ctx.generic_contexts(),
                 )
                 .map_err(|source| annotate(seg.header.number, source))?;
-                let target = resolve_page(&mut pages, current, seg.header.page_association)?;
-                grow_if_unknown(
-                    &mut pages[target].bitmap,
-                    unknown_height[target],
-                    region.y,
-                    region_bm.height(),
-                    limits,
-                )?;
-                compose_region(
-                    &mut pages[target].bitmap,
+                place_or_store(
+                    matches!(ty, Some(SegmentType::IntermediateHalftoneRegion)),
+                    seg.header.number,
+                    &mut store,
+                    &mut pages,
+                    &unknown_height,
+                    current,
+                    seg.header.page_association,
                     region_bm,
                     region.x,
                     region.y,
                     region.comb_operator,
-                );
+                    limits,
+                )?;
             }
             Some(
                 SegmentType::ImmediateGenericRefinementRegion
-                | SegmentType::ImmediateLosslessGenericRefinementRegion,
+                | SegmentType::ImmediateLosslessGenericRefinementRegion
+                | SegmentType::IntermediateGenericRefinementRegion,
             ) => {
-                // T.88 §7.4.7: an *immediate* generic refinement region with no
-                // referred region segment refines the page buffer in place; the
-                // reference is the page-buffer window under the region box
-                // (§7.4.7.4) and the external combination operator is REPLACE.
-                // Refinement regions that refer to another region segment reuse a
-                // retained intermediate/auxiliary buffer, which the Phase 3
-                // decoder does not keep — those stay Unsupported (Phase 5).
-                if !seg.header.referred_to.is_empty() {
-                    return Err(DecodeError::Unsupported(
-                        UnsupportedFeature::RefinementRegion,
-                    ));
-                }
+                // T.88 §7.4.7.4: GRREFERENCE is the referred region segment's
+                // auxiliary buffer (an intermediate region's stored bitmap) when
+                // this segment refers to one, otherwise the page-buffer window
+                // under the region box. GRREFERENCEDX/DY = 0 (Table 35).
                 let region = parse_refinement_region(seg.data)
                     .map_err(|source| annotate(seg.header.number, source))?;
-                let target =
-                    resolve_page(&mut pages, current, seg.header.page_association)?;
-                grow_if_unknown(
-                    &mut pages[target].bitmap,
-                    unknown_height[target],
-                    region.y,
-                    region.height,
-                    limits,
-                )?;
-                let reference = page_reference_window(
-                    &pages[target].bitmap,
-                    region.x,
-                    region.y,
-                    region.width,
-                    region.height,
-                    limits,
-                )?;
-                // §7.4.7.5 step 2: reset all arithmetic statistics to zero. Each
-                // refinement region segment starts with a fresh context bank.
+                let intermediate =
+                    matches!(ty, Some(SegmentType::IntermediateGenericRefinementRegion));
+
+                let (reference, ext_comb) = if seg.header.referred_to.is_empty() {
+                    // No referred region: refine the page buffer window in place;
+                    // §7.4.7.5 step 1 external combination operator is REPLACE.
+                    let target =
+                        resolve_page(&mut pages, current, seg.header.page_association)?;
+                    grow_if_unknown(
+                        &mut pages[target].bitmap,
+                        unknown_height[target],
+                        region.y,
+                        region.height,
+                        limits,
+                    )?;
+                    let reference = page_reference_window(
+                        &pages[target].bitmap,
+                        region.x,
+                        region.y,
+                        region.width,
+                        region.height,
+                        limits,
+                    )?;
+                    (reference, 4u8)
+                } else {
+                    // Referred region: its retained bitmap is GRREFERENCE.
+                    let src = store
+                        .referred_region(&seg.header.referred_to, globals_store)
+                        .ok_or(DecodeError::MissingReferredSegment {
+                            segment: seg.header.number,
+                            referred: seg.header.referred_to.first().copied().unwrap_or(0),
+                        })?;
+                    ((**src).clone(), region.comb_operator)
+                };
+
+                // §7.4.7.5 step 2: fresh arithmetic statistics per segment.
                 let refine_ctx = ctx.refinement_contexts();
                 let mut dec = ArithmeticDecoder::new(region.data);
                 let refined = decode_refinement_region_templated(
@@ -484,19 +490,20 @@ pub fn process_document_with_globals(
                     limits,
                 )
                 .map_err(|source| annotate(seg.header.number, source))?;
-                compose_region(
-                    &mut pages[target].bitmap,
+                place_or_store(
+                    intermediate,
+                    seg.header.number,
+                    &mut store,
+                    &mut pages,
+                    &unknown_height,
+                    current,
+                    seg.header.page_association,
                     refined,
                     region.x,
                     region.y,
-                    // §7.4.7.5 step 1: no referred region => REPLACE.
-                    4,
-                );
-            }
-            Some(SegmentType::IntermediateGenericRefinementRegion) => {
-                return Err(DecodeError::Unsupported(
-                    UnsupportedFeature::RefinementRegion,
-                ));
+                    ext_comb,
+                    limits,
+                )?;
             }
             Some(SegmentType::Tables) => {
                 decode_tables_into(seg, &mut store, limits)?;
@@ -567,6 +574,52 @@ fn compose_region(
         return;
     }
     page.combine(&region, x as i32, y as i32, op);
+}
+
+/// Whether a region segment type is *intermediate* (its bitmap is retained as an
+/// auxiliary buffer for a later refinement, not drawn on the page — T.88 §8.2).
+#[inline]
+fn is_intermediate(ty: SegmentType) -> bool {
+    matches!(
+        ty,
+        SegmentType::IntermediateTextRegion
+            | SegmentType::IntermediateHalftoneRegion
+            | SegmentType::IntermediateGenericRegion
+            | SegmentType::IntermediateGenericRefinementRegion
+    )
+}
+
+/// Either store an intermediate region's bitmap as an auxiliary buffer, or
+/// composite an immediate region onto its page.
+#[allow(clippy::too_many_arguments)]
+fn place_or_store(
+    intermediate: bool,
+    seg_number: u32,
+    store: &mut SegmentStore,
+    pages: &mut [DecodedPage],
+    unknown_height: &[bool],
+    current: Option<usize>,
+    page_association: u32,
+    region_bm: MonoBitmap,
+    x: u32,
+    y: u32,
+    comb: u8,
+    limits: &DecodeLimits,
+) -> Result<(), DecodeError> {
+    if intermediate {
+        store.insert(seg_number, DecodedSegment::Region(Arc::new(region_bm)))?;
+    } else {
+        let target = resolve_page(pages, current, page_association)?;
+        grow_if_unknown(
+            &mut pages[target].bitmap,
+            unknown_height[target],
+            y,
+            region_bm.height(),
+            limits,
+        )?;
+        compose_region(&mut pages[target].bitmap, region_bm, x, y, comb);
+    }
+    Ok(())
 }
 
 /// Grow an unknown-height page so a region of height `h` placed at row `y`

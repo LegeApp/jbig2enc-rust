@@ -13,14 +13,10 @@
 pub enum UnsupportedFeature {
     #[error("unknown segment data length")]
     UnknownSegmentLength,
-    #[error("MMR (Group 4) coding")]
-    MmrCoding,
     #[error("symbol dictionary / text region segment")]
     SymbolCoding,
     #[error("pattern dictionary / halftone region segment")]
     HalftoneCoding,
-    #[error("refinement region segment")]
-    RefinementRegion,
     #[error("segment type {0} not handled in this phase")]
     SegmentType(u8),
     #[error("symbol dictionary refinement / aggregate coding")]
@@ -150,10 +146,10 @@ mod tests {
         let e: DecodeError = ParseError::InvalidFileHeader.into();
         assert!(matches!(e, DecodeError::Parse(ParseError::InvalidFileHeader)));
 
-        let e: DecodeError = UnsupportedFeature::MmrCoding.into();
+        let e: DecodeError = UnsupportedFeature::SymbolCoding.into();
         assert!(matches!(
             e,
-            DecodeError::Unsupported(UnsupportedFeature::MmrCoding)
+            DecodeError::Unsupported(UnsupportedFeature::SymbolCoding)
         ));
     }
 

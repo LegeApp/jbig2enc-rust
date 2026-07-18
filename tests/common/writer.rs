@@ -1357,6 +1357,48 @@ pub fn retained_context_page(
     stream
 }
 
+/// A page with an intermediate generic region (seg 1, type 36 — stored as an
+/// auxiliary buffer, not drawn) and an immediate generic refinement region
+/// (seg 2, type 42, referring seg 1) that refines it and composites onto the
+/// page (T.88 §7.4.7.4: GRREFERENCE = the referred region's buffer, GRREFDX/DY
+/// = 0). `reference` and `target` are the same size.
+pub fn intermediate_refine_page(reference: &TestBitmap, target: &TestBitmap) -> Vec<u8> {
+    assert_eq!(reference.width, target.width);
+    assert_eq!(reference.height, target.height);
+    let w = reference.width;
+    let h = reference.height;
+    let mut stream = Vec::new();
+
+    let page_data = page_info_payload(w, h);
+    stream.extend_from_slice(&segment_header(0, 48, &[], 1, page_data.len() as u32));
+    stream.extend_from_slice(&page_data);
+
+    // Intermediate generic region (type 36): defines the reference bitmap.
+    let gen_region = generic_region_payload(reference, 0, &nominal_at(0), false, 0);
+    stream.extend_from_slice(&segment_header(1, 36, &[], 1, gen_region.len() as u32));
+    stream.extend_from_slice(&gen_region);
+
+    // Immediate generic refinement region (type 42) referring to segment 1.
+    let mut region = Vec::new();
+    region.extend_from_slice(&w.to_be_bytes());
+    region.extend_from_slice(&h.to_be_bytes());
+    region.extend_from_slice(&0u32.to_be_bytes()); // x
+    region.extend_from_slice(&0u32.to_be_bytes()); // y
+    region.push(0); // region flags: external combination operator = OR
+    region.push(0); // refinement flags: GRTEMPLATE=0, TPGRON=0
+    // AT: GRAT1 nominal (-1,-1), GRAT2 (-1,-1).
+    region.push((-1i8) as u8);
+    region.push((-1i8) as u8);
+    region.push((-1i8) as u8);
+    region.push((-1i8) as u8);
+    region.extend_from_slice(&refinement_arith_data(target, reference, 0, false));
+    stream.extend_from_slice(&segment_header(2, 42, &[1], 1, region.len() as u32));
+    stream.extend_from_slice(&region);
+
+    stream.extend_from_slice(&segment_header(3, 49, &[], 1, 0));
+    stream
+}
+
 fn emit_symbol_id(w: &mut BitWriter, sym_table: &HuffmanTable, id: usize) {
     let (code, len, _, _) = sym_table
         .encode_value(id as i32)
