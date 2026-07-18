@@ -176,6 +176,137 @@ pub fn decode_generic_bitmap(
     Ok(bitmap)
 }
 
+/// Skip-aware generic bitmap decode (T.88 §6.2.5.7 USESKIP / halftone
+/// HENABLESKIP §6.6.5.1): pixels where `skip` is set are forced to 0 and *not*
+/// arithmetically decoded; their neighbours still contribute to later contexts
+/// as 0. Per-pixel (no fast rolling path) — used only for the rare skip case.
+/// TPGDON is not combined with skip here (the gray-scale planes never set it).
+#[allow(clippy::too_many_arguments)]
+pub fn decode_generic_bitmap_skip(
+    decoder: &mut ArithmeticDecoder<'_>,
+    width: u32,
+    height: u32,
+    template: u8,
+    at: [(i8, i8); 4],
+    contexts: &mut [MqContext],
+    limits: &DecodeLimits,
+    skip: &MonoBitmap,
+) -> Result<MonoBitmap, DecodeError> {
+    if (contexts.len() as u64) < (1u64 << 16) {
+        return Err(DecodeError::Overflow {
+            operation: "generic bitmap context array too small",
+        });
+    }
+    let mut bitmap = MonoBitmap::new(width, height, false, limits)?;
+    if width == 0 || height == 0 {
+        return Ok(bitmap);
+    }
+    let stride = bitmap.stride_words() as usize;
+    let zero_row = vec![0u32; stride];
+    let mut cur = vec![0u32; stride];
+    for y in 0..height {
+        for w in cur.iter_mut() {
+            *w = 0;
+        }
+        let prev1: &[u32] = if y >= 1 { bitmap.row(y - 1) } else { &zero_row };
+        let prev2: &[u32] = if y >= 2 { bitmap.row(y - 2) } else { &zero_row };
+        for x in 0..width {
+            if skip.get(x, y) {
+                continue; // implicitly 0, no arithmetic bit consumed
+            }
+            let ctx = pixel_context(template, &cur, prev1, prev2, width, x as i64, &at);
+            let bit = decoder.decode_bit(&mut contexts[ctx]);
+            if bit {
+                let xu = x as usize;
+                cur[xu >> 5] |= 1u32 << (31 - (xu & 31));
+            }
+        }
+        bitmap.row_mut(y).copy_from_slice(&cur);
+    }
+    Ok(bitmap)
+}
+
+/// Per-pixel context for any template, matching the per-template decoders'
+/// bit layouts. Used by the skip-aware path.
+#[inline]
+fn pixel_context(
+    template: u8,
+    cur: &[u32],
+    prev1: &[u32],
+    prev2: &[u32],
+    width: u32,
+    xi: i64,
+    at: &[(i8, i8); 4],
+) -> usize {
+    let a1 = (at[0].0 as i64, at[0].1 as i64);
+    match template {
+        0 => {
+            let a2 = (at[1].0 as i64, at[1].1 as i64);
+            let a3 = (at[2].0 as i64, at[2].1 as i64);
+            let a4 = (at[3].0 as i64, at[3].1 as i64);
+            let p = |dx: i64, dy: i64| at_pixel(cur, prev1, prev2, width, xi, dx, dy);
+            ((p(a4.0, a4.1) << 15)
+                | (p(-1, -2) << 14)
+                | (p(0, -2) << 13)
+                | (p(1, -2) << 12)
+                | (p(a3.0, a3.1) << 11)
+                | (p(a2.0, a2.1) << 10)
+                | (p(-2, -1) << 9)
+                | (p(-1, -1) << 8)
+                | (p(0, -1) << 7)
+                | (p(1, -1) << 6)
+                | (p(2, -1) << 5)
+                | (p(a1.0, a1.1) << 4)
+                | (p(-4, 0) << 3)
+                | (p(-3, 0) << 2)
+                | (p(-2, 0) << 1)
+                | p(-1, 0)) as usize
+        }
+        1 => {
+            let a = at_pixel(cur, prev1, prev2, width, xi, a1.0, a1.1);
+            (sample(cur, width, xi - 1)
+                | (sample(cur, width, xi - 2) << 1)
+                | (sample(cur, width, xi - 3) << 2)
+                | (a << 3)
+                | (sample(prev1, width, xi + 2) << 4)
+                | (sample(prev1, width, xi + 1) << 5)
+                | (sample(prev1, width, xi) << 6)
+                | (sample(prev1, width, xi - 1) << 7)
+                | (sample(prev1, width, xi - 2) << 8)
+                | (sample(prev2, width, xi + 2) << 9)
+                | (sample(prev2, width, xi + 1) << 10)
+                | (sample(prev2, width, xi) << 11)
+                | (sample(prev2, width, xi - 1) << 12)) as usize
+        }
+        2 => {
+            let a = at_pixel(cur, prev1, prev2, width, xi, a1.0, a1.1);
+            (sample(cur, width, xi - 1)
+                | (sample(cur, width, xi - 2) << 1)
+                | (a << 2)
+                | (sample(prev1, width, xi + 1) << 3)
+                | (sample(prev1, width, xi) << 4)
+                | (sample(prev1, width, xi - 1) << 5)
+                | (sample(prev1, width, xi - 2) << 6)
+                | (sample(prev2, width, xi + 1) << 7)
+                | (sample(prev2, width, xi) << 8)
+                | (sample(prev2, width, xi - 1) << 9)) as usize
+        }
+        _ => {
+            let a = at_pixel(cur, prev1, prev2, width, xi, a1.0, a1.1);
+            (sample(cur, width, xi - 1)
+                | (sample(cur, width, xi - 2) << 1)
+                | (sample(cur, width, xi - 3) << 2)
+                | (sample(cur, width, xi - 4) << 3)
+                | (a << 4)
+                | (sample(prev1, width, xi + 1) << 5)
+                | (sample(prev1, width, xi) << 6)
+                | (sample(prev1, width, xi - 1) << 7)
+                | (sample(prev1, width, xi - 2) << 8)
+                | (sample(prev1, width, xi - 3) << 9)) as usize
+        }
+    }
+}
+
 /// Dispatch to the correct template decoder. `template` selects the pixel
 /// neighbourhood (0–3); values outside that range are clamped to 3's behaviour
 /// by the parser (the flags field is only 2 bits wide, so `template <= 3`

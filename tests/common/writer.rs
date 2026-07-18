@@ -916,6 +916,136 @@ pub fn refagg_page(
     stream
 }
 
+// ------------------------------------------------------------------------
+// Halftone HENABLESKIP writer (Phase 5e oracle support)
+// ------------------------------------------------------------------------
+
+/// Build a pattern-dictionary payload (arithmetic, HDTEMPLATE=0, T.88 §7.4.4).
+/// `patterns` are the HDPW×HDPH patterns, index 0..GRAYMAX, laid out side by
+/// side in one collective bitmap coded with AT1 = (-HDPW, 0) per §6.7.5.
+pub fn pattern_dict_payload(patterns: &[TestBitmap], hdpw: u32, hdph: u32) -> Vec<u8> {
+    let graymax = patterns.len() as u32 - 1;
+    // Collective bitmap: patterns concatenated left to right.
+    let mut collective = TestBitmap::new((graymax + 1) * hdpw, hdph);
+    for (i, p) in patterns.iter().enumerate() {
+        for y in 0..hdph {
+            for x in 0..hdpw {
+                if p.get(x, y) {
+                    collective.set(i as u32 * hdpw + x, y, true);
+                }
+            }
+        }
+    }
+    let at = [(-(hdpw as i32) as i8, 0i8), (-3, -1), (2, -2), (-2, -2)];
+    let data = generic_arith_data(&collective, 0, &at, false);
+
+    let mut payload = Vec::new();
+    payload.push(0x00); // flags: HDMMR=0, HDTEMPLATE=0
+    payload.push(hdpw as u8);
+    payload.push(hdph as u8);
+    payload.extend_from_slice(&graymax.to_be_bytes());
+    payload.extend_from_slice(&data);
+    payload
+}
+
+/// Whether grid cell `(ng, mg)` is skipped (its pattern lies outside the
+/// region) — mirrors `decode::halftone_region::compute_skip`.
+fn cell_skipped(
+    ng: u32,
+    mg: u32,
+    hgx: i64,
+    hgy: i64,
+    hrx: i64,
+    hry: i64,
+    hpw: i64,
+    hph: i64,
+    hbw: i64,
+    hbh: i64,
+) -> bool {
+    let x = (hgx + mg as i64 * hry + ng as i64 * hrx) >> 8;
+    let y = (hgy + mg as i64 * hrx - ng as i64 * hry) >> 8;
+    x + hpw <= 0 || x >= hbw || y + hph <= 0 || y >= hbh
+}
+
+/// A page: a pattern dictionary (segment 1) plus a halftone region (segment 2)
+/// with HENABLESKIP=1 and a single gray-plane (2 patterns). `cell_values` gives
+/// the pattern index (0/1) for each non-skipped cell at `[mg][ng]`; the grid is
+/// axis-aligned with HRX = HDPW<<8, HRY = 0 (so square patterns, HDPW=HDPH).
+pub fn halftone_skip_page(
+    page_w: u32,
+    page_h: u32,
+    patterns: &[TestBitmap],
+    hdpw: u32,
+    hgw: u32,
+    hgh: u32,
+    cell_values: &[Vec<bool>],
+) -> Vec<u8> {
+    let hrx = (hdpw as i64) << 8;
+    let hry = 0i64;
+    let (hgx, hgy) = (0i64, 0i64);
+    let hpw = hdpw as i64;
+    let hph = hdpw as i64;
+    let hbw = page_w as i64;
+    let hbh = page_h as i64;
+
+    // Gray plane (HBPP=1): pixel (ng, mg) = pattern index; skipped cells omitted.
+    let mut coder = Jbig2ArithCoder::new();
+    // Build the plane bitmap so causal context reads see the coded values.
+    let mut plane = TestBitmap::new(hgw, hgh);
+    for mg in 0..hgh {
+        for ng in 0..hgw {
+            if cell_values[mg as usize][ng as usize] {
+                plane.set(ng, mg, true);
+            }
+        }
+    }
+    let at = [(3i8, -1i8), (-3, -1), (2, -2), (-2, -2)]; // gray-plane AT (template 0)
+    for mg in 0..hgh {
+        for ng in 0..hgw {
+            if cell_skipped(ng, mg, hgx, hgy, hrx, hry, hpw, hph, hbw, hbh) {
+                continue;
+            }
+            let ctx = context(0, &plane, ng as i64, mg as i64, &at);
+            coder.encode_bit(ctx, plane.get(ng, mg));
+        }
+    }
+    coder.flush(true);
+    let gray_data = coder.as_bytes().to_vec();
+
+    let mut stream = Vec::new();
+    let page_data = page_info_payload(page_w, page_h);
+    stream.extend_from_slice(&segment_header(0, 48, &[], 1, page_data.len() as u32));
+    stream.extend_from_slice(&page_data);
+
+    // Segment 1: pattern dictionary (type 16).
+    let pd = pattern_dict_payload(patterns, hdpw, hdpw);
+    stream.extend_from_slice(&segment_header(1, 16, &[], 1, pd.len() as u32));
+    stream.extend_from_slice(&pd);
+
+    // Segment 2: immediate halftone region (type 22/23) referring to seg 1.
+    let mut region = Vec::new();
+    region.extend_from_slice(&page_w.to_be_bytes());
+    region.extend_from_slice(&page_h.to_be_bytes());
+    region.extend_from_slice(&0u32.to_be_bytes()); // x
+    region.extend_from_slice(&0u32.to_be_bytes()); // y
+    region.push(0); // region flags: OR
+    // §7.4.5.1.1 halftone flags: HMMR=0, HTEMPLATE=0, HENABLESKIP=1 (bit3),
+    // HCOMBOP=OR (bits4-6=0), HDEFPIXEL=0.
+    region.push(0x08);
+    region.extend_from_slice(&hgw.to_be_bytes());
+    region.extend_from_slice(&hgh.to_be_bytes());
+    region.extend_from_slice(&(hgx as i32).to_be_bytes());
+    region.extend_from_slice(&(hgy as i32).to_be_bytes());
+    region.extend_from_slice(&(hrx as u16).to_be_bytes());
+    region.extend_from_slice(&(hry as u16).to_be_bytes());
+    region.extend_from_slice(&gray_data);
+    stream.extend_from_slice(&segment_header(2, 23, &[1], 1, region.len() as u32));
+    stream.extend_from_slice(&region);
+
+    stream.extend_from_slice(&segment_header(3, 49, &[], 1, 0));
+    stream
+}
+
 fn emit_symbol_id(w: &mut BitWriter, sym_table: &HuffmanTable, id: usize) {
     let (code, len, _, _) = sym_table
         .encode_value(id as i32)

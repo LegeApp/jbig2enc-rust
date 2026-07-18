@@ -123,14 +123,46 @@ fn bits_per_value(num_patterns: usize) -> u32 {
 /// returning the region bitmap. `generic_ctx` is reused, worker-local scratch
 /// (reset here, must be at least `1 << 16` entries); it is only touched for the
 /// arithmetic gray-plane variant.
+/// Compute the HSKIP bitmap (T.88 §6.6.5.1): a grid cell is skipped when its
+/// pattern, placed by the grid geometry, lies entirely outside the region.
+fn compute_skip(
+    region: &HalftoneRegion<'_>,
+    patterns: &PatternDictionary,
+    hgw: u32,
+    hgh: u32,
+    limits: &DecodeLimits,
+) -> Result<MonoBitmap, DecodeError> {
+    let mut skip = MonoBitmap::new(hgw, hgh, false, limits)?;
+    let hpw = patterns.patterns[0].width() as i64;
+    let hph = patterns.patterns[0].height() as i64;
+    let hbw = region.width as i64;
+    let hbh = region.height as i64;
+    let hgx = region.grid_x as i64;
+    let hgy = region.grid_y as i64;
+    let hrx = region.grid_vector_x as i64;
+    let hry = region.grid_vector_y as i64;
+    for mg in 0..hgh {
+        let mg_i = mg as i64;
+        for ng in 0..hgw {
+            let ng_i = ng as i64;
+            let x = (hgx + mg_i * hry + ng_i * hrx) >> 8;
+            let y = (hgy + mg_i * hrx - ng_i * hry) >> 8;
+            if x + hpw <= 0 || x >= hbw || y + hph <= 0 || y >= hbh {
+                skip.set(ng, mg, true);
+            }
+        }
+    }
+    Ok(skip)
+}
+
 pub fn decode_halftone_region(
     region: &HalftoneRegion<'_>,
     patterns: &PatternDictionary,
     limits: &DecodeLimits,
     generic_ctx: &mut [MqContext],
 ) -> Result<MonoBitmap, DecodeError> {
-    if region.enable_skip {
-        // HENABLESKIP skip masks are deferred to Phase 5e.
+    if region.enable_skip && region.mmr {
+        // HENABLESKIP with MMR gray planes is a rare combination not modelled.
         return Err(DecodeError::Unsupported(UnsupportedFeature::HalftoneCoding));
     }
 
@@ -153,6 +185,14 @@ pub fn decode_halftone_region(
     if hgw == 0 || hgh == 0 {
         return Ok(htreg);
     }
+
+    // §6.6.5.1 HSKIP: a cell whose pattern placement falls entirely outside the
+    // region is skipped in the gray-scale decoding.
+    let skip = if region.enable_skip {
+        Some(compute_skip(region, patterns, hgw, hgh, limits)?)
+    } else {
+        None
+    };
 
     // §6.6.5 step 4 + Annex C.5: decode HBPP Gray-coded planes, MSB first.
     // `planes[j]` holds the coded (still Gray-coded) plane for bit position j.
@@ -196,8 +236,21 @@ pub fn decode_halftone_region(
         // (the encoder codes them with a single coder, contexts carried across).
         let mut dec = ArithmeticDecoder::new(region.data);
         for j in (0..hbpp as usize).rev() {
-            planes[j] =
-                decode_generic_bitmap(&mut dec, hgw, hgh, region.template, at, generic_ctx, limits)?;
+            planes[j] = match &skip {
+                Some(s) => crate::decode::generic::decode_generic_bitmap_skip(
+                    &mut dec,
+                    hgw,
+                    hgh,
+                    region.template,
+                    at,
+                    generic_ctx,
+                    limits,
+                    s,
+                )?,
+                None => decode_generic_bitmap(
+                    &mut dec, hgw, hgh, region.template, at, generic_ctx, limits,
+                )?,
+            };
         }
     }
 
