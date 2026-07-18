@@ -412,6 +412,35 @@ diff, runs the checklist, and only then does the next phase start.
   edge case the current `decode()` bit-matching does not special-case; tests
   use ≥2 symbols.
 
+## Phase 5d findings (striped pages + unknown segment lengths)
+
+* **Unknown segment data length (§7.2.7)** for immediate generic regions:
+  `file.rs` scans the data part for the terminator — `FF AC` (arithmetic) or
+  `00 00` (MMR), selected by the eighteenth byte's MMR bit — from the
+  eighteenth byte onward, then the four-byte row count. `page.rs` overrides the
+  region height with that row count and trims it from the coded data. Other
+  segment types with unknown length remain a typed `Unsupported`.
+
+* **Striped pages of unknown height (§7.4.8.5)** (page height 0xFFFFFFFF): the
+  page starts empty and `MonoBitmap::grow_to_height` extends it as regions and
+  end-of-stripe segments arrive, bounded by `max_page_pixels`. End-of-stripe
+  (type 50) end rows set the final page height (§7.4.9). Known-height striped
+  pages already worked. The `StripedPage` `UnsupportedFeature` variant is
+  deleted.
+
+* **jbig2dec quirk (documented).** For an unknown-height page jbig2dec 0.20 pads
+  the output to the maximum stripe size rather than trimming to the last
+  end-of-stripe row; the native decoder trims per §7.4.9. The oracle test sets
+  the max stripe size equal to the true total height so both agree.
+
+* **Writer fix.** The test writer's `generic_arith_data` had called
+  `flush(true)` then `into_vec()` (which flushes a second time), leaving bytes
+  after the FF AC marker — harmless for known-length regions but fatal to the
+  §7.2.7 terminator scan. It now reads the buffer after a single flush.
+
+* Oracle: `tests/decode_striped.rs` checks both forms native == source ==
+  jbig2dec.
+
 ## Gap F: Out of scope for now (explicitly deferred)
 
 * Product B / Phase 5 (Huffman, striped pages, random access, templates

@@ -4,9 +4,10 @@
 //! locates segment boundaries and slices payloads; nothing is decoded here.
 
 use crate::decode::error::{DecodeError, ParseError, UnsupportedFeature};
-use crate::decode::segment::{SegmentHeader, ensure_known_length, parse_segment_header};
+use crate::decode::segment::{SegmentHeader, parse_segment_header};
 use crate::shared::limits::DecodeLimits;
 use crate::shared::reader::Reader;
+use crate::shared::segment::SegmentType;
 
 /// The 8-byte JBIG2 file identification string (T.88 §D.4.1).
 pub const FILE_MAGIC: [u8; 8] = [0x97, 0x4A, 0x42, 0x32, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -105,18 +106,63 @@ fn parse_segment_sequence<'a>(
                 limit: limits.max_referred_segments as u64,
             }));
         }
-        // §7.2.7 unknown length is not supported by the self-decoder yet.
-        let len = ensure_known_length(&header).map_err(DecodeError::Unsupported)?;
-        let len = usize::try_from(len).map_err(|_| DecodeError::Overflow {
-            operation: "segment data length to usize",
-        })?;
-        let data = reader.take(len).map_err(|source| DecodeError::Segment {
-            segment: header.number,
-            source,
-        })?;
+        // §7.2.7 unknown data length: legal only for immediate generic regions,
+        // whose length is recovered by scanning for the terminator sequence.
+        let data = if header.is_unknown_length() {
+            let ty = header.segment_type();
+            if !matches!(ty, Some(SegmentType::ImmediateGenericRegion)) {
+                return Err(DecodeError::Unsupported(
+                    UnsupportedFeature::UnknownSegmentLength,
+                ));
+            }
+            let remaining = reader.peek(reader.remaining()).unwrap_or(&[]);
+            let len = unknown_generic_length(remaining)?;
+            reader.take(len).map_err(|source| DecodeError::Segment {
+                segment: header.number,
+                source,
+            })?
+        } else {
+            let len = usize::try_from(header.data_length).map_err(|_| DecodeError::Overflow {
+                operation: "segment data length to usize",
+            })?;
+            reader.take(len).map_err(|source| DecodeError::Segment {
+                segment: header.number,
+                source,
+            })?
+        };
         segments.push(ParsedSegment { header, data });
     }
     Ok(segments)
+}
+
+/// Determine the data-part length of an unknown-length immediate generic region
+/// (T.88 §7.2.7). The data begins with the 17-byte region-segment information
+/// field and a 1-byte generic-flags field (the "eighteenth byte"), whose bit 0
+/// selects MMR. The data ends with a terminator — `0xFF 0xAC` (arithmetic) or
+/// `0x00 0x00` (MMR) — that can occur anywhere after the eighteenth byte,
+/// followed by a four-byte row count. Returns the total data length in bytes.
+fn unknown_generic_length(data: &[u8]) -> Result<usize, DecodeError> {
+    // Need at least the 18-byte prefix plus a 2-byte terminator and 4-byte count.
+    const PREFIX: usize = 18;
+    if data.len() < PREFIX + 6 {
+        return Err(DecodeError::Malformed {
+            reason: "unknown-length generic region too short",
+        });
+    }
+    let mmr = data[17] & 0x01 != 0;
+    let (a, b) = if mmr { (0x00, 0x00) } else { (0xFF, 0xAC) };
+    // Search for the terminator starting at the eighteenth byte (index 17),
+    // scanning forward. The row count is the four bytes immediately after it.
+    let mut i = PREFIX;
+    while i + 6 <= data.len() {
+        if data[i] == a && data[i + 1] == b {
+            return Ok(i + 2 + 4);
+        }
+        i += 1;
+    }
+    Err(DecodeError::Malformed {
+        reason: "unknown-length generic region terminator not found",
+    })
 }
 
 /// Detect whether `data` begins with the JBIG2 file magic.

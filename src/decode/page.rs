@@ -189,6 +189,9 @@ pub fn process_document_with_globals(
     ctx: &mut DecoderContext,
 ) -> Result<Vec<DecodedPage>, DecodeError> {
     let mut pages: Vec<DecodedPage> = Vec::new();
+    // Parallel to `pages`: whether each page's height was originally unknown
+    // (0xFFFFFFFF) and so grows stripe-by-stripe (T.88 §7.4.8.5).
+    let mut unknown_height: Vec<bool> = Vec::new();
     let mut current: Option<usize> = None;
     let mut store = SegmentStore::new();
     let globals_store = globals.map(|g| g.store());
@@ -226,6 +229,13 @@ pub fn process_document_with_globals(
                 .map_err(|source| annotate(seg.header.number, source))?;
                 let target =
                     resolve_page(&mut pages, current, seg.header.page_association)?;
+                grow_if_unknown(
+                    &mut pages[target].bitmap,
+                    unknown_height[target],
+                    result.y,
+                    result.bitmap.height(),
+                    limits,
+                )?;
                 compose_region(
                     &mut pages[target].bitmap,
                     result.bitmap,
@@ -243,16 +253,20 @@ pub fn process_document_with_globals(
                     segment: seg.header.number,
                     source,
                 })?;
-                if info.has_unknown_height() {
-                    return Err(DecodeError::Unsupported(UnsupportedFeature::StripedPage));
+                let is_unknown = info.has_unknown_height();
+                // A page of unknown height starts empty and grows as stripes /
+                // regions arrive; a known-height page is allocated up front.
+                let init_height = if is_unknown { 0 } else { info.height };
+                if !is_unknown {
+                    check_page_pixels(&info, limits)?;
                 }
-                check_page_pixels(&info, limits)?;
                 let bitmap =
-                    MonoBitmap::new(info.width, info.height, info.default_pixel, limits)?;
+                    MonoBitmap::new(info.width, init_height, info.default_pixel, limits)?;
                 pages.push(DecodedPage {
                     page_number: seg.header.page_association,
                     bitmap,
                 });
+                unknown_height.push(is_unknown);
                 current = Some(pages.len() - 1);
             }
             Some(
@@ -260,15 +274,43 @@ pub fn process_document_with_globals(
                 | SegmentType::ImmediateLosslessGenericRegion
                 | SegmentType::IntermediateGenericRegion,
             ) => {
-                let region = parse_generic_region(seg.data).map_err(|source| {
+                let mut region = parse_generic_region(seg.data).map_err(|source| {
                     DecodeError::Segment {
                         segment: seg.header.number,
                         source,
                     }
                 })?;
+                if seg.header.is_unknown_length() {
+                    // §7.2.7 / §6.2.6: the data part ends with a four-byte row
+                    // count; the region's true height is that count (<= the
+                    // region-info height). Trim it from the coded data.
+                    let dlen = region.data.len();
+                    if dlen < 4 {
+                        return Err(DecodeError::Malformed {
+                            reason: "unknown-length generic region missing row count",
+                        });
+                    }
+                    let rc = &region.data[dlen - 4..];
+                    let row_count =
+                        u32::from_be_bytes([rc[0], rc[1], rc[2], rc[3]]);
+                    if row_count > region.height {
+                        return Err(DecodeError::Malformed {
+                            reason: "unknown-length row count exceeds region height",
+                        });
+                    }
+                    region.height = row_count;
+                    region.data = &region.data[..dlen - 4];
+                }
                 let region_bm =
                     decode_generic_region(&region, limits, ctx.generic_contexts())?;
                 let target = resolve_page(&mut pages, current, seg.header.page_association)?;
+                grow_if_unknown(
+                    &mut pages[target].bitmap,
+                    unknown_height[target],
+                    region.y,
+                    region_bm.height(),
+                    limits,
+                )?;
                 compose_region(
                     &mut pages[target].bitmap,
                     region_bm,
@@ -277,10 +319,25 @@ pub fn process_document_with_globals(
                     region.comb_operator,
                 );
             }
+            // §7.4.10 end of stripe: a 4-byte end row. For an unknown-height
+            // page this communicates the page size, so grow to include it.
+            Some(SegmentType::EndOfStripe) => {
+                if seg.data.len() >= 4 {
+                    let end_row =
+                        u32::from_be_bytes([seg.data[0], seg.data[1], seg.data[2], seg.data[3]]);
+                    if let Some(idx) = current.filter(|&i| unknown_height[i]) {
+                        let target_h = end_row.saturating_add(1);
+                        pages[idx].bitmap.grow_to_height(
+                            target_h,
+                            limits.max_page_pixels,
+                            limits,
+                        )?;
+                    }
+                }
+            }
             // Segments the self-decoder ignores structurally.
             Some(
                 SegmentType::EndOfPage
-                | SegmentType::EndOfStripe
                 | SegmentType::EndOfFile
                 | SegmentType::Profiles
                 | SegmentType::Extension,
@@ -319,6 +376,13 @@ pub fn process_document_with_globals(
                 )
                 .map_err(|source| annotate(seg.header.number, source))?;
                 let target = resolve_page(&mut pages, current, seg.header.page_association)?;
+                grow_if_unknown(
+                    &mut pages[target].bitmap,
+                    unknown_height[target],
+                    region.y,
+                    region_bm.height(),
+                    limits,
+                )?;
                 compose_region(
                     &mut pages[target].bitmap,
                     region_bm,
@@ -347,6 +411,13 @@ pub fn process_document_with_globals(
                     .map_err(|source| annotate(seg.header.number, source))?;
                 let target =
                     resolve_page(&mut pages, current, seg.header.page_association)?;
+                grow_if_unknown(
+                    &mut pages[target].bitmap,
+                    unknown_height[target],
+                    region.y,
+                    region.height,
+                    limits,
+                )?;
                 let reference = page_reference_window(
                     &pages[target].bitmap,
                     region.x,
@@ -454,6 +525,27 @@ fn compose_region(
         return;
     }
     page.combine(&region, x as i32, y as i32, op);
+}
+
+/// Grow an unknown-height page so a region of height `h` placed at row `y`
+/// fits (T.88 §7.4.8.5). A no-op for known-height pages.
+fn grow_if_unknown(
+    page: &mut MonoBitmap,
+    unknown: bool,
+    y: u32,
+    h: u32,
+    limits: &DecodeLimits,
+) -> Result<(), DecodeError> {
+    if unknown {
+        let needed = (y as u64)
+            .checked_add(h as u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or(DecodeError::Overflow {
+                operation: "striped page height",
+            })?;
+        page.grow_to_height(needed, limits.max_page_pixels, limits)?;
+    }
+    Ok(())
 }
 
 /// Whether every word of the page is zero (blank / all-white default).

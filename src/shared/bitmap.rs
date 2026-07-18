@@ -111,6 +111,49 @@ impl MonoBitmap {
         })
     }
 
+    /// Grow the bitmap to at least `new_height` rows, preserving existing
+    /// content; new rows are white. A no-op if already tall enough. Used for
+    /// striped pages of unknown height (T.88 §7.4.8.5), so growth is bounded by
+    /// `max_page_pixels` rather than `max_region_pixels`.
+    pub fn grow_to_height(
+        &mut self,
+        new_height: u32,
+        max_pixels: u64,
+        limits: &DecodeLimits,
+    ) -> Result<(), DecodeError> {
+        if new_height <= self.height {
+            return Ok(());
+        }
+        if new_height > limits.max_height {
+            return Err(DecodeError::limit(LimitError::Dimension {
+                dimension: "height",
+                value: new_height as u64,
+                limit: limits.max_height as u64,
+            }));
+        }
+        let pixels = (self.width as u64)
+            .checked_mul(new_height as u64)
+            .ok_or(DecodeError::Overflow {
+                operation: "striped page pixel count",
+            })?;
+        if pixels > max_pixels {
+            return Err(DecodeError::limit(LimitError::Pixels {
+                what: "striped page",
+                value: pixels,
+                limit: max_pixels,
+            }));
+        }
+        let total_words = (self.stride_words as u64)
+            .checked_mul(new_height as u64)
+            .and_then(|w| usize::try_from(w).ok())
+            .ok_or(DecodeError::Overflow {
+                operation: "striped page word count",
+            })?;
+        self.words.resize(total_words, 0);
+        self.height = new_height;
+        Ok(())
+    }
+
     #[inline]
     pub fn width(&self) -> u32 {
         self.width

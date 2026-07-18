@@ -211,8 +211,12 @@ pub fn generic_arith_data(
             coder.encode_bit(ctx, bm.get(x, y));
         }
     }
+    // flush(true) finalizes and appends the FF AC terminator; read the buffer
+    // directly rather than via into_vec (which would flush a second time and
+    // leave bytes after the terminator — harmless for known-length regions but
+    // fatal to the §7.2.7 terminator scan).
     coder.flush(true);
-    coder.into_vec()
+    coder.as_bytes().to_vec()
 }
 
 /// Build a generic-region segment payload (T.88 §7.4.6): region info + generic
@@ -246,14 +250,100 @@ pub fn generic_region_payload(
 
 /// Build a page-information segment payload (T.88 §7.4.8), 19 bytes.
 pub fn page_info_payload(width: u32, height: u32) -> Vec<u8> {
+    page_info_payload_striped(width, height, 0)
+}
+
+/// Page-information payload with an explicit striping field. `striping` bit 15
+/// set marks the page as striped; the low 15 bits are the maximum stripe size.
+pub fn page_info_payload_striped(width: u32, height: u32, striping: u16) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(&width.to_be_bytes());
     v.extend_from_slice(&height.to_be_bytes());
     v.extend_from_slice(&0u32.to_be_bytes()); // x resolution
     v.extend_from_slice(&0u32.to_be_bytes()); // y resolution
     v.push(0x00); // page flags: lossy, default pixel 0, OR combination
-    v.extend_from_slice(&0u16.to_be_bytes()); // striping information (not striped)
+    v.extend_from_slice(&striping.to_be_bytes());
     v
+}
+
+/// Like [`generic_region_payload`] but with an explicit region origin `(x, y)`.
+pub fn generic_region_payload_at(
+    bm: &TestBitmap,
+    template: u8,
+    at: &[(i8, i8); 4],
+    tpgdon: bool,
+    comb_operator: u8,
+    x: u32,
+    y: u32,
+) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(&bm.width.to_be_bytes());
+    v.extend_from_slice(&bm.height.to_be_bytes());
+    v.extend_from_slice(&x.to_be_bytes());
+    v.extend_from_slice(&y.to_be_bytes());
+    v.push(comb_operator & 0x07);
+    let flags = ((template & 0x03) << 1) | ((tpgdon as u8) << 3);
+    v.push(flags);
+    let at_count = if template == 0 { 4 } else { 1 };
+    for &(ax, ay) in at.iter().take(at_count) {
+        v.push(ax as u8);
+        v.push(ay as u8);
+    }
+    v.extend_from_slice(&generic_arith_data(bm, template, at, tpgdon));
+    v
+}
+
+/// A page whose single immediate generic region has *unknown* segment length
+/// (T.88 §7.2.7): the region's arithmetic data ends with the `FF AC` marker
+/// (emitted by the encoder's flush) followed by a 4-byte row count, and the
+/// segment header's data-length field is the 0xFFFFFFFF sentinel.
+pub fn unknown_length_generic_page(bm: &TestBitmap) -> Vec<u8> {
+    let mut stream = Vec::new();
+    let page_data = page_info_payload(bm.width, bm.height);
+    stream.extend_from_slice(&segment_header(0, 48, &[], 1, page_data.len() as u32));
+    stream.extend_from_slice(&page_data);
+
+    let mut region = generic_region_payload(bm, 0, &nominal_at(0), false, 0);
+    // The arithmetic data already ends with FF AC; append the 4-byte row count.
+    region.extend_from_slice(&bm.height.to_be_bytes());
+    stream.extend_from_slice(&segment_header(1, 38, &[], 1, 0xFFFF_FFFF));
+    stream.extend_from_slice(&region);
+
+    stream.extend_from_slice(&segment_header(2, 49, &[], 1, 0));
+    stream
+}
+
+/// A striped page of *unknown* height (T.88 §7.4.8.5): page height 0xFFFFFFFF
+/// with the striped bit set, `bands` stacked vertically each as its own generic
+/// region followed by an end-of-stripe segment, then end-of-page.
+pub fn striped_unknown_height_page(width: u32, bands: &[TestBitmap]) -> Vec<u8> {
+    let mut stream = Vec::new();
+    // Striping info: bit15 set. jbig2dec 0.20 pads an unknown-height page out to
+    // the maximum stripe size rather than trimming to the last end-of-stripe row
+    // (the native decoder follows §7.4.9 and trims); set the max stripe size to
+    // the true total height so both agree on the final page size.
+    let total_h: u32 = bands.iter().map(|b| b.height).sum();
+    let max_stripe = (total_h & 0x7FFF) as u16;
+    let page_data = page_info_payload_striped(width, 0xFFFF_FFFF, 0x8000 | max_stripe);
+    stream.extend_from_slice(&segment_header(0, 48, &[], 1, page_data.len() as u32));
+    stream.extend_from_slice(&page_data);
+
+    let mut seg = 1u32;
+    let mut y = 0u32;
+    for band in bands {
+        let region = generic_region_payload_at(band, 0, &nominal_at(0), false, 0, 0, y);
+        stream.extend_from_slice(&segment_header(seg, 38, &[], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+        seg += 1;
+        // End of stripe: end row = y + band height - 1.
+        let end_row = y + band.height - 1;
+        stream.extend_from_slice(&segment_header(seg, 50, &[], 1, 4));
+        stream.extend_from_slice(&end_row.to_be_bytes());
+        seg += 1;
+        y += band.height;
+    }
+    stream.extend_from_slice(&segment_header(seg, 49, &[], 1, 0));
+    stream
 }
 
 /// Emit a short-form segment header (T.88 §7.2) followed by nothing — the
