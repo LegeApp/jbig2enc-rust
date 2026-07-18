@@ -460,20 +460,25 @@ diff, runs the checklist, and only then does the next phase start.
   headers up to the end-of-file terminator, then the data blocks in order.
   Verified vs jbig2dec on a hand-built random-access generic page.
 
+* **SDREFAGG=1 refinement-coded symbol dictionaries** (REFAGGNINST=1, §6.5.8.2):
+  new symbols coded as a generic refinement of an earlier (imported or new)
+  symbol now decode; verified vs jbig2dec via a Huffman base dict → SDREFAGG
+  dict → text-region page. REFAGGNINST>1 (true aggregates) stays Unsupported.
+
+* **Halftone HENABLESKIP** (§6.6.5.1): the HSKIP bitmap is computed and the
+  arithmetic gray planes decode with a skip-aware generic path; verified vs
+  jbig2dec. HENABLESKIP with MMR gray planes stays Unsupported.
+
 * Variants deleted: `TransposedTextRegion`, `RandomAccessOrganisation`.
 
 ## Phase 5 remaining (documented deferrals)
 
-These are the rarest / most infrastructural items; each is a typed
-`Unsupported` and needs a dedicated test-writer to verify against jbig2dec:
+Every JBIG2 *coding feature* the spec defines now decodes and is verified
+pixel-exact against jbig2dec 0.20. What remains is rare-variant or
+infrastructural, each still a typed `Unsupported` where reachable:
 
-* **SDREFAGG=1 refinement/aggregate symbol dictionaries** (§6.5.8.2) — the
-  REFAGGNINST=1 fast path reuses the now-complete refinement decoder, but needs
-  a refinement-coded-dictionary writer for oracle coverage; REFAGGNINST>1
-  (true aggregates via an internal text region) is the rarest form.
-* **HENABLESKIP halftone skip** (§6.6.5.1) — needs a skip-aware generic
-  gray-plane decoder (touches the verified hot loop) and is an encoder
-  optimisation never emitted here.
+* **REFAGGNINST>1 true aggregate dictionary symbols** (§6.5.8.2, an internal
+  text-region invocation) — the rarest symbol form.
 * **Huffman + refinement text regions** (SBHUFF=1 ∧ SBREFINE=1) — needs the
   §6.4.11.5 Huffman refinement-size handling.
 * **Retained arithmetic contexts across segments** (§7.4.4.3 SDUSEDCTX) — the
