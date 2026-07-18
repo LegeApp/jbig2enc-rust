@@ -18,6 +18,7 @@ pub mod file;
 pub mod generic;
 pub mod globals;
 pub mod halftone_region;
+pub mod huffman;
 pub mod iaid;
 pub mod integer;
 pub mod mmr;
