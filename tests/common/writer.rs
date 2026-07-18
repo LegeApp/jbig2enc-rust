@@ -1248,6 +1248,115 @@ pub fn huffman_refine_text_page(
     stream
 }
 
+// ------------------------------------------------------------------------
+// Retained arithmetic contexts writer (Phase 5e oracle support, §6.5.5)
+// ------------------------------------------------------------------------
+
+/// Encode one arithmetic symbol-dictionary's inner data onto `coder`: a single
+/// height class of generic (template-0) symbols, then the export runs. The
+/// generic contexts are whatever `coder` currently holds (fresh, or imported
+/// from a previous dictionary via `reinit_registers_keep_bitmap_contexts`).
+fn encode_generic_dict_inner(
+    coder: &mut Jbig2ArithCoder,
+    new_symbols: &[TestBitmap],
+    imported_count: usize,
+) {
+    let height = new_symbols[0].height;
+    let at = nominal_at(0);
+    coder.encode_integer(IntProc::Iadh, height as i32).unwrap();
+    let mut prev = 0i32;
+    for sym in new_symbols {
+        coder
+            .encode_integer(IntProc::Iadw, sym.width as i32 - prev)
+            .unwrap();
+        prev = sym.width as i32;
+        for y in 0..height {
+            for x in 0..sym.width {
+                let ctx = context(0, sym, x as i64, y as i64, &at);
+                coder.encode_bit(ctx, sym.get(x, y));
+            }
+        }
+    }
+    coder.encode_oob(IntProc::Iadw).unwrap();
+    coder
+        .encode_integer(IntProc::Iaex, imported_count as i32)
+        .unwrap();
+    coder
+        .encode_integer(IntProc::Iaex, new_symbols.len() as i32)
+        .unwrap();
+}
+
+fn arith_dict_payload(data: &[u8], num_ex: usize, num_new: usize, used: bool, retained: bool) -> Vec<u8> {
+    let mut flags: u16 = 0; // SDHUFF=0, SDREFAGG=0, SDTEMPLATE=0
+    if used {
+        flags |= 0x0100;
+    }
+    if retained {
+        flags |= 0x0200;
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&flags.to_be_bytes());
+    for (ax, ay) in [(3i8, -1i8), (-3, -1), (2, -2), (-2, -2)] {
+        payload.push(ax as u8);
+        payload.push(ay as u8);
+    }
+    payload.extend_from_slice(&(num_ex as u32).to_be_bytes());
+    payload.extend_from_slice(&(num_new as u32).to_be_bytes());
+    payload.extend_from_slice(data);
+    payload
+}
+
+/// A page with two arithmetic symbol dictionaries where the second imports the
+/// first's bitmap-coding contexts (T.88 §6.5.5): dict A (seg 1, retained=1),
+/// dict B (seg 2, refers A, used=1), then a Huffman text region placing dict B's
+/// symbols. All symbols share one height and have non-decreasing widths.
+pub fn retained_context_page(
+    page_w: u32,
+    page_h: u32,
+    syms_a: &[TestBitmap],
+    syms_b: &[TestBitmap],
+    placements: &[(usize, i32)],
+) -> Vec<u8> {
+    let mut coder = Jbig2ArithCoder::new();
+    encode_generic_dict_inner(&mut coder, syms_a, 0);
+    coder.flush(true);
+    let data_a = coder.as_bytes().to_vec();
+    let dict_a = arith_dict_payload(&data_a, syms_a.len(), syms_a.len(), false, true);
+
+    // Dict B: keep A's bitmap contexts, reset the MQ registers, code B.
+    coder.reinit_registers_keep_bitmap_contexts();
+    encode_generic_dict_inner(&mut coder, syms_b, syms_a.len());
+    coder.flush(true);
+    let data_b = coder.as_bytes().to_vec();
+    let dict_b = arith_dict_payload(&data_b, syms_b.len(), syms_b.len(), true, false);
+
+    let mut stream = Vec::new();
+    let page_data = page_info_payload(page_w, page_h);
+    stream.extend_from_slice(&segment_header(0, 48, &[], 1, page_data.len() as u32));
+    stream.extend_from_slice(&page_data);
+    stream.extend_from_slice(&segment_header(1, 0, &[], 1, dict_a.len() as u32));
+    stream.extend_from_slice(&dict_a);
+    stream.extend_from_slice(&segment_header(2, 0, &[1], 1, dict_b.len() as u32));
+    stream.extend_from_slice(&dict_b);
+
+    let widths: Vec<u32> = syms_b.iter().map(|s| s.width).collect();
+    let heights: Vec<u32> = syms_b.iter().map(|s| s.height).collect();
+    let region = huffman_text_region_payload(
+        page_w,
+        page_h,
+        syms_b.len(),
+        &widths,
+        &heights,
+        placements,
+        false,
+    );
+    stream.extend_from_slice(&segment_header(3, 6, &[2], 1, region.len() as u32));
+    stream.extend_from_slice(&region);
+
+    stream.extend_from_slice(&segment_header(4, 49, &[], 1, 0));
+    stream
+}
+
 fn emit_symbol_id(w: &mut BitWriter, sym_table: &HuffmanTable, id: usize) {
     let (code, len, _, _) = sym_table
         .encode_value(id as i32)

@@ -292,6 +292,27 @@ impl Jbig2ArithCoder {
         self.refinement_contexts.fill(0);
     }
 
+    /// Reinitialise the MQ registers and integer/IAID statistics for a new
+    /// coded stream while **preserving** the generic and generic-refinement
+    /// (bitmap-coding) contexts. This is the encoder-side analogue of a symbol
+    /// dictionary decoded with the "bitmap coding context used" flag (T.88
+    /// §6.5.5 step 3): the next dictionary's bitmaps are coded starting from the
+    /// previous dictionary's final statistics. Test-support only — it does not
+    /// change the output of any normal encode path.
+    pub fn reinit_registers_keep_bitmap_contexts(&mut self) {
+        self.a = 0x8000;
+        self.c = 0;
+        self.ct = 12;
+        self.b = 0;
+        self.bp = -1;
+        self.data.clear();
+        for ctx in self.int_ctx.iter_mut() {
+            ctx.fill(0);
+        }
+        self.iaid_ctx.fill(0);
+        // self.context and self.refinement_contexts are intentionally preserved.
+    }
+
     /// Finalizes the arithmetic coding stream.
     pub fn finalize(&mut self, _data: &mut Vec<u8>) -> anyhow::Result<()> {
         self.renorm();

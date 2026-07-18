@@ -123,10 +123,30 @@ pub(crate) fn decode_symbol_dict_into(
         local.gather_symbols(seg.header.number, &seg.header.referred_to, globals)?;
     let tables = local.gather_huffman_tables(&seg.header.referred_to, globals);
 
+    // §7.4.2.1.1 bits 8/9: "bitmap coding context used" / "retained".
+    let flags = if seg.data.len() >= 2 {
+        u16::from_be_bytes([seg.data[0], seg.data[1]])
+    } else {
+        0
+    };
+    let ctx_used = flags & 0x0100 != 0;
+    let ctx_retained = flags & 0x0200 != 0;
+
     ctx.ensure_generic();
     if ctx.refinement_contexts.len() < REFINEMENT_CONTEXT_COUNT {
         ctx.refinement_contexts
             .resize(REFINEMENT_CONTEXT_COUNT, Default::default());
+    }
+    // §6.5.5 step 3: import the generic + refinement statistics of the last
+    // referred retained dictionary before decoding.
+    if let Some(ret) = ctx_used
+        .then(|| local.last_retained(&seg.header.referred_to, globals))
+        .flatten()
+    {
+        let n = ret.generic.len().min(ctx.generic_contexts.len());
+        ctx.generic_contexts[..n].copy_from_slice(&ret.generic[..n]);
+        let rn = ret.refine.len().min(ctx.refinement_contexts.len());
+        ctx.refinement_contexts[..rn].copy_from_slice(&ret.refine[..rn]);
     }
     // Disjoint field borrows: generic, integer, IAID, and refinement banks.
     let generic = &mut ctx.generic_contexts[..crate::decode::context::GENERIC_CONTEXT_COUNT];
@@ -134,9 +154,21 @@ pub(crate) fn decode_symbol_dict_into(
     let iaid_ctx = &mut ctx.iaid_contexts;
     let refine_ctx = &mut ctx.refinement_contexts[..REFINEMENT_CONTEXT_COUNT];
     let dict = decode_symbol_dictionary(
-        seg.data, &imported, &tables, limits, int_ctx, iaid_ctx, generic, refine_ctx,
+        seg.data, &imported, &tables, limits, int_ctx, iaid_ctx, generic, refine_ctx, !ctx_used,
     )
     .map_err(|source| annotate(seg.header.number, source))?;
+
+    // §6.5.5 step 7: preserve this dictionary's statistics for a later importer.
+    if ctx_retained {
+        local.insert_retained(
+            seg.header.number,
+            crate::decode::store::RetainedContexts {
+                generic: ctx.generic_contexts[..crate::decode::context::GENERIC_CONTEXT_COUNT]
+                    .to_vec(),
+                refine: ctx.refinement_contexts[..REFINEMENT_CONTEXT_COUNT].to_vec(),
+            },
+        );
+    }
 
     let arc = Arc::new(dict);
     local.insert(

@@ -14,6 +14,16 @@ use crate::decode::huffman::HuffmanTable;
 use crate::decode::pattern_dictionary::PatternDictionary;
 use crate::decode::symbol_dictionary::SymbolDictionary;
 use crate::shared::bitmap::MonoBitmap;
+use crate::shared::mq_table::MqContext;
+
+/// Generic + generic-refinement arithmetic statistics retained by a symbol
+/// dictionary segment (T.88 §6.5.5 steps 3/7, the "bitmap coding context
+/// retained" flag) for a later dictionary with "context used" set to import.
+#[derive(Clone)]
+pub struct RetainedContexts {
+    pub generic: Vec<MqContext>,
+    pub refine: Vec<MqContext>,
+}
 
 /// A decoded segment resource, resolvable by later segments.
 #[derive(Clone)]
@@ -36,6 +46,7 @@ pub enum DecodedSegment {
 #[derive(Default, Clone)]
 pub struct SegmentStore {
     values: FxHashMap<u32, DecodedSegment>,
+    retained: FxHashMap<u32, Arc<RetainedContexts>>,
 }
 
 impl SegmentStore {
@@ -57,6 +68,29 @@ impl SegmentStore {
     #[inline]
     pub fn get(&self, number: u32) -> Option<&DecodedSegment> {
         self.values.get(&number)
+    }
+
+    /// Save the retained arithmetic contexts of a symbol dictionary segment.
+    pub fn insert_retained(&mut self, number: u32, ctx: RetainedContexts) {
+        self.retained.insert(number, Arc::new(ctx));
+    }
+
+    /// The retained contexts of the *last* referred symbol-dictionary segment
+    /// that retained them (T.88 §6.5.5 step 3), checking `self` then `globals`.
+    pub fn last_retained(
+        &self,
+        referred: &[u32],
+        globals: Option<&SegmentStore>,
+    ) -> Option<Arc<RetainedContexts>> {
+        for &rn in referred.iter().rev() {
+            if let Some(c) = self.retained.get(&rn) {
+                return Some(c.clone());
+            }
+            if let Some(c) = globals.and_then(|g| g.retained.get(&rn)) {
+                return Some(c.clone());
+            }
+        }
+        None
     }
 
     /// Resolve a symbol dictionary by number, erroring if it is missing or of

@@ -75,6 +75,7 @@ pub fn decode_symbol_dictionary(
     iaid_ctx: &mut IaidContexts,
     generic_ctx: &mut [MqContext],
     refine_ctx: &mut [MqContext],
+    reset_bitmap_ctx: bool,
 ) -> Result<SymbolDictionary, DecodeError> {
     let mut r = Reader::new(payload);
 
@@ -154,11 +155,14 @@ pub fn decode_symbol_dictionary(
         );
     }
 
-    // Fresh coder state: zero the reused context banks (§7.4.4.3: each
-    // dictionary segment starts every arithmetic statistic at zero).
+    // Integer/IAID statistics always start fresh; the generic and refinement
+    // (bitmap-coding) statistics reset only when not importing retained
+    // contexts (T.88 §6.5.5 steps 3/4, the "bitmap coding context used" flag).
     int_ctx.reset();
-    for c in generic_ctx.iter_mut() {
-        *c = MqContext(0);
+    if reset_bitmap_ctx {
+        for c in generic_ctx.iter_mut() {
+            *c = MqContext(0);
+        }
     }
     // SBSYMCODELEN for the refinement symbol-ID (§6.5.8.2.3).
     let code_len = ceil_log2(total as u32) as u8;
@@ -169,8 +173,10 @@ pub fn decode_symbol_dictionary(
                 operation: "refinement context array too small",
             });
         }
-        for c in refine_ctx.iter_mut() {
-            *c = MqContext(0);
+        if reset_bitmap_ctx {
+            for c in refine_ctx.iter_mut() {
+                *c = MqContext(0);
+            }
         }
     }
 
