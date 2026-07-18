@@ -4,9 +4,14 @@
 //! A counting global allocator measures heap allocations per decode. The
 //! guarantee asserted here is that the per-decode allocation count is *stable*
 //! across iterations of the same page — the context and target buffers are
-//! reused, so steady state does not grow. (The count is not zero yet: the page,
-//! region, and per-segment scratch buffers still allocate once per call; those
-//! are documented follow-up optimisations. Stability is the shipped guarantee.)
+//! reused, so steady state does not grow. Every allocation that scales with the
+//! page size (the page bitmap, each region bitmap) is now pooled in the
+//! `DecoderContext`, so the steady-state count is down to a single small,
+//! fixed-size allocation: the parser's `Vec<ParsedSegment>`. Eliminating that
+//! last one would need either `unsafe` to pool a lifetime-bearing `Vec` across
+//! calls or an offset-based rework of the public parse types — not worth it for
+//! a buffer that does not scale with the image. Stability is the shipped
+//! guarantee.
 
 mod common;
 

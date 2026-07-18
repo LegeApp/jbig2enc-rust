@@ -1,307 +1,185 @@
 # jbig2enc-rust
 
-`jbig2enc-rust` is a production-oriented JBIG2 encoder in Rust for scanned
-black-and-white documents, PDF embedding, and long multi-page text compression.
+A JBIG2 encoder and decoder in Rust for bilevel (black-and-white) images —
+scanned documents, PDF-embedded streams, and standalone JBIG2 files.
 
-The practical question for a project like this is simple: is it actually better
-than the original `jbig2enc`, or just newer?
+The crate is split into an `encode` half and a `decode` half over a shared
+protocol core. Both halves are independent Cargo features; a consumer can build
+either alone. Both halves are production ready.
 
-On a fair in-process `350`-page heads-up against the original encoder, using the
-same preloaded page set and release builds on both sides, the answer on
-text-heavy material is yes. The Rust encoder reaches generic-mode size parity
-with the original implementation, beats the original in plain symbol mode on
-both speed and file size, and its current `sym_unify` mode produces the best
-overall text compression result in the set.
+## Encoder
 
-Long-run snapshot on `sahib2/350p`:
+Three operating points:
 
-- `c generic`: `5228.2 KB` in `1.15s`
-- `rust generic`: `5232.2 KB` in `2.47s`
-- `c symbol`: `2566.5 KB` in `24.58s`
-- `rust symbol`: `2227.1 KB` in `6.05s`
-- `rust sym_unify`: `2025.9 KB` in `16.93s`
+- **`generic`** — pages encoded as generic JBIG2 regions, no symbol
+  dictionary. Fastest, lossless with respect to the input bitmap, largest
+  output of the three.
+- **`symbol`** — connected components are extracted, repeated glyphs are
+  grouped into a symbol dictionary, and page instances reference dictionary
+  entries. Lossy (symbol substitution), much smaller than `generic` on
+  text-heavy scans.
+- **`sym_unify`** — the symbol pipeline plus a family-unification pass that
+  merges symbol variants across pages (scanning noise, border variation,
+  page-to-page drift) using exact dictionary-entry byte accounting and
+  planner-side anchor remapping. Smallest output; slower than plain `symbol`.
 
-That means:
+Mode selection is by config preset:
 
-- Rust `generic` is effectively size-parity with the original encoder.
-- Rust `symbol` is `13.2%` smaller than original `jbig2enc` symbol mode and about
-  `4.1x` faster on this corpus.
-- Rust `sym_unify` is `21.1%` smaller than original `jbig2enc` symbol mode and
-  still faster than the original encoder.
+```rust
+use jbig2enc_rust::Jbig2Config;
 
-Within the Rust encoder itself on the same `350`-page run:
+let generic   = Jbig2Config::lossless();
+let symbol    = Jbig2Config::text();
+let sym_unify = Jbig2Config::text_symbol_unify();
+```
 
-- `symbol` is `57.4%` smaller than Rust `generic`.
-- `sym_unify` is `61.3%` smaller than Rust `generic`.
-- `sym_unify` is `9.0%` smaller than Rust `symbol`.
+### Measurements
 
-No substitution bugs have been observed on the benchmark corpora used during
-development. The remaining weakness is not catastrophic character confusion, but
-that the symbol modes still leave more material in generic residual regions than
-an ideal long-book encoder would. That is a compression-efficiency problem, not
-a known correctness failure.
+In-process 350-page comparison against the original C `jbig2enc` (same
+preloaded PBM page set, release builds both sides, page preparation outside
+the timed region), corpus `sahib2/350p`:
 
-The benchmark harness was built specifically to avoid the old subprocess-skewed
-comparison. Both encoders run in-process, both start from the same preloaded PBM
-pages, and page preparation is kept outside the timed region.
+- `c generic`: 5228.2 KB in 1.15 s
+- `rust generic`: 5232.2 KB in 2.47 s
+- `c symbol`: 2566.5 KB in 24.58 s
+- `rust symbol`: 2227.1 KB in 6.05 s
+- `rust sym_unify`: 2025.9 KB in 16.93 s
 
-## What The Modes Do
+Relative: Rust `generic` is size-parity with the C encoder; Rust `symbol` is
+13.2% smaller and about 4.1× faster than C symbol mode; `sym_unify` is 21.1%
+smaller than C symbol mode. Within the Rust encoder, `symbol` is 57.4% smaller
+than `generic`, and `sym_unify` is 61.3% smaller than `generic` (9.0% smaller
+than `symbol`).
 
-This encoder currently exposes three practical operating points:
+A `confed/10p` release benchmark after the 0.5.3 portable-SIMD comparator
+change (`wide`-based `u32x8` kernels in symbol matching, scalar early-exit
+preserved):
 
-### `generic`
+- `symbol`: 175.3 KB in 0.57 s
+- `sym_unify`: 145.0 KB in 2.47 s (17.3% smaller than `symbol`)
 
-This is the fastest and most conservative mode. It encodes pages as generic
-JBIG2 regions without building a lossy symbol dictionary. It is the right choice
-when speed, simplicity, or low-risk integration matters more than maximum
-compression.
+Known encoder limits: the symbol modes leave more material in generic residual
+regions than an ideal long-book encoder would, and refinement-assisted coding
+is not implemented. These are compression-efficiency limits; no substitution
+errors have been observed on the development corpora.
 
-- Best for: general bilevel pages, debugging, and lowest-complexity integration
-- Tradeoff: largest files of the three modes
-- `350p` result: `5232.2 KB`
+## Decoder
 
-### `symbol`
+A full-featured JBIG2 decoder covering both embedded (PDF `/JBIG2Decode`,
+globals stream + page stream) and standalone file organisation:
 
-This is the plain symbol-dictionary mode for text-heavy scans. The encoder
-extracts connected components, groups repeated glyphs into dictionary entries,
-and codes page instances by reference to those entries.
+- Generic regions: arithmetic templates 0–3, TPGDON, and MMR.
+- Symbol dictionaries and text regions: arithmetic and Huffman variants,
+  including refinement/aggregate coding and custom Huffman tables.
+- Refinement regions, pattern dictionaries, and halftone regions.
+- Striped pages, intermediate regions, and segment retention handling.
+- `DecodeStrictness::Compatible` accepts the spec deviations real-world
+  encoders produce and records each recovery as a typed `RecoveryEvent`;
+  `Strict` rejects them. Inputs outside the supported surface return typed
+  `Unsupported` errors — the decoder does not panic on malformed input.
+- `decode_embedded_into` decodes into caller-owned buffers through a pooled
+  `DecoderContext` (per-worker context, shared immutable `DecodedGlobals`),
+  for zero-allocation steady state in multi-page workloads. Output is packed
+  1-bit rows.
 
-- Best for: fast, practical compression of ordinary scanned text
-- Tradeoff: lossy symbol substitution, but far smaller output than `generic`
-- `350p` result: `2227.1 KB`
-- Savings: `57.4%` smaller than Rust `generic`
+Decode benchmarks (release, single thread): A4 generic page ~31 ms (parity
+with `jbig2dec` 0.20), symbol page ~4.4 ms, halftone page ~20 ms. `jbig2dec`
+is used as the differential oracle in the test suite; some validation tools
+expect it in `PATH`.
 
-### `sym_unify`
-
-This is the current advanced text mode. It starts from the symbol-dictionary
-pipeline, then does an additional family-unification pass to merge symbol
-variants more aggressively but still conservatively enough to avoid the
-substitution problems that make lossy JBIG2 dangerous when done badly.
-
-In practical terms, `sym_unify` tries to recognize that many "different" symbols
-are really members of the same glyph family once you account for scanning noise,
-border variation, and page-to-page drift. It builds candidate classes, selects
-representatives, estimates whether a merge will actually save bytes, and then
-lets the planner remap page-local one-offs onto already-useful anchors when they
-are safe enough to attach.
-
-It is not a direct copy of a single paper. It grew out of the project's own
-symbol-dictionary work, the same broad classifier-and-representative tradition
-seen in `djvulibre` and Leptonica's JBIG2 notes, and then was sharpened with
-ideas from the JBIG2 dictionary-design literature. The papers listed in the
-bibliography were used to pressure-test the design, tune the cost model, and
-refine the roadmap, even where their methods were not transplanted literally.
-
-- Best for: the smallest files on long, fairly uniform text corpora
-- Tradeoff: slower than plain `symbol`, but still faster than original `jbig2enc`
-  symbol mode in the current long-run comparison
-- `350p` result: `2025.9 KB`
-- Savings: `61.3%` smaller than Rust `generic`, `9.0%` smaller than Rust `symbol`
-
-## Recent Optimization Notes
-
-Version `0.5.3` adds a portable SIMD comparison path for symbol matching using
-the `wide` crate. The comparator keeps the existing word-wise shifted
-XOR/popcount search and preserves scalar early-exit behavior, while routing
-wide enough rows through portable `u32x8` kernels. This primarily targets the
-symbol-mode matching and `sym_unify` anchor checks where repeated bitmap
-comparison dominates runtime.
-
-A local `confed/10p` release benchmark after this change produced:
-
-- `symbol`: `175.3 KB` in `0.57s`
-- `sym_unify`: `145.0 KB` in `2.47s`
-- `sym_unify` size savings vs `symbol`: `17.3%`
-
-## Why This Repo Is Worth Using
-
-The original `jbig2enc` still deserves respect. It has age, field use, and many
-years of community familiarity behind it. This project is worth using anyway
-because it is no longer just a port. It is a faster encoder with a better current
-text-compression path.
-
-The main technical reasons are:
-
-- A full Rust encoder core with practical JBIG2 segment generation for standalone
-  files and PDF-style split output.
-- Connected-component extraction and text-symbol handling integrated directly
-  into the encoder pipeline.
-- A modern symbol-dictionary planner that can choose between plain symbol mode
-  and the stronger `sym_unify` path.
-- Exact dictionary-entry byte accounting for `sym_unify`, so class formation and
-  export decisions are based on realistic dictionary cost rather than rough
-  bitmap heuristics.
-- Planner-side local/global anchor remapping, which helps recover page-local
-  one-offs into the symbol system instead of leaving them in generic output.
-- A fair in-process benchmark bridge to the original C encoder, so performance
-  claims can be tested on the same basis.
-- Spec-oriented halftone support, including PDF split output for pattern
-  dictionaries and page-local halftone regions.
-
-## Current Limits
-
-This is not presented as "finished forever."
-
-The current symbol modes are already strong enough to beat the original encoder
-on the measured corpus, but there is still room to improve:
-
-- Too much text-like material still falls through to generic residual encoding in
-  `symbol` and especially `sym_unify`.
-- The long-book behavior is good but not ideal yet; dictionary growth flattens in
-  the right direction, but residual generic bytes are still higher than they
-  should be.
-- Refinement-assisted coding remains an open area for improvement rather than a
-  solved one.
-
-Those are compression-efficiency limits. They are exactly the kind of limits you
-want at this stage: the encoder is already useful, and the remaining work is
-about getting closer to the best possible file size without giving up safety.
-
-## Installation
-
-Add this to your `Cargo.toml`:
+## Usage
 
 ```toml
 [dependencies]
-jbig2enc-rust = "0.5.3"
+jbig2enc-rust = "0.5.3"            # encoder + decoder + symboldict (defaults)
 ```
 
-The symbol-dictionary feature is enabled by default. To be explicit:
+Decoder only:
 
 ```toml
 [dependencies.jbig2enc-rust]
 version = "0.5.3"
-features = ["symboldict"]
+default-features = false
+features = ["decode"]
 ```
 
-## Usage
-
-### Basic Encoding
+Encoding a single page:
 
 ```rust
 use jbig2enc_rust::{Jbig2Config, encode_single_image};
 
 let input = vec![0, 1, 0, 1, 1, 0, 1, 0];
-let width = 2;
-let height = 4;
-
-let _config = Jbig2Config::default();
+let (width, height) = (2, 4);
 let result = encode_single_image(&input, width, height, false)?;
 ```
 
-### PDF Mode Encoding
-
-For PDF embedding, use split global/page output:
+PDF split output (global dictionary and page-local data separated for
+embedding):
 
 ```rust
 use jbig2enc_rust::{Jbig2Context, encode_single_image};
 
-let input = vec![0, 1, 0, 1, 1, 0, 1, 0];
-let width = 2;
-let height = 4;
-
 let _ctx = Jbig2Context::with_pdf_mode(true);
 let result = encode_single_image(&input, width, height, true)?;
-// result.global_data contains global dictionary data, if any
-// result.page_data contains page-local data
+// result.global_data — global dictionary segments, if any
+// result.page_data   — page-local segments
 ```
 
-### Mode Presets
+## Cargo features
 
-```rust
-use jbig2enc_rust::Jbig2Config;
+- `encode` — the encoder half.
+- `decode` — the decoder half. Either half builds without the other.
+- `symboldict` — symbol-dictionary encoding (implies `encode`; on by default).
+- `parallel` — Rayon-based parallel helpers where available.
+- `tracing`, `trace_encoder`, `trace_arith` — logging/tracing hooks.
+- `line_verify` — line verification helpers.
+- `refine` — refinement-related configuration paths.
+- `profiling` — profiling support.
+- `halftone_bin` — image support for the halftone tooling binaries.
 
-let generic = Jbig2Config::lossless();
-let symbol = Jbig2Config::text();
-let sym_unify = Jbig2Config::text_symbol_unify();
+## Layout
+
 ```
-
-## Features
-
-Available Cargo features:
-
-- `symboldict`: enables symbol-dictionary encoding support
-- `tracing`: enables tracing-based debug logging
-- `trace_encoder`: enables additional encoder tracing
-- `trace_arith`: enables arithmetic-coder tracing hooks
-- `line_verify`: enables line verification helpers
-- `refine`: enables refinement-related configuration paths
-- `parallel`: enables Rayon-based parallel helpers where available
-- `profiling`: enables profiling support
-- `halftone_bin`: enables optional image support for halftone tooling paths
-
-## Architecture
-
-The main modules are:
-
-- `jbig2enc`: encoder pipeline, planning, dictionary export, and page assembly
-- `jbig2cc`: connected-component extraction for symbol workflows
-- `jbig2comparator`: symbol comparison and matching
-- `jbig2simd`: internal portable SIMD helpers for packed bitmap operations
-- `jbig2unify`: the `sym_unify` class-building and representative-selection pass
-- `jbig2cost`: dictionary cost accounting used by the planner
-- `jbig2halftone`: spec-oriented halftone encoding pipeline
-- `jbig2arith`: arithmetic coding support
-- `jbig2structs`: public configuration and core JBIG2 data structures
+src/
+  encode/   encoder pipeline: api, cc (connected components), classify,
+            comparator, simd, cost, unify planning, halftone, document assembly
+  decode/   decoder: segment/page parsing, generic/text/halftone regions,
+            symbol dictionaries, huffman, mmr, refinement, arith, context pooling
+  shared/   protocol core shared by both halves
+```
 
 ## Testing
 
-Run the library checks with:
-
 ```bash
-cargo check --lib
-```
-
-Comparator and SIMD-focused checks:
-
-```bash
-cargo test --lib jbig2simd
-cargo test --test comparator
+cargo test                                   # full suite
+cargo test --no-default-features --features decode   # decoder half alone
+cargo test --test comparator                 # symbol comparator
 cargo test --test perf_smoke -- --ignored --nocapture
 ```
 
-Some validation tools also expect `jbig2dec` to be available in `PATH`.
+The encoder's byte-identical output guard lives in
+`tests/encode_byte_identical.rs` (regenerate hashes with
+`UPDATE_ENCODE_HASHES=1`).
 
-## License Notice
+## License
 
-This crate is published under `MIT OR Apache-2.0`.
+`MIT OR Apache-2.0`.
 
-When built with symbol-dictionary support, the symbol matching path includes code
-adapted from `djvulibre`. That means binaries built with the relevant
-symbol-dictionary functionality may carry GPL implications. Review your build
-configuration and distribution requirements carefully before shipping.
+When built with `symboldict`, the symbol matching path includes code adapted
+from `djvulibre`; binaries built with that functionality may carry GPL
+implications. Review your build configuration before distributing.
 
-## Acknowledgments
+## References
 
-- Original `jbig2enc`
-- `djvulibre`
-- Leptonica's JBIG2 classifier notes
-- ISO/IEC 14492 (JBIG2)
-
-## Bibliography
-
-### Directly used implementation references
-
-- ISO/IEC 14492:2001. JBIG2 image coding standard.
+- ISO/IEC 14492:2001 (JBIG2)
 - Original `jbig2enc`: https://github.com/agl/jbig2enc
 - `djvulibre`: https://github.com/djvuzone/djvulibre
-- Leptonica, "Jbig2 Classifier." Informative background on conservative class
-  formation and substitution-avoidance behavior.
-- M. Valliappan, B. L. Evans, D. A. D. Tompkins, and F. Kossentini, "Lossy
-  Compression of Stochastic Halftones with JBIG2." This work directly informed
-  the halftone path implemented in this repository.
-
-### Sources used to hone, evaluate, and pressure-test the symbol roadmap
-
-These papers were not copied into the code as one-to-one implementations, but
-they were useful for understanding the design space, sharpening tradeoffs, and
-evaluating where the Rust encoder should go next.
-
-- Yan Ye, Dirck Schilling, Pamela Cosman, and Hyung Hwa Koy, "Symbol Dictionary
-  Design for the JBIG2 Standard."
-- Yan Ye and Pamela Cosman, "Fast and Memory Efficient JBIG2 Encoder."
-- Maribel Figuera, Jonghyon Yi, and Charles A. Bouman, "A New Approach to JBIG2
-  Binary Image Compression."
-- Yandong Guo, Dejan Depalov, Peter Bauer, Brent Bradburn, Jan P. Allebach, and
-  Charles A. Bouman, "Binary Image Compression Using Conditional Entropy-Based
-  Dictionary Design and Indexing."
+- Leptonica's JBIG2 classifier notes
+- M. Valliappan, B. L. Evans, D. A. D. Tompkins, F. Kossentini, "Lossy
+  Compression of Stochastic Halftones with JBIG2" (informed the halftone path)
+- Symbol-dictionary design literature consulted for the `sym_unify` cost model:
+  Ye/Schilling/Cosman/Koy, "Symbol Dictionary Design for the JBIG2 Standard";
+  Ye/Cosman, "Fast and Memory Efficient JBIG2 Encoder"; Figuera/Yi/Bouman,
+  "A New Approach to JBIG2 Binary Image Compression";
+  Guo/Depalov/Bauer/Bradburn/Allebach/Bouman, "Binary Image Compression Using
+  Conditional Entropy-Based Dictionary Design and Indexing"
