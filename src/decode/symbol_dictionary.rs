@@ -22,6 +22,7 @@ use crate::decode::iaid::IaidContexts;
 use crate::decode::integer::{DecodedInteger, IntegerContexts};
 use crate::decode::mmr::decode_mmr_bitmap;
 use crate::decode::refinement::{decode_refinement_region_templated, REFINEMENT_CONTEXT_COUNT};
+use crate::decode::text_region::{decode_text_region_arith, TextArithParams};
 use crate::shared::bitmap::MonoBitmap;
 use crate::shared::int_proc::IntProc;
 use crate::shared::limits::DecodeLimits;
@@ -134,6 +135,12 @@ pub fn decode_symbol_dictionary(
 
     let data = &payload[r.position()..];
 
+    if sdhuff && sdrefagg {
+        // A Huffman refinement/aggregate dictionary (Figure 25 layout with
+        // Huffman-coded offsets, §6.5.8.2) is a rare combination not modelled;
+        // the Huffman path below assumes SDREFAGG=0 (Figure 24).
+        return Err(DecodeError::Unsupported(UnsupportedFeature::SymbolRefinement));
+    }
     if sdhuff {
         return decode_symbol_dictionary_huffman(
             data,
@@ -297,16 +304,38 @@ fn decode_refagg_symbol(
 ) -> Result<MonoBitmap, DecodeError> {
     // §6.5.8.2.1 number of instances in the aggregation.
     let refagg_ninst = match int_ctx.decode(dec, IntProc::Iaai) {
-        DecodedInteger::Value(v) => v,
-        DecodedInteger::OutOfBand => {
+        DecodedInteger::Value(v) if v >= 0 => v,
+        _ => {
             return Err(DecodeError::Malformed {
-                reason: "OOB where REFAGGNINST expected",
+                reason: "invalid REFAGGNINST",
             });
         }
     };
-    if refagg_ninst != 1 {
-        // True aggregate coding (an internal text region) is deferred.
-        return Err(DecodeError::Unsupported(UnsupportedFeature::SymbolRefinement));
+    if refagg_ninst > 1 {
+        // §6.5.8.2 step 2: a true aggregate is decoded as an internal text
+        // region (Table 17) over SBSYMS = imported ++ already-decoded new
+        // symbols, sharing this dictionary's arithmetic decoder and contexts.
+        let mut combined: Vec<Arc<MonoBitmap>> = Vec::with_capacity(imported.len() + new_symbols.len());
+        combined.extend(imported.iter().cloned());
+        combined.extend(new_symbols.iter().cloned());
+        let params = TextArithParams {
+            width: sym_width,
+            height: hc_height,
+            num_instances: refagg_ninst as u32,
+            log_strips: 0, // SBSTRIPS = 1
+            ref_corner: 1, // TOPLEFT
+            transposed: false,
+            sb_comb_op: 0, // OR
+            sb_def_pixel: false,
+            sb_ds_offset: 0,
+            sbrefine: true,
+            sb_rtemplate: sdrtemplate,
+            grat: sdrat,
+            code_len,
+        };
+        return decode_text_region_arith(
+            dec, &params, &combined, int_ctx, iaid_ctx, refine_ctx, limits,
+        );
     }
 
     // §6.5.8.2.2: symbol ID, then refinement offsets, then refine the reference.

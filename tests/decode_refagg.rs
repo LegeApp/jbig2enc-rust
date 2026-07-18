@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::writer::{refagg_page, standalone_file, TestBitmap};
+use common::writer::{aggregate_page, refagg_page, standalone_file, TestBitmap};
 use jbig2enc_rust::decode::{decode_embedded, DecodeOptions};
 
 fn glyph(w: u32, h: u32, seed: u32) -> TestBitmap {
@@ -54,6 +54,70 @@ fn refagg_refined_symbols() {
         for gy in 0..g.height {
             for gx in 0..g.width {
                 if g.get(gx, gy) {
+                    let px = s + gx as i32;
+                    if px >= 0 && (px as u32) < w {
+                        expected.set(px as u32, gy, true);
+                    }
+                }
+            }
+        }
+    }
+
+    let opts = DecodeOptions::default();
+    let got = decode_embedded(None, &stream, &opts)
+        .unwrap_or_else(|e| panic!("native decode failed: {e}"));
+    for y in 0..h {
+        for x in 0..w {
+            assert_eq!(got.get(x, y), expected.get(x, y), "native ({x},{y})");
+        }
+    }
+
+    let file = standalone_file(&stream);
+    if let Some(res) = common::oracle::decode_standalone(&file) {
+        let pbm = res.unwrap_or_else(|e| panic!("jbig2dec failed: {e}"));
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(pbm.get(x, y) != 0, expected.get(x, y), "oracle ({x},{y})");
+            }
+        }
+    }
+}
+
+#[test]
+fn refagg_aggregate_symbol() {
+    // Two base symbols aggregated (REFAGGNINST=2) into one new symbol, then that
+    // aggregate placed by a text region.
+    let base = vec![glyph(4, 8, 10), glyph(5, 8, 11)];
+    // Aggregate: base 0 at S=0 (x 0..3), base 1 at S=4 (x 4..8). SYMWIDTH = 9.
+    let instances = [(0usize, 0i32), (1, 4)];
+    let sym_width = 9u32;
+    let sym_height = 8u32;
+    // Place the aggregate symbol at S=1 and S=12.
+    let placements = [(0usize, 1i32), (0, 12)];
+    let (w, h) = (28u32, 12u32);
+
+    let stream = aggregate_page(w, h, &base, &instances, sym_width, sym_height, &placements);
+
+    // The aggregate symbol = base0 at (0,0) OR base1 at (4,0), 9x8.
+    let mut agg = TestBitmap::new(sym_width, sym_height);
+    for gy in 0..8 {
+        for gx in 0..4 {
+            if base[0].get(gx, gy) {
+                agg.set(gx, gy, true);
+            }
+        }
+        for gx in 0..5 {
+            if base[1].get(gx, gy) {
+                agg.set(4 + gx, gy, true);
+            }
+        }
+    }
+    // Expected page: the aggregate placed at each S.
+    let mut expected = TestBitmap::new(w, h);
+    for &(_, s) in &placements {
+        for gy in 0..agg.height {
+            for gx in 0..agg.width {
+                if agg.get(gx, gy) {
                     let px = s + gx as i32;
                     if px >= 0 && (px as u32) < w {
                         expected.set(px as u32, gy, true);

@@ -878,6 +878,107 @@ pub fn arith_refagg_dict_payload(
     payload
 }
 
+/// Build an SDREFAGG=1 dictionary payload defining ONE aggregate symbol
+/// (REFAGGNINST>1, §6.5.8.2 step 2): the new symbol is a text region of
+/// `instances` (base_id, s) placed TOPLEFT, RI=0, SBSTRIPS=1, into a
+/// `sym_width`-wide bitmap. Every base symbol shares the aggregate's height.
+pub fn arith_aggregate_dict_payload(
+    imported: &[TestBitmap],
+    instances: &[(usize, i32)],
+    sym_width: u32,
+) -> Vec<u8> {
+    let total = imported.len() + 1;
+    let code_len = log2_ceil(total).max(1);
+    let height = imported[0].height;
+
+    let mut coder = Jbig2ArithCoder::new();
+    coder.encode_integer(IntProc::Iadh, height as i32).unwrap();
+    // Single new symbol: DW from 0.
+    coder.encode_integer(IntProc::Iadw, sym_width as i32).unwrap();
+    // Its bitmap is an aggregate text region of `instances`.
+    coder
+        .encode_integer(IntProc::Iaai, instances.len() as i32)
+        .unwrap();
+    coder.encode_integer(IntProc::Iadt, 0).unwrap(); // initial STRIPT (DT0)
+    coder.encode_integer(IntProc::Iadt, 0).unwrap(); // strip delta T
+    let (id0, s0) = instances[0];
+    coder.encode_integer(IntProc::Iafs, s0).unwrap();
+    coder.encode_iaid(id0 as u32, code_len).unwrap();
+    coder.encode_integer(IntProc::Iari, 0).unwrap(); // RI = 0
+    let mut cur_s = s0 + imported[id0].width as i32 - 1;
+    for &(id, s) in &instances[1..] {
+        coder.encode_integer(IntProc::Iads, s - cur_s).unwrap();
+        coder.encode_iaid(id as u32, code_len).unwrap();
+        coder.encode_integer(IntProc::Iari, 0).unwrap();
+        cur_s = s + imported[id].width as i32 - 1;
+    }
+    coder.encode_oob(IntProc::Iads).unwrap(); // end of strip
+    coder.encode_oob(IntProc::Iadw).unwrap(); // end of height class
+    coder
+        .encode_integer(IntProc::Iaex, imported.len() as i32)
+        .unwrap();
+    coder.encode_integer(IntProc::Iaex, 1).unwrap();
+    coder.flush(true);
+    let data = coder.as_bytes().to_vec();
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0x0002u16.to_be_bytes()); // SDREFAGG=1, SDHUFF=0
+    for (ax, ay) in [(3i8, -1i8), (-3, -1), (2, -2), (-2, -2)] {
+        payload.push(ax as u8);
+        payload.push(ay as u8);
+    }
+    for (ax, ay) in [(-1i8, -1i8), (-1, -1)] {
+        payload.push(ax as u8);
+        payload.push(ay as u8);
+    }
+    payload.extend_from_slice(&1u32.to_be_bytes()); // SDNUMEXSYMS
+    payload.extend_from_slice(&1u32.to_be_bytes()); // SDNUMNEWSYMS
+    payload.extend_from_slice(&data);
+    payload
+}
+
+/// A page: Huffman base dictionary (seg 1), an SDREFAGG dictionary defining one
+/// aggregate symbol (seg 2), and a Huffman text region placing that aggregate
+/// symbol (seg 3).
+pub fn aggregate_page(
+    page_w: u32,
+    page_h: u32,
+    base: &[TestBitmap],
+    instances: &[(usize, i32)],
+    sym_width: u32,
+    sym_height: u32,
+    placements: &[(usize, i32)],
+) -> Vec<u8> {
+    let mut stream = Vec::new();
+    let page_data = page_info_payload(page_w, page_h);
+    stream.extend_from_slice(&segment_header(0, 48, &[], 1, page_data.len() as u32));
+    stream.extend_from_slice(&page_data);
+
+    let base_dict = huffman_symbol_dict_payload(base);
+    stream.extend_from_slice(&segment_header(1, 0, &[], 1, base_dict.len() as u32));
+    stream.extend_from_slice(&base_dict);
+
+    let agg = arith_aggregate_dict_payload(base, instances, sym_width);
+    stream.extend_from_slice(&segment_header(2, 0, &[1], 1, agg.len() as u32));
+    stream.extend_from_slice(&agg);
+
+    // Text region placing the single aggregate symbol.
+    let region = huffman_text_region_payload(
+        page_w,
+        page_h,
+        1,
+        &[sym_width],
+        &[sym_height],
+        placements,
+        false,
+    );
+    stream.extend_from_slice(&segment_header(3, 6, &[2], 1, region.len() as u32));
+    stream.extend_from_slice(&region);
+
+    stream.extend_from_slice(&segment_header(4, 49, &[], 1, 0));
+    stream
+}
+
 /// A page: a Huffman symbol dictionary of base symbols (segment 1), an SDREFAGG
 /// dictionary refining them (segment 2), and a Huffman text region placing the
 /// refined symbols (segment 3).

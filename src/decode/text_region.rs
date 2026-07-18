@@ -19,7 +19,7 @@ use crate::decode::error::{DecodeError, LimitError, UnsupportedFeature};
 use crate::decode::huffman::{standard_table, BitReader, HuffmanTable, HuffmanValue};
 use crate::decode::iaid::IaidContexts;
 use crate::decode::integer::{DecodedInteger, IntegerContexts};
-use crate::decode::refinement::decode_refinement_region;
+use crate::decode::refinement::decode_refinement_region_templated;
 use crate::shared::bitmap::{CombinationOperator, MonoBitmap};
 use crate::shared::int_proc::IntProc;
 use crate::shared::limits::DecodeLimits;
@@ -143,10 +143,6 @@ pub fn decode_text_region(
         let _g2y = r.read_i8()?;
         grat = (g1x, g1y);
     }
-    if sbrefine && sb_rtemplate != 0 {
-        // GRTEMPLATE-1 refinement is Phase 3.
-        return Err(DecodeError::Unsupported(UnsupportedFeature::RefinementRegion));
-    }
 
     // §7.4.3.1.7 SBNUMINSTANCES.
     let num_instances = r.read_u32_be()?;
@@ -158,8 +154,7 @@ pub fn decode_text_region(
         }));
     }
 
-    let sb_num_syms = symbols.len() as u32;
-    let code_len = log2_ceil(sb_num_syms) as u8;
+    let code_len = log2_ceil(symbols.len() as u32) as u8;
     iaid_ctx.reset_for_bits(code_len)?;
     int_ctx.reset();
     if sbrefine {
@@ -168,29 +163,84 @@ pub fn decode_text_region(
         }
     }
 
-    let sb_strips: i64 = 1i64 << (log_strips & 0x03);
-    let region_op = comb_op(ext_comb);
-    let symbol_op = comb_op(sb_comb_op);
-
+    let params = TextArithParams {
+        width,
+        height,
+        num_instances,
+        log_strips,
+        ref_corner,
+        transposed,
+        sb_comb_op,
+        sb_def_pixel,
+        sb_ds_offset,
+        sbrefine,
+        sb_rtemplate,
+        grat,
+        code_len,
+    };
     let data = &payload[r.position()..];
-    let mut bitmap = MonoBitmap::new(width, height, sb_def_pixel, limits)?;
     let mut dec = ArithmeticDecoder::new(data);
+    let bitmap = decode_text_region_arith(
+        &mut dec, &params, symbols, int_ctx, iaid_ctx, refine_ctx, limits,
+    )?;
+    Ok(TextRegionResult {
+        bitmap,
+        x,
+        y,
+        comb_operator: ext_comb,
+    })
+}
+
+/// Explicit parameters for the arithmetic text-region core, so it can serve both
+/// a text-region segment and an aggregate symbol-dictionary symbol (§6.5.8.2).
+pub(crate) struct TextArithParams {
+    pub width: u32,
+    pub height: u32,
+    pub num_instances: u32,
+    pub log_strips: u8,
+    pub ref_corner: u8,
+    pub transposed: bool,
+    pub sb_comb_op: u8,
+    pub sb_def_pixel: bool,
+    pub sb_ds_offset: i32,
+    pub sbrefine: bool,
+    pub sb_rtemplate: u8,
+    pub grat: (i8, i8),
+    pub code_len: u8,
+}
+
+/// The arithmetic text-region strip/placement loop (T.88 §6.4.5), decoding from
+/// an existing arithmetic decoder and context banks (which the caller has reset
+/// or is carrying across an aggregate invocation).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_text_region_arith(
+    dec: &mut ArithmeticDecoder<'_>,
+    p: &TextArithParams,
+    symbols: &[Arc<MonoBitmap>],
+    int_ctx: &mut IntegerContexts,
+    iaid_ctx: &mut IaidContexts,
+    refine_ctx: &mut [MqContext],
+    limits: &DecodeLimits,
+) -> Result<MonoBitmap, DecodeError> {
+    let sb_strips: i64 = 1i64 << (p.log_strips & 0x03);
+    let symbol_op = comb_op(p.sb_comb_op);
+    let mut bitmap = MonoBitmap::new(p.width, p.height, p.sb_def_pixel, limits)?;
 
     // §6.4.5 1) initial STRIPT.
-    let dt0 = decode_value(int_ctx.decode(&mut dec, IntProc::Iadt))?;
+    let dt0 = decode_value(int_ctx.decode(dec, IntProc::Iadt))?;
     let mut strip_t: i64 = -(dt0 as i64 * sb_strips);
     let mut first_s: i64 = 0;
     let mut n_inst: u32 = 0;
 
-    while n_inst < num_instances {
+    while n_inst < p.num_instances {
         // §6.4.5 3b) strip T delta.
-        let dt = decode_value(int_ctx.decode(&mut dec, IntProc::Iadt))?;
+        let dt = decode_value(int_ctx.decode(dec, IntProc::Iadt))?;
         strip_t = strip_t
             .checked_add(dt as i64 * sb_strips)
             .ok_or(DecodeError::Overflow { operation: "strip T" })?;
 
         // §6.4.5 3c) first symbol S coordinate.
-        let dfs = decode_value(int_ctx.decode(&mut dec, IntProc::Iafs))?;
+        let dfs = decode_value(int_ctx.decode(dec, IntProc::Iafs))?;
         first_s = first_s
             .checked_add(dfs as i64)
             .ok_or(DecodeError::Overflow { operation: "first S" })?;
@@ -200,18 +250,18 @@ pub fn decode_text_region(
         loop {
             if !first_in_strip {
                 // §6.4.5 3c) subsequent S: IADS, OOB ends the strip.
-                match int_ctx.decode(&mut dec, IntProc::Iads) {
+                match int_ctx.decode(dec, IntProc::Iads) {
                     DecodedInteger::OutOfBand => break,
                     DecodedInteger::Value(ids) => {
                         cur_s = cur_s
-                            .checked_add(ids as i64 + sb_ds_offset as i64)
+                            .checked_add(ids as i64 + p.sb_ds_offset as i64)
                             .ok_or(DecodeError::Overflow { operation: "S coordinate" })?;
                     }
                 }
             }
             first_in_strip = false;
 
-            if n_inst >= num_instances {
+            if n_inst >= p.num_instances {
                 return Err(DecodeError::Malformed {
                     reason: "more text instances than SBNUMINSTANCES",
                 });
@@ -221,22 +271,22 @@ pub fn decode_text_region(
             let cur_t = if sb_strips == 1 {
                 0
             } else {
-                decode_value(int_ctx.decode(&mut dec, IntProc::Iait))? as i64
+                decode_value(int_ctx.decode(dec, IntProc::Iait))? as i64
             };
             let t_i = strip_t
                 .checked_add(cur_t)
                 .ok_or(DecodeError::Overflow { operation: "T coordinate" })?;
 
             // §6.4.5 3c x) symbol id.
-            let id = iaid_ctx.decode(&mut dec, code_len);
+            let id = iaid_ctx.decode(dec, p.code_len);
             let symbol = symbols.get(id as usize).ok_or(DecodeError::Malformed {
                 reason: "symbol id out of range",
             })?;
             let hi = symbol.height() as i64;
 
             // §6.4.11 refinement indicator (only present when SBREFINE=1).
-            let ri = if sbrefine {
-                decode_value(int_ctx.decode(&mut dec, IntProc::Iari))?
+            let ri = if p.sbrefine {
+                decode_value(int_ctx.decode(dec, IntProc::Iari))?
             } else {
                 0
             };
@@ -244,10 +294,10 @@ pub fn decode_text_region(
             // The glyph actually placed: the reference symbol, or a decoded
             // refinement of it. `placed_height` anchors bottom reference corners.
             let (placed, placed_height): (PlacedSymbol<'_>, i64) = if ri != 0 {
-                let rdw = decode_value(int_ctx.decode(&mut dec, IntProc::Iardw))? as i64;
-                let rdh = decode_value(int_ctx.decode(&mut dec, IntProc::Iardh))? as i64;
-                let rdx = decode_value(int_ctx.decode(&mut dec, IntProc::Iardx))?;
-                let rdy = decode_value(int_ctx.decode(&mut dec, IntProc::Iardy))?;
+                let rdw = decode_value(int_ctx.decode(dec, IntProc::Iardw))? as i64;
+                let rdh = decode_value(int_ctx.decode(dec, IntProc::Iardh))? as i64;
+                let rdx = decode_value(int_ctx.decode(dec, IntProc::Iardx))?;
+                let rdy = decode_value(int_ctx.decode(dec, IntProc::Iardy))?;
                 let grw = symbol.width() as i64 + rdw;
                 let grh = symbol.height() as i64 + rdh;
                 if grw <= 0
@@ -260,20 +310,19 @@ pub fn decode_text_region(
                     });
                 }
                 // §6.3.5.3: GRREFERENCEDX/DY = floor(RDW/2)+RDX, floor(RDH/2)+RDY.
-                // RDW/RDH are bounded by the grw/grh range check above, but RDX/RDY
-                // are unbounded decoded integers, so a malformed stream can drive
-                // the sum past i32. Saturate: an out-of-range offset just makes the
-                // reference window read as all-zero (a bounded, if wrong, bitmap).
+                // RDX/RDY are unbounded decoded integers; saturate the sum.
                 let grdx = (rdw.div_euclid(2) as i32).saturating_add(rdx);
                 let grdy = (rdh.div_euclid(2) as i32).saturating_add(rdy);
-                let refined = decode_refinement_region(
-                    &mut dec,
+                let refined = decode_refinement_region_templated(
+                    dec,
                     symbol,
                     grw as u32,
                     grh as u32,
                     grdx,
                     grdy,
-                    grat,
+                    p.sb_rtemplate,
+                    false,
+                    p.grat,
                     refine_ctx,
                     limits,
                 )?;
@@ -282,15 +331,14 @@ pub fn decode_text_region(
                 (PlacedSymbol::Borrowed(symbol), hi)
             };
 
-            // Placement (all four reference corners, transposed or not). The
-            // placed glyph is the reference symbol, or its refinement when RI=1;
-            // CURS advances by the *placed* glyph extent, matching jbig2dec.
+            // Placement (all four reference corners, transposed or not). CURS
+            // advances by the *placed* glyph extent, matching jbig2dec.
             let placed_width = placed.bitmap().width() as i64;
             place_symbol(
                 &mut bitmap,
                 placed.bitmap(),
-                ref_corner,
-                transposed,
+                p.ref_corner,
+                p.transposed,
                 &mut cur_s,
                 t_i,
                 placed_width,
@@ -298,24 +346,13 @@ pub fn decode_text_region(
                 symbol_op,
             )?;
             n_inst += 1;
-            if n_inst == num_instances {
-                return Ok(TextRegionResult {
-                    bitmap,
-                    x,
-                    y,
-                    comb_operator: ext_comb,
-                });
-            }
+            // §6.4.5: completion is checked at the strip boundary (step 4a), so
+            // decode the whole strip through its terminating IADS OOB before
+            // stopping — essential when an aggregate shares its arithmetic
+            // stream with the enclosing dictionary.
         }
     }
-
-    let _ = region_op; // region composition operator is applied by the caller
-    Ok(TextRegionResult {
-        bitmap,
-        x,
-        y,
-        comb_operator: ext_comb,
-    })
+    Ok(bitmap)
 }
 
 /// Geometry from the region-segment information field.
