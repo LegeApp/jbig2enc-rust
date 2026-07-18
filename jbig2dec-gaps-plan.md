@@ -369,6 +369,49 @@ diff, runs the checklist, and only then does the next phase start.
   both as a native round-trip and against jbig2dec (odd-width matrix, banded
   and all-duplicate-row images for the LTP=1 path). Reused by later sub-phases.
 
+## Phase 5c findings (Huffman decoding)
+
+* **Huffman symbol dictionaries and text regions decode pixel-exact vs
+  jbig2dec 0.20.** `src/decode/huffman.rs` holds the machinery: an MSB-first
+  `BitReader`, canonical table representation with B.3 code assignment, all 15
+  standard tables B.1–B.15 as static line lists, segment-type-53 custom-table
+  parsing (B.2), and a `from_code_lengths` constructor for the RUNCODE and
+  SBSYMCODES symbol-ID tables. The `HuffmanCoding` `UnsupportedFeature` variant
+  is deleted.
+
+* **Symbol dictionary SDHUFF=1 (§6.5, Figure 24):** height-class delta heights
+  (SDHUFFDH) and delta widths (SDHUFFDW/OOB) drive a per-class collective
+  bitmap read via SDHUFFBMSIZE — BMSIZE=0 uncompressed (byte-padded rows) or
+  MMR of exactly BMSIZE bytes — then split into symbols; export runs via Table
+  B.1. Table selection resolves standard tables or referred custom tables
+  (type 53) consumed in field order (§7.4.3.1.6).
+
+* **Text region SBHUFF=1 (§6.4):** the symbol-ID Huffman table (§7.4.3.1.7 —
+  35 RUNCODE lengths, run-length-coded symbol-ID code lengths, B.3 assignment)
+  is the fiddliest part and is exercised directly. FS/DS/DT table selection,
+  the SBSTRIPS strip/T bookkeeping, and all four reference corners are
+  implemented. A single `BitReader` spans the symbol-ID table and the strip
+  data (the table ends byte-aligned).
+
+* **Store/plumbing:** `DecodedSegment::HuffmanTable` + `gather_huffman_tables`;
+  type-53 Tables segments are parsed into the store in both `page.rs` and
+  `globals.rs`.
+
+* **Oracle:** `tests/common/writer.rs` gained a Huffman writer (a `BitWriter`
+  plus `encode_value`/`encode_oob` test helpers on `HuffmanTable`).
+  `tests/decode_huffman.rs` builds pages of a Huffman symbol dictionary + a
+  Huffman text region and checks native == expected == jbig2dec.
+
+* **Deferred (documented):** (1) The MMR collective-bitmap branch (BMSIZE>0)
+  reuses the Phase-4-validated `decode_mmr_bitmap` but is not yet directly
+  oracle-tested — the writer emits BMSIZE=0. (2) Custom (type-53) tables are
+  unit-tested against the B.5 byte-encoding example but not end-to-end via the
+  oracle. (3) Huffman + refinement (SBREFINE=1) and transposed Huffman text
+  regions surface as typed `Unsupported`, folded into Phase 5e. (4) A Huffman
+  symbol-ID table with a single symbol of code length 0 (zero-bit ID) is a spec
+  edge case the current `decode()` bit-matching does not special-case; tests
+  use ≥2 symbols.
+
 ## Gap F: Out of scope for now (explicitly deferred)
 
 * Product B / Phase 5 (Huffman, striped pages, random access, templates

@@ -121,12 +121,13 @@ pub(crate) fn decode_symbol_dict_into(
 ) -> Result<Arc<SymbolDictionary>, DecodeError> {
     let imported =
         local.gather_symbols(seg.header.number, &seg.header.referred_to, globals)?;
+    let tables = local.gather_huffman_tables(&seg.header.referred_to, globals);
 
     ctx.ensure_generic();
     // Disjoint field borrows: generic + integer context banks at once.
     let generic = &mut ctx.generic_contexts[..crate::decode::context::GENERIC_CONTEXT_COUNT];
     let int_ctx = &mut ctx.integer_contexts;
-    let dict = decode_symbol_dictionary(seg.data, &imported, limits, int_ctx, generic)
+    let dict = decode_symbol_dictionary(seg.data, &imported, &tables, limits, int_ctx, generic)
         .map_err(|source| annotate(seg.header.number, source))?;
 
     let arc = Arc::new(dict);
@@ -154,6 +155,21 @@ pub(crate) fn decode_pattern_dict_into(
         DecodedSegment::PatternDictionary(arc.clone()),
     )?;
     Ok(arc)
+}
+
+/// Parse a custom Huffman-table segment (type 53, T.88 §7.4.13) and register it
+/// in `local` for later symbol dictionaries / text regions to reference.
+pub(crate) fn decode_tables_into(
+    seg: &ParsedSegment<'_>,
+    local: &mut SegmentStore,
+    limits: &DecodeLimits,
+) -> Result<(), DecodeError> {
+    let table = crate::decode::huffman::parse_custom_table(seg.data, limits)
+        .map_err(|source| annotate(seg.header.number, source))?;
+    local.insert(
+        seg.header.number,
+        DecodedSegment::HuffmanTable(Arc::new(table)),
+    )
 }
 
 /// Attach the segment number to a bare parse error; other errors pass through.
@@ -194,6 +210,7 @@ pub fn process_document_with_globals(
                     &seg.header.referred_to,
                     globals_store,
                 )?;
+                let tables = store.gather_huffman_tables(&seg.header.referred_to, globals_store);
                 // Ensure the refinement bank is sized, then split disjoint field
                 // borrows for the integer, IAID, and refinement context banks.
                 if ctx.refinement_contexts.len() < REFINEMENT_CONTEXT_COUNT {
@@ -203,9 +220,10 @@ pub fn process_document_with_globals(
                 let int_ctx = &mut ctx.integer_contexts;
                 let iaid_ctx = &mut ctx.iaid_contexts;
                 let refine_ctx = &mut ctx.refinement_contexts[..REFINEMENT_CONTEXT_COUNT];
-                let result =
-                    decode_text_region(seg.data, &symbols, limits, int_ctx, iaid_ctx, refine_ctx)
-                        .map_err(|source| annotate(seg.header.number, source))?;
+                let result = decode_text_region(
+                    seg.data, &symbols, &tables, limits, int_ctx, iaid_ctx, refine_ctx,
+                )
+                .map_err(|source| annotate(seg.header.number, source))?;
                 let target =
                     resolve_page(&mut pages, current, seg.header.page_association)?;
                 compose_region(
@@ -368,7 +386,7 @@ pub fn process_document_with_globals(
                 ));
             }
             Some(SegmentType::Tables) => {
-                return Err(DecodeError::Unsupported(UnsupportedFeature::HuffmanCoding));
+                decode_tables_into(seg, &mut store, limits)?;
             }
             Some(SegmentType::ColorPalette) | Some(SegmentType::FileHeader) => {}
             None => {

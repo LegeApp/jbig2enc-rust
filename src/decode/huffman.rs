@@ -188,6 +188,28 @@ impl HuffmanTable {
         })
     }
 
+    /// Build a "pure prefix" table from a list of code lengths, where decoding
+    /// yields the *index* of the matched length (T.88 §7.4.3.1.7: the RUNCODE
+    /// table and the SBSYMCODES symbol-ID table). A length of 0 means the value
+    /// is unused. Each line carries no range bits.
+    pub fn from_code_lengths(lengths: &[u32]) -> Result<Self, DecodeError> {
+        let mut lines = Vec::with_capacity(lengths.len());
+        for (i, &len) in lengths.iter().enumerate() {
+            if len > 32 {
+                return Err(DecodeError::Malformed {
+                    reason: "symbol-ID code length exceeds 32 bits",
+                });
+            }
+            lines.push(RawLine {
+                pref_len: len as u8,
+                range_len: 0,
+                range_low: i as i64,
+                kind: LineKind::Normal,
+            });
+        }
+        HuffmanTable::build(lines)
+    }
+
     /// Decode one value (B.4). Returns [`HuffmanValue::Oob`] for the OOB line.
     pub fn decode(&self, r: &mut BitReader<'_>) -> Result<HuffmanValue, DecodeError> {
         // Accumulate bits until (length, code) matches a line. Bounded by the
@@ -208,6 +230,54 @@ impl HuffmanTable {
                 }
             }
         }
+    }
+
+    /// Test/encoder helper: the bits to emit for `value` — `(prefix_code,
+    /// prefix_len, offset, range_len)`. Returns `None` if no line covers it.
+    #[allow(dead_code)]
+    pub fn encode_value(&self, value: i32) -> Option<(u32, u8, u64, u8)> {
+        let v = value as i64;
+        // Bounded normal lines first (disjoint ascending ranges below HTHIGH).
+        for (i, l) in self.lines.iter().enumerate() {
+            if l.pref_len == 0 || l.kind != LineKind::Normal || l.range_len >= 32 {
+                continue;
+            }
+            let lo = l.range_low;
+            let hi = lo + (1i64 << l.range_len) - 1;
+            if v >= lo && v <= hi {
+                return Some((self.codes[i], l.pref_len, (v - lo) as u64, l.range_len));
+            }
+        }
+        // Upper range line (Normal, 32-bit): covers value >= range_low.
+        for (i, l) in self.lines.iter().enumerate() {
+            if l.pref_len == 0 || l.kind != LineKind::Normal || l.range_len < 32 {
+                continue;
+            }
+            if v >= l.range_low {
+                return Some((self.codes[i], l.pref_len, (v - l.range_low) as u64, 32));
+            }
+        }
+        // Lower range line: covers value <= range_low.
+        for (i, l) in self.lines.iter().enumerate() {
+            if l.pref_len == 0 || l.kind != LineKind::Lower {
+                continue;
+            }
+            if v <= l.range_low {
+                return Some((self.codes[i], l.pref_len, (l.range_low - v) as u64, l.range_len));
+            }
+        }
+        None
+    }
+
+    /// Test/encoder helper: the OOB prefix `(code, len)`, if this table has one.
+    #[allow(dead_code)]
+    pub fn encode_oob(&self) -> Option<(u32, u8)> {
+        for (i, l) in self.lines.iter().enumerate() {
+            if l.kind == LineKind::Oob && l.pref_len > 0 {
+                return Some((self.codes[i], l.pref_len));
+            }
+        }
+        None
     }
 
     fn emit(&self, l: &RawLine, r: &mut BitReader<'_>) -> Result<HuffmanValue, DecodeError> {

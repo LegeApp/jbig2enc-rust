@@ -15,8 +15,6 @@ pub enum UnsupportedFeature {
     RandomAccessOrganisation,
     #[error("unknown segment data length")]
     UnknownSegmentLength,
-    #[error("Huffman-coded segment")]
-    HuffmanCoding,
     #[error("MMR (Group 4) coding")]
     MmrCoding,
     #[error("symbol dictionary / text region segment")]
@@ -158,10 +156,10 @@ mod tests {
         let e: DecodeError = ParseError::InvalidFileHeader.into();
         assert!(matches!(e, DecodeError::Parse(ParseError::InvalidFileHeader)));
 
-        let e: DecodeError = UnsupportedFeature::HuffmanCoding.into();
+        let e: DecodeError = UnsupportedFeature::MmrCoding.into();
         assert!(matches!(
             e,
-            DecodeError::Unsupported(UnsupportedFeature::HuffmanCoding)
+            DecodeError::Unsupported(UnsupportedFeature::MmrCoding)
         ));
     }
 

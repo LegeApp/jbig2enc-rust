@@ -17,7 +17,9 @@ use std::sync::Arc;
 use crate::decode::arith::ArithmeticDecoder;
 use crate::decode::error::{DecodeError, LimitError, UnsupportedFeature, usize_from_u32};
 use crate::decode::generic::decode_generic_bitmap;
+use crate::decode::huffman::{standard_table, BitReader, HuffmanTable, HuffmanValue};
 use crate::decode::integer::{DecodedInteger, IntegerContexts};
+use crate::decode::mmr::decode_mmr_bitmap;
 use crate::shared::bitmap::MonoBitmap;
 use crate::shared::int_proc::IntProc;
 use crate::shared::limits::DecodeLimits;
@@ -48,9 +50,11 @@ impl SymbolDictionary {
 /// here (a fresh dictionary starts every context at zero, matching the
 /// encoder's per-segment coder). `generic_ctx` must be at least `1 << 16`
 /// entries.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_symbol_dictionary(
     payload: &[u8],
     imported: &[Arc<MonoBitmap>],
+    huffman_tables: &[Arc<HuffmanTable>],
     limits: &DecodeLimits,
     int_ctx: &mut IntegerContexts,
     generic_ctx: &mut [MqContext],
@@ -62,20 +66,19 @@ pub fn decode_symbol_dictionary(
     let sdhuff = flags & 0x0001 != 0;
     let sdrefagg = flags & 0x0002 != 0;
     let sdtemplate = ((flags >> 10) & 0x0003) as u8;
-    if sdhuff {
-        return Err(DecodeError::Unsupported(UnsupportedFeature::HuffmanCoding));
-    }
     if sdrefagg {
         return Err(DecodeError::Unsupported(UnsupportedFeature::SymbolRefinement));
     }
-    // §7.4.2.1.2 SDAT: template 0 (SDHUFF=0) carries 4 adaptive pixels;
-    // templates 1–3 carry a single adaptive pixel.
+    // §7.4.2.1.2 SDAT: present only when SDHUFF=0. Template 0 carries 4 adaptive
+    // pixels; templates 1–3 carry a single adaptive pixel.
     let mut at = [(0i8, 0i8); 4];
-    let at_count = if sdtemplate == 0 { 4 } else { 1 };
-    for slot in at.iter_mut().take(at_count) {
-        let ax = r.read_i8()?;
-        let ay = r.read_i8()?;
-        *slot = (ax, ay);
+    if !sdhuff {
+        let at_count = if sdtemplate == 0 { 4 } else { 1 };
+        for slot in at.iter_mut().take(at_count) {
+            let ax = r.read_i8()?;
+            let ay = r.read_i8()?;
+            *slot = (ax, ay);
+        }
     }
     // SDRAT (refinement AT) is only present when SDREFAGG=1, which we rejected.
 
@@ -107,6 +110,19 @@ pub fn decode_symbol_dictionary(
     }
 
     let data = &payload[r.position()..];
+
+    if sdhuff {
+        return decode_symbol_dictionary_huffman(
+            data,
+            flags,
+            imported,
+            huffman_tables,
+            num_new,
+            num_ex_usize,
+            total,
+            limits,
+        );
+    }
 
     // Fresh coder state: zero the reused context banks.
     int_ctx.reset();
@@ -205,6 +221,348 @@ pub fn decode_symbol_dictionary(
     Ok(SymbolDictionary {
         exported_symbols: exported.into_boxed_slice(),
     })
+}
+
+/// Select the standard or custom Huffman table for a two-bit selection field.
+/// `custom` is an iterator over the referred custom tables, consumed in field
+/// order (T.88 §7.4.3.1.6 — the same rule applies to the symbol dictionary).
+fn select_table<'a, I>(
+    selection: u32,
+    std_a: u8,
+    std_b: u8,
+    custom: &mut I,
+) -> Result<TableRef, DecodeError>
+where
+    I: Iterator<Item = &'a Arc<HuffmanTable>>,
+{
+    match selection {
+        0 => Ok(TableRef::Owned(standard_table(std_a)?)),
+        1 => Ok(TableRef::Owned(standard_table(std_b)?)),
+        3 => custom
+            .next()
+            .map(|t| TableRef::Shared(t.clone()))
+            .ok_or(DecodeError::Malformed {
+                reason: "custom Huffman table referenced but not supplied",
+            }),
+        _ => Err(DecodeError::Malformed {
+            reason: "reserved Huffman table selection (value 2)",
+        }),
+    }
+}
+
+/// A one-bit selection (standard table B.1, or custom).
+fn select_table_bit<'a, I>(bit: bool, custom: &mut I) -> Result<TableRef, DecodeError>
+where
+    I: Iterator<Item = &'a Arc<HuffmanTable>>,
+{
+    if bit {
+        custom
+            .next()
+            .map(|t| TableRef::Shared(t.clone()))
+            .ok_or(DecodeError::Malformed {
+                reason: "custom Huffman table referenced but not supplied",
+            })
+    } else {
+        Ok(TableRef::Owned(standard_table(1)?))
+    }
+}
+
+/// Either an owned standard table or a shared referred custom table.
+enum TableRef {
+    Owned(HuffmanTable),
+    Shared(Arc<HuffmanTable>),
+}
+
+impl TableRef {
+    #[inline]
+    fn get(&self) -> &HuffmanTable {
+        match self {
+            TableRef::Owned(t) => t,
+            TableRef::Shared(t) => t,
+        }
+    }
+}
+
+/// Decode a Huffman-coded symbol dictionary (SDHUFF=1, SDREFAGG=0; T.88 §6.5
+/// with Figure 24 height-class layout).
+#[allow(clippy::too_many_arguments)]
+fn decode_symbol_dictionary_huffman(
+    data: &[u8],
+    flags: u16,
+    imported: &[Arc<MonoBitmap>],
+    huffman_tables: &[Arc<HuffmanTable>],
+    num_new: usize,
+    num_ex: usize,
+    total: usize,
+    limits: &DecodeLimits,
+) -> Result<SymbolDictionary, DecodeError> {
+    // §7.4.2.1.1 table selection fields, resolved to concrete tables. Custom
+    // tables are consumed from the referred list in field order.
+    let mut custom = huffman_tables.iter();
+    let dh_sel = ((flags >> 2) & 0x0003) as u32;
+    let dw_sel = ((flags >> 4) & 0x0003) as u32;
+    let bmsize_sel = (flags >> 6) & 0x0001 != 0;
+    let agg_sel = (flags >> 7) & 0x0001 != 0;
+    let dh_table = select_table(dh_sel, 4, 5, &mut custom)?;
+    let dw_table = select_table(dw_sel, 2, 3, &mut custom)?;
+    let bmsize_table = select_table_bit(bmsize_sel, &mut custom)?;
+    // SDHUFFAGGINST is unused when SDREFAGG=0, but its custom table (if any) is
+    // still consumed from the referred list.
+    let _agg_table = select_table_bit(agg_sel, &mut custom)?;
+
+    let export_table = standard_table(1)?; // §6.5.10 export runs use Table B.1.
+
+    let mut r = BitReader::new(data);
+    let mut new_symbols: Vec<Arc<MonoBitmap>> = Vec::with_capacity(num_new.min(4096));
+    let mut widths: Vec<u32> = Vec::with_capacity(num_new.min(4096));
+    let mut hc_height: i64 = 0;
+    let mut total_pixels: u64 = 0;
+
+    // §6.5.5 height-class loop.
+    while new_symbols.len() < num_new {
+        let hcdh = match dh_table.get().decode(&mut r)? {
+            HuffmanValue::Value(v) => v as i64,
+            HuffmanValue::Oob => {
+                return Err(DecodeError::Malformed {
+                    reason: "OOB where height-class delta expected",
+                });
+            }
+        };
+        hc_height = hc_height.checked_add(hcdh).ok_or(DecodeError::Overflow {
+            operation: "height class height",
+        })?;
+        if hc_height <= 0 || hc_height > limits.max_height as i64 {
+            return Err(DecodeError::Malformed {
+                reason: "non-positive or oversized height class",
+            });
+        }
+
+        let hc_first = new_symbols.len();
+        let mut sym_width: i64 = 0;
+        let mut tot_width: i64 = 0;
+        // §6.5.5 4c) width loop, terminated by OOB(DW).
+        loop {
+            match dw_table.get().decode(&mut r)? {
+                HuffmanValue::Oob => break,
+                HuffmanValue::Value(dw) => {
+                    sym_width =
+                        sym_width.checked_add(dw as i64).ok_or(DecodeError::Overflow {
+                            operation: "symbol width",
+                        })?;
+                }
+            }
+            if sym_width <= 0 || sym_width > limits.max_width as i64 {
+                return Err(DecodeError::Malformed {
+                    reason: "non-positive or oversized symbol width",
+                });
+            }
+            if new_symbols.len() >= num_new {
+                return Err(DecodeError::Malformed {
+                    reason: "more symbols coded than SDNUMNEWSYMS",
+                });
+            }
+            tot_width = tot_width
+                .checked_add(sym_width)
+                .ok_or(DecodeError::Overflow {
+                    operation: "height class total width",
+                })?;
+            let px = (sym_width as u64)
+                .checked_mul(hc_height as u64)
+                .ok_or(DecodeError::Overflow {
+                    operation: "symbol pixel count",
+                })?;
+            if px > limits.max_symbol_pixels {
+                return Err(DecodeError::limit(LimitError::Pixels {
+                    what: "symbol",
+                    value: px,
+                    limit: limits.max_symbol_pixels,
+                }));
+            }
+            total_pixels = total_pixels.checked_add(px).ok_or(DecodeError::Overflow {
+                operation: "dictionary pixel total",
+            })?;
+            if total_pixels > limits.max_total_dictionary_pixels {
+                return Err(DecodeError::limit(LimitError::Pixels {
+                    what: "dictionary",
+                    value: total_pixels,
+                    limit: limits.max_total_dictionary_pixels,
+                }));
+            }
+            // Reserve a slot; the bitmap is filled from the collective bitmap.
+            new_symbols.push(Arc::new(MonoBitmap::new(1, 1, false, limits)?));
+            widths.push(sym_width as u32);
+        }
+
+        // §6.5.9 height class collective bitmap.
+        let bmsize = match bmsize_table.get().decode(&mut r)? {
+            HuffmanValue::Value(v) if v >= 0 => v as usize,
+            _ => {
+                return Err(DecodeError::Malformed {
+                    reason: "invalid height-class collective bitmap size",
+                });
+            }
+        };
+        r.align_to_byte();
+        let tot_width_u = u32::try_from(tot_width).map_err(|_| DecodeError::Overflow {
+            operation: "collective bitmap width",
+        })?;
+        let hc_height_u = hc_height as u32;
+
+        let collective = if tot_width_u == 0 {
+            MonoBitmap::new(0, hc_height_u, false, limits)?
+        } else if bmsize == 0 {
+            // Uncompressed: HCHEIGHT rows of TOTWIDTH pixels, byte-padded.
+            let row_bytes = (tot_width_u as usize).div_ceil(8);
+            let need = row_bytes
+                .checked_mul(hc_height_u as usize)
+                .ok_or(DecodeError::Overflow {
+                    operation: "uncompressed collective bitmap size",
+                })?;
+            let bytes = take_bytes(&mut r, need)?;
+            bitmap_from_uncompressed(bytes, tot_width_u, hc_height_u, row_bytes, limits)?
+        } else {
+            // MMR-coded collective bitmap of exactly `bmsize` bytes.
+            let bytes = take_bytes(&mut r, bmsize)?;
+            decode_mmr_bitmap(bytes, tot_width_u, hc_height_u, limits)?
+        };
+        r.align_to_byte();
+
+        // Split the collective bitmap into the height class's symbols.
+        let mut x0 = 0u32;
+        for i in hc_first..new_symbols.len() {
+            let w = widths[i];
+            let sym = extract_columns(&collective, x0, w, hc_height_u, limits)?;
+            new_symbols[i] = Arc::new(sym);
+            x0 += w;
+        }
+    }
+
+    // §6.5.10 export flags via Table B.1 over the same bit reader.
+    let exported =
+        export_symbols_huffman(&mut r, &export_table, imported, &new_symbols, total, num_ex)?;
+    Ok(SymbolDictionary {
+        exported_symbols: exported.into_boxed_slice(),
+    })
+}
+
+/// Take exactly `n` bytes from the byte-aligned reader position.
+fn take_bytes<'a>(r: &mut BitReader<'a>, n: usize) -> Result<&'a [u8], DecodeError> {
+    let start = r.byte_position();
+    let slice = r.remaining_from_byte();
+    if slice.len() < n {
+        return Err(DecodeError::Parse(crate::decode::error::ParseError::UnexpectedEof {
+            offset: start,
+            needed: n - slice.len(),
+        }));
+    }
+    // Advance the reader past the consumed bytes.
+    for _ in 0..n {
+        let _ = r.read_bits(8);
+    }
+    Ok(&slice[..n])
+}
+
+/// Build a bitmap from uncompressed, byte-padded, MSB-first row data.
+fn bitmap_from_uncompressed(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    row_bytes: usize,
+    limits: &DecodeLimits,
+) -> Result<MonoBitmap, DecodeError> {
+    let mut bm = MonoBitmap::new(width, height, false, limits)?;
+    for y in 0..height {
+        let row = &bytes[(y as usize) * row_bytes..(y as usize + 1) * row_bytes];
+        for x in 0..width {
+            let byte = row[(x as usize) >> 3];
+            let bit = 7 - (x & 7);
+            if (byte >> bit) & 1 != 0 {
+                bm.set(x, y, true);
+            }
+        }
+    }
+    Ok(bm)
+}
+
+/// Extract columns `[x0, x0+width)` of `src` as a new bitmap.
+fn extract_columns(
+    src: &MonoBitmap,
+    x0: u32,
+    width: u32,
+    height: u32,
+    limits: &DecodeLimits,
+) -> Result<MonoBitmap, DecodeError> {
+    let mut bm = MonoBitmap::new(width, height, false, limits)?;
+    for y in 0..height {
+        for x in 0..width {
+            if src.get(x0 + x, y) {
+                bm.set(x, y, true);
+            }
+        }
+    }
+    Ok(bm)
+}
+
+/// §6.5.10 export flags for the Huffman path: run lengths decoded with Table
+/// B.1 over the Huffman bit reader; otherwise identical to the arithmetic path.
+fn export_symbols_huffman(
+    r: &mut BitReader<'_>,
+    table: &HuffmanTable,
+    imported: &[Arc<MonoBitmap>],
+    new_symbols: &[Arc<MonoBitmap>],
+    total: usize,
+    expected_exports: usize,
+) -> Result<Vec<Arc<MonoBitmap>>, DecodeError> {
+    let mut exported: Vec<Arc<MonoBitmap>> = Vec::with_capacity(expected_exports.min(total));
+    let mut index = 0usize;
+    let mut ex_flag = false;
+    let max_runs = total.saturating_mul(2).saturating_add(4);
+    let mut runs = 0usize;
+
+    while index < total {
+        runs += 1;
+        if runs > max_runs {
+            return Err(DecodeError::Malformed {
+                reason: "export-flag run count exceeded",
+            });
+        }
+        let run = match table.decode(r)? {
+            HuffmanValue::Value(v) if v >= 0 => v as usize,
+            _ => {
+                return Err(DecodeError::Malformed {
+                    reason: "invalid export run length",
+                });
+            }
+        };
+        if run > total - index {
+            return Err(DecodeError::Malformed {
+                reason: "export run overruns symbol space",
+            });
+        }
+        if ex_flag {
+            for j in index..index + run {
+                let sym = if j < imported.len() {
+                    imported[j].clone()
+                } else {
+                    new_symbols[j - imported.len()].clone()
+                };
+                exported.push(sym);
+            }
+        }
+        index += run;
+        ex_flag = !ex_flag;
+    }
+    if index != total {
+        return Err(DecodeError::Malformed {
+            reason: "export runs do not cover symbol space exactly",
+        });
+    }
+    if exported.len() != expected_exports {
+        return Err(DecodeError::Malformed {
+            reason: "exported symbol count does not match SDNUMEXSYMS",
+        });
+    }
+    Ok(exported)
 }
 
 /// Decode the run-length export flags and materialise the exported symbol list.

@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use crate::decode::arith::ArithmeticDecoder;
 use crate::decode::error::{DecodeError, LimitError, UnsupportedFeature};
+use crate::decode::huffman::{standard_table, BitReader, HuffmanTable, HuffmanValue};
 use crate::decode::iaid::IaidContexts;
 use crate::decode::integer::{DecodedInteger, IntegerContexts};
 use crate::decode::refinement::decode_refinement_region;
@@ -77,6 +78,7 @@ fn clamp_i32(v: i64) -> i32 {
 pub fn decode_text_region(
     payload: &[u8],
     symbols: &[Arc<MonoBitmap>],
+    huffman_tables: &[Arc<HuffmanTable>],
     limits: &DecodeLimits,
     int_ctx: &mut IntegerContexts,
     iaid_ctx: &mut IaidContexts,
@@ -104,8 +106,31 @@ pub fn decode_text_region(
     let ds_offset_raw = ((flags >> 10) & 0x001F) as u32;
     let sb_rtemplate = ((flags >> 15) & 0x0001) as u8;
 
+    // Sign-extend the 5-bit SBDSOFFSET (shared by both coding paths).
+    let sb_ds_offset: i32 = if ds_offset_raw >= 16 {
+        ds_offset_raw as i32 - 32
+    } else {
+        ds_offset_raw as i32
+    };
+
     if sbhuff {
-        return Err(DecodeError::Unsupported(UnsupportedFeature::HuffmanCoding));
+        return decode_text_region_huffman(
+            &mut r,
+            payload,
+            TextGeometry { width, height, x, y, ext_comb },
+            TextFlags {
+                sbrefine,
+                log_strips,
+                ref_corner,
+                transposed,
+                sb_comb_op,
+                sb_def_pixel,
+                sb_ds_offset,
+            },
+            symbols,
+            huffman_tables,
+            limits,
+        );
     }
     if transposed {
         return Err(DecodeError::Unsupported(
@@ -138,13 +163,6 @@ pub fn decode_text_region(
             limit: limits.max_symbols as u64,
         }));
     }
-
-    // Sign-extend the 5-bit SBDSOFFSET.
-    let sb_ds_offset: i32 = if ds_offset_raw >= 16 {
-        ds_offset_raw as i32 - 32
-    } else {
-        ds_offset_raw as i32
-    };
 
     let sb_num_syms = symbols.len() as u32;
     let code_len = log2_ceil(sb_num_syms) as u8;
@@ -312,6 +330,358 @@ pub fn decode_text_region(
         y,
         comb_operator: ext_comb,
     })
+}
+
+/// Geometry from the region-segment information field.
+struct TextGeometry {
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    ext_comb: u8,
+}
+
+/// The text-region flag fields shared by both coding paths.
+struct TextFlags {
+    sbrefine: bool,
+    log_strips: u8,
+    ref_corner: u8,
+    transposed: bool,
+    sb_comb_op: u8,
+    sb_def_pixel: bool,
+    sb_ds_offset: i32,
+}
+
+/// Select an FS/DS/DT/... Huffman table from a two-bit selection, consuming a
+/// custom table from `custom` (in field order) for selection value 3.
+fn tr_select<'a, I>(
+    selection: u32,
+    a: u8,
+    b: u8,
+    c: Option<u8>,
+    custom: &mut I,
+) -> Result<TrTable, DecodeError>
+where
+    I: Iterator<Item = &'a Arc<HuffmanTable>>,
+{
+    match selection {
+        0 => Ok(TrTable::Owned(standard_table(a)?)),
+        1 => Ok(TrTable::Owned(standard_table(b)?)),
+        2 if c.is_some() => {
+            let idx = c.ok_or(DecodeError::Malformed {
+                reason: "reserved text-region Huffman table selection",
+            })?;
+            Ok(TrTable::Owned(standard_table(idx)?))
+        }
+        3 => custom
+            .next()
+            .map(|t| TrTable::Shared(t.clone()))
+            .ok_or(DecodeError::Malformed {
+                reason: "custom Huffman table referenced but not supplied",
+            }),
+        _ => Err(DecodeError::Malformed {
+            reason: "reserved text-region Huffman table selection",
+        }),
+    }
+}
+
+enum TrTable {
+    Owned(HuffmanTable),
+    Shared(Arc<HuffmanTable>),
+}
+impl TrTable {
+    #[inline]
+    fn get(&self) -> &HuffmanTable {
+        match self {
+            TrTable::Owned(t) => t,
+            TrTable::Shared(t) => t,
+        }
+    }
+}
+
+/// Decode the symbol-ID Huffman table (T.88 §7.4.3.1.7): 35 four-bit RUNCODE
+/// lengths, run-length-coded symbol-ID code lengths, then B.3 code assignment.
+fn decode_symbol_id_table(
+    r: &mut BitReader<'_>,
+    num_syms: usize,
+    limits: &DecodeLimits,
+) -> Result<HuffmanTable, DecodeError> {
+    // 1) 35 RUNCODE code lengths (4 bits each).
+    let mut runcode_lengths = [0u32; 35];
+    for len in runcode_lengths.iter_mut() {
+        *len = r.read_bits(4);
+    }
+    let runcode_table = HuffmanTable::from_code_lengths(&runcode_lengths)?;
+
+    // 3–5) decode `num_syms` symbol-ID code lengths.
+    let mut lengths: Vec<u32> = Vec::with_capacity(num_syms.min(1 << 16));
+    let mut prev_len = 0u32;
+    let mut guard = 0usize;
+    let guard_max = num_syms.saturating_mul(2).saturating_add(64);
+    while lengths.len() < num_syms {
+        guard += 1;
+        if guard > guard_max {
+            return Err(DecodeError::Malformed {
+                reason: "symbol-ID code-length run overrun",
+            });
+        }
+        let code = match runcode_table.decode(r)? {
+            HuffmanValue::Value(v) => v as u32,
+            HuffmanValue::Oob => {
+                return Err(DecodeError::Malformed {
+                    reason: "OOB in symbol-ID runcode stream",
+                });
+            }
+        };
+        match code {
+            0..=31 => {
+                lengths.push(code);
+                prev_len = code;
+            }
+            32 => {
+                // Copy the previous length 3–6 times (2 extra bits + 3).
+                let repeat = r.read_bits(2) as usize + 3;
+                for _ in 0..repeat {
+                    if lengths.len() >= num_syms {
+                        break;
+                    }
+                    lengths.push(prev_len);
+                }
+            }
+            33 => {
+                // Repeat length 0 for 3–10 times (3 extra bits + 3).
+                let repeat = r.read_bits(3) as usize + 3;
+                for _ in 0..repeat {
+                    if lengths.len() >= num_syms {
+                        break;
+                    }
+                    lengths.push(0);
+                }
+                prev_len = 0;
+            }
+            34 => {
+                // Repeat length 0 for 11–138 times (7 extra bits + 11).
+                let repeat = r.read_bits(7) as usize + 11;
+                for _ in 0..repeat {
+                    if lengths.len() >= num_syms {
+                        break;
+                    }
+                    lengths.push(0);
+                }
+                prev_len = 0;
+            }
+            _ => {
+                return Err(DecodeError::Malformed {
+                    reason: "invalid symbol-ID runcode",
+                });
+            }
+        }
+        if lengths.len() > limits.max_symbols {
+            return Err(DecodeError::limit(LimitError::Count {
+                what: "symbol-ID code lengths",
+                value: lengths.len() as u64,
+                limit: limits.max_symbols as u64,
+            }));
+        }
+    }
+    // 6) byte-align, then 7) build SBSYMCODES.
+    r.align_to_byte();
+    HuffmanTable::from_code_lengths(&lengths)
+}
+
+/// Decode a Huffman-coded text region (SBHUFF=1). Non-transposed, non-refined
+/// (SBREFINE=0) — transposed and refined Huffman text regions are Phase 5e.
+#[allow(clippy::too_many_arguments)]
+fn decode_text_region_huffman(
+    r: &mut Reader<'_>,
+    payload: &[u8],
+    geom: TextGeometry,
+    tf: TextFlags,
+    symbols: &[Arc<MonoBitmap>],
+    huffman_tables: &[Arc<HuffmanTable>],
+    limits: &DecodeLimits,
+) -> Result<TextRegionResult, DecodeError> {
+    if tf.transposed {
+        return Err(DecodeError::Unsupported(
+            UnsupportedFeature::TransposedTextRegion,
+        ));
+    }
+    if tf.sbrefine {
+        // Huffman + refinement is Phase 5e.
+        return Err(DecodeError::Unsupported(UnsupportedFeature::RefinementRegion));
+    }
+
+    // §7.4.3.1.2 text region Huffman flags (16-bit).
+    let hflags = r.read_u16_be()?;
+    let fs_sel = (hflags & 0x0003) as u32;
+    let ds_sel = ((hflags >> 2) & 0x0003) as u32;
+    let dt_sel = ((hflags >> 4) & 0x0003) as u32;
+    // RDW/RDH/RDX/RDY/RSIZE selections are only meaningful when SBREFINE=1.
+
+    // §7.4.3.1.4 SBNUMINSTANCES.
+    let num_instances = r.read_u32_be()?;
+    if num_instances as usize > limits.max_symbols {
+        return Err(DecodeError::limit(LimitError::Count {
+            what: "text instances",
+            value: num_instances as u64,
+            limit: limits.max_symbols as u64,
+        }));
+    }
+
+    // Select FS/DS/DT tables (custom tables consumed in field order).
+    let mut custom = huffman_tables.iter();
+    let fs_table = tr_select(fs_sel, 6, 7, None, &mut custom)?;
+    let ds_table = tr_select(ds_sel, 8, 9, Some(10), &mut custom)?;
+    let dt_table = tr_select(dt_sel, 11, 12, Some(13), &mut custom)?;
+
+    // The symbol-ID table and the strip data share one bit stream starting at
+    // the current byte position (§7.4.3.1.5 then the strip data).
+    let bit_start = r.position();
+    let mut br = BitReader::new(&payload[bit_start..]);
+    let sb_num_syms = symbols.len();
+    let sym_table = decode_symbol_id_table(&mut br, sb_num_syms, limits)?;
+
+    let sb_strips: i64 = 1i64 << (tf.log_strips & 0x03);
+    let log_strips = (tf.log_strips & 0x03) as u32;
+    let symbol_op = comb_op(tf.sb_comb_op);
+    let mut bitmap = MonoBitmap::new(geom.width, geom.height, tf.sb_def_pixel, limits)?;
+
+    // §6.4.5 2) initial STRIPT = -(DT0 * SBSTRIPS); FIRSTS = 0.
+    let dt0 = huff_value(dt_table.get().decode(&mut br)?)? as i64;
+    let mut strip_t: i64 = -(dt0 * sb_strips);
+    let mut first_s: i64 = 0;
+    let mut n_inst: u32 = 0;
+
+    while n_inst < num_instances {
+        // §6.4.5 4b) strip delta T.
+        let dt = huff_value(dt_table.get().decode(&mut br)?)? as i64;
+        strip_t = strip_t
+            .checked_add(dt * sb_strips)
+            .ok_or(DecodeError::Overflow { operation: "strip T" })?;
+
+        // §6.4.5 4c i) first S coordinate.
+        let dfs = huff_value(fs_table.get().decode(&mut br)?)? as i64;
+        first_s = first_s
+            .checked_add(dfs)
+            .ok_or(DecodeError::Overflow { operation: "first S" })?;
+        let mut cur_s = first_s;
+        let mut first_in_strip = true;
+
+        loop {
+            if !first_in_strip {
+                // §6.4.5 4c ii) subsequent S; OOB ends the strip.
+                match ds_table.get().decode(&mut br)? {
+                    HuffmanValue::Oob => break,
+                    HuffmanValue::Value(ids) => {
+                        cur_s = cur_s
+                            .checked_add(ids as i64 + tf.sb_ds_offset as i64)
+                            .ok_or(DecodeError::Overflow { operation: "S coordinate" })?;
+                    }
+                }
+            }
+            first_in_strip = false;
+
+            if n_inst >= num_instances {
+                return Err(DecodeError::Malformed {
+                    reason: "more text instances than SBNUMINSTANCES",
+                });
+            }
+
+            // §6.4.5 4c iii) T within the strip.
+            let cur_t = if sb_strips == 1 {
+                0
+            } else {
+                br.read_bits(log_strips) as i64
+            };
+            let t_i = strip_t
+                .checked_add(cur_t)
+                .ok_or(DecodeError::Overflow { operation: "T coordinate" })?;
+
+            // §6.4.5 4c iv) symbol ID via SBSYMCODES.
+            let id = match sym_table.decode(&mut br)? {
+                HuffmanValue::Value(v) => v as usize,
+                HuffmanValue::Oob => {
+                    return Err(DecodeError::Malformed {
+                        reason: "OOB decoding symbol ID",
+                    });
+                }
+            };
+            let symbol = symbols.get(id).ok_or(DecodeError::Malformed {
+                reason: "symbol id out of range",
+            })?;
+            let wi = symbol.width() as i64;
+            let hi = symbol.height() as i64;
+
+            place_symbol(
+                &mut bitmap,
+                symbol,
+                tf.ref_corner,
+                &mut cur_s,
+                t_i,
+                wi,
+                hi,
+                symbol_op,
+            )?;
+
+            n_inst += 1;
+        }
+    }
+
+    Ok(TextRegionResult {
+        bitmap,
+        x: geom.x,
+        y: geom.y,
+        comb_operator: geom.ext_comb,
+    })
+}
+
+/// Non-transposed symbol placement (T.88 §6.4.5 4c vi–xi) for all four
+/// reference corners, advancing `cur_s` per the spec's before/after rules.
+#[allow(clippy::too_many_arguments)]
+fn place_symbol(
+    bitmap: &mut MonoBitmap,
+    symbol: &MonoBitmap,
+    ref_corner: u8,
+    cur_s: &mut i64,
+    t_i: i64,
+    wi: i64,
+    hi: i64,
+    op: CombinationOperator,
+) -> Result<(), DecodeError> {
+    // REFCORNER: 0 BOTTOMLEFT, 1 TOPLEFT, 2 BOTTOMRIGHT, 3 TOPRIGHT.
+    let right = ref_corner == 2 || ref_corner == 3;
+    let bottom = ref_corner == 0 || ref_corner == 2;
+
+    // vi) right corners advance CURS by WI-1 *before* placement.
+    if right {
+        *cur_s = cur_s
+            .checked_add(wi - 1)
+            .ok_or(DecodeError::Overflow { operation: "S advance (pre)" })?;
+    }
+    let si = *cur_s;
+    // viii) placement corner → top-left of the bitmap.
+    let s_left = if right { si - (wi - 1) } else { si };
+    let t_top = if bottom { t_i - (hi - 1) } else { t_i };
+    bitmap.combine(symbol, clamp_i32(s_left), clamp_i32(t_top), op);
+
+    // xi) left corners advance CURS by WI-1 *after* placement.
+    if !right {
+        *cur_s = cur_s
+            .checked_add(wi - 1)
+            .ok_or(DecodeError::Overflow { operation: "S advance (post)" })?;
+    }
+    Ok(())
+}
+
+/// Require a finite Huffman value (OOB where a value is mandatory is malformed).
+#[inline]
+fn huff_value(v: HuffmanValue) -> Result<i32, DecodeError> {
+    match v {
+        HuffmanValue::Value(v) => Ok(v),
+        HuffmanValue::Oob => Err(DecodeError::Malformed {
+            reason: "unexpected OOB in Huffman text region",
+        }),
+    }
 }
 
 /// The glyph placed for one instance: a borrowed dictionary symbol (RI=0) or a

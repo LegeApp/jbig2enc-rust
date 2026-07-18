@@ -10,6 +10,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use crate::decode::error::DecodeError;
+use crate::decode::huffman::HuffmanTable;
 use crate::decode::pattern_dictionary::PatternDictionary;
 use crate::decode::symbol_dictionary::SymbolDictionary;
 use crate::shared::bitmap::MonoBitmap;
@@ -21,6 +22,9 @@ pub enum DecodedSegment {
     SymbolDictionary(Arc<SymbolDictionary>),
     /// A pattern dictionary's patterns (referred by halftone regions).
     PatternDictionary(Arc<PatternDictionary>),
+    /// A custom Huffman table (segment type 53), referred by symbol
+    /// dictionaries and text regions using user-supplied tables (T.88 §7.4.13).
+    HuffmanTable(Arc<HuffmanTable>),
     /// A retained region bitmap (intermediate regions; not produced by the
     /// current encoder but modelled for completeness).
     Region(Arc<MonoBitmap>),
@@ -124,5 +128,31 @@ impl SegmentStore {
             }
         }
         Ok(out)
+    }
+
+    /// Gather the referred custom Huffman tables (segment type 53), in reference
+    /// order, checking `self` then `globals`. Referred non-table segments are
+    /// skipped (a symbol dictionary refers to both its input dictionaries and
+    /// its custom tables); a referred number in neither store is ignored here
+    /// (symbol/pattern resolution reports genuine missing references).
+    pub fn gather_huffman_tables(
+        &self,
+        referred: &[u32],
+        globals: Option<&SegmentStore>,
+    ) -> Vec<Arc<HuffmanTable>> {
+        let mut out: Vec<Arc<HuffmanTable>> = Vec::new();
+        for &rn in referred {
+            let found = match self.values.get(&rn) {
+                Some(DecodedSegment::HuffmanTable(t)) => Some(t),
+                _ => match globals.and_then(|g| g.get(rn)) {
+                    Some(DecodedSegment::HuffmanTable(t)) => Some(t),
+                    _ => None,
+                },
+            };
+            if let Some(t) = found {
+                out.push(t.clone());
+            }
+        }
+        out
     }
 }

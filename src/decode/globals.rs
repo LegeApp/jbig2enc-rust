@@ -11,7 +11,7 @@ use std::sync::Arc;
 use crate::decode::context::DecoderContext;
 use crate::decode::error::{DecodeError, UnsupportedFeature};
 use crate::decode::file;
-use crate::decode::page::{decode_pattern_dict_into, decode_symbol_dict_into};
+use crate::decode::page::{decode_pattern_dict_into, decode_symbol_dict_into, decode_tables_into};
 use crate::decode::pattern_dictionary::PatternDictionary;
 use crate::decode::store::SegmentStore;
 use crate::decode::symbol_dictionary::SymbolDictionary;
@@ -76,13 +76,15 @@ pub fn decode_globals(
                 let dict = decode_pattern_dict_into(seg, &mut store, &options.limits, &mut ctx)?;
                 pattern_dictionaries.push(dict);
             }
+            Some(SegmentType::Tables) => {
+                decode_tables_into(seg, &mut store, &options.limits)?;
+            }
             // Structural / metadata segments carry no resource.
             Some(
                 SegmentType::EndOfFile
                 | SegmentType::EndOfPage
                 | SegmentType::EndOfStripe
                 | SegmentType::Profiles
-                | SegmentType::Tables
                 | SegmentType::ColorPalette
                 | SegmentType::FileHeader
                 | SegmentType::Extension,
