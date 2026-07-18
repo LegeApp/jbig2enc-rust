@@ -25,8 +25,6 @@ pub enum UnsupportedFeature {
     RefinementRegion,
     #[error("segment type {0} not handled in this phase")]
     SegmentType(u8),
-    #[error("transposed text region")]
-    TransposedTextRegion,
     #[error("symbol dictionary refinement / aggregate coding")]
     SymbolRefinement,
 }

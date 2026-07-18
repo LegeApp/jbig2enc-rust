@@ -9,7 +9,9 @@
 
 mod common;
 
-use common::writer::{huffman_symbol_text_page, standalone_file, TestBitmap};
+use common::writer::{
+    huffman_symbol_text_page, huffman_symbol_text_page_ex, standalone_file, TestBitmap,
+};
 use jbig2enc_rust::decode::{decode_embedded, DecodeOptions};
 
 /// A small distinct glyph of the given size.
@@ -116,6 +118,55 @@ fn repeated_symbol_ids() {
     let symbols = vec![glyph(5, 9, 7), glyph(5, 9, 8), glyph(5, 9, 9)];
     let placements = [(1usize, 2i32), (1, 9), (0, 16), (2, 23), (1, 30)];
     check(48, 12, &symbols, &placements, "repeated-ids");
+}
+
+#[test]
+fn transposed_vertical_text() {
+    // TRANSPOSED=1: the S axis is Y, so glyphs stack vertically at x=0. Symbols
+    // share one height class (the simple dict writer's constraint); widths are
+    // non-decreasing (standard SDHUFFDW table B.2).
+    let symbols = vec![glyph(4, 6, 20), glyph(5, 6, 21), glyph(6, 6, 22)];
+    // (symbol_index, s=Y coordinate), increasing down the column.
+    let placements = [(0usize, 1i32), (1, 8), (2, 15)];
+    let (w, h) = (12u32, 24u32);
+    let stream = huffman_symbol_text_page_ex(w, h, &symbols, &placements, true);
+
+    // Expected: each glyph's top-left at (0, s).
+    let mut expected = TestBitmap::new(w, h);
+    for &(sym, s) in &placements {
+        let g = &symbols[sym];
+        for gy in 0..g.height {
+            for gx in 0..g.width {
+                if g.get(gx, gy) {
+                    let py = s + gy as i32;
+                    if py >= 0 && (py as u32) < h {
+                        expected.set(gx, py as u32, true);
+                    }
+                }
+            }
+        }
+    }
+
+    let got = decode_embedded(None, &stream, &opts())
+        .unwrap_or_else(|e| panic!("transposed: native decode failed: {e}"));
+    for y in 0..h {
+        for x in 0..w {
+            assert_eq!(got.get(x, y), expected.get(x, y), "transposed native ({x},{y})");
+        }
+    }
+    let file = standalone_file(&stream);
+    if let Some(res) = common::oracle::decode_standalone(&file) {
+        let pbm = res.unwrap_or_else(|e| panic!("transposed: jbig2dec failed: {e}"));
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(
+                    pbm.get(x, y) != 0,
+                    expected.get(x, y),
+                    "transposed oracle ({x},{y})"
+                );
+            }
+        }
+    }
 }
 
 #[test]

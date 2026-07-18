@@ -518,15 +518,18 @@ pub fn huffman_symbol_dict_payload(symbols: &[TestBitmap]) -> Vec<u8> {
     payload
 }
 
-/// Build a Huffman text-region segment payload (SBHUFF=1, SBREFINE=0,
-/// TRANSPOSED=0, TOPLEFT, SBSTRIPS=1). `placements` are `(symbol_index, s, t)`
-/// with all instances in a single strip at `t = 0`, ordered by increasing S.
+/// Build a Huffman text-region segment payload (SBHUFF=1, SBREFINE=0, TOPLEFT,
+/// SBSTRIPS=1). `placements` are `(symbol_index, s)` in a single strip at
+/// `t = 0`, ordered by increasing S. When `transposed`, the S axis is Y.
+#[allow(clippy::too_many_arguments)]
 pub fn huffman_text_region_payload(
     width: u32,
     height: u32,
     num_symbols: usize,
     symbol_widths: &[u32],
+    symbol_heights: &[u32],
     placements: &[(usize, i32)],
+    transposed: bool,
 ) -> Vec<u8> {
     let fs = standard_table(6).unwrap();
     let ds = standard_table(8).unwrap(); // has OOB
@@ -558,17 +561,26 @@ pub fn huffman_text_region_payload(
     // STRIPT = -(1) then += 1, giving strip T = 0.
     emit_value(&mut w, &dt, 1); // initial STRIPT: DT0 = 1
     emit_value(&mut w, &dt, 1); // strip delta T = 1 -> strip T becomes 0
+    // TOPLEFT advances CURS after placement by the glyph extent along the S
+    // axis: the width for a normal region, the height when transposed.
+    let extent = |sym: usize| {
+        if transposed {
+            symbol_heights[sym] as i32
+        } else {
+            symbol_widths[sym] as i32
+        }
+    };
     // First S.
     let (first_sym, first_s) = placements[0];
     emit_value(&mut w, &fs, first_s);
     emit_symbol_id(&mut w, &sym_table, first_sym);
-    let mut cur_s = first_s + symbol_widths[first_sym] as i32 - 1;
+    let mut cur_s = first_s + extent(first_sym) - 1;
     // Subsequent instances via IDS.
     for &(sym, s) in &placements[1..] {
         let ids = s - cur_s; // SBDSOFFSET = 0
         emit_value(&mut w, &ds, ids);
         emit_symbol_id(&mut w, &sym_table, sym);
-        cur_s = s + symbol_widths[sym] as i32 - 1;
+        cur_s = s + extent(sym) - 1;
     }
     emit_oob(&mut w, &ds); // end of strip
     let data = w.into_bytes();
@@ -580,8 +592,9 @@ pub fn huffman_text_region_payload(
     payload.extend_from_slice(&0u32.to_be_bytes()); // x
     payload.extend_from_slice(&0u32.to_be_bytes()); // y
     payload.push(0); // region flags: OR
-    // §7.4.3.1.1 text flags: SBHUFF=1 (bit0), REFCORNER=TOPLEFT=1 (bits4-5=01).
-    let text_flags: u16 = 0x0001 | (1 << 4);
+    // §7.4.3.1.1 text flags: SBHUFF=1 (bit0), REFCORNER=TOPLEFT=1 (bits4-5=01),
+    // TRANSPOSED (bit6).
+    let text_flags: u16 = 0x0001 | (1 << 4) | ((transposed as u16) << 6);
     payload.extend_from_slice(&text_flags.to_be_bytes());
     // §7.4.3.1.2 Huffman flags: all standard (0).
     payload.extend_from_slice(&0u16.to_be_bytes());
@@ -764,6 +777,17 @@ pub fn huffman_symbol_text_page(
     symbols: &[TestBitmap],
     placements: &[(usize, i32)],
 ) -> Vec<u8> {
+    huffman_symbol_text_page_ex(page_w, page_h, symbols, placements, false)
+}
+
+/// As [`huffman_symbol_text_page`], with an explicit `transposed` flag.
+pub fn huffman_symbol_text_page_ex(
+    page_w: u32,
+    page_h: u32,
+    symbols: &[TestBitmap],
+    placements: &[(usize, i32)],
+    transposed: bool,
+) -> Vec<u8> {
     let mut stream = Vec::new();
     // Segment 0: page info.
     let page_data = page_info_payload(page_w, page_h);
@@ -775,7 +799,16 @@ pub fn huffman_symbol_text_page(
     stream.extend_from_slice(&dict);
     // Segment 2: Huffman text region (type 6, immediate) referring to segment 1.
     let widths: Vec<u32> = symbols.iter().map(|s| s.width).collect();
-    let region = huffman_text_region_payload(page_w, page_h, symbols.len(), &widths, placements);
+    let heights: Vec<u32> = symbols.iter().map(|s| s.height).collect();
+    let region = huffman_text_region_payload(
+        page_w,
+        page_h,
+        symbols.len(),
+        &widths,
+        &heights,
+        placements,
+        transposed,
+    );
     stream.extend_from_slice(&segment_header(2, 6, &[1], 1, region.len() as u32));
     stream.extend_from_slice(&region);
     // Segment 3: end of page.

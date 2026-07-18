@@ -132,12 +132,6 @@ pub fn decode_text_region(
             limits,
         );
     }
-    if transposed {
-        return Err(DecodeError::Unsupported(
-            UnsupportedFeature::TransposedTextRegion,
-        ));
-    }
-
     // §7.4.3.1.3 SBRAT: refinement adaptive-template pixels, present only when
     // SBREFINE=1 and SBRTEMPLATE=0 (GRTEMPLATE-0 uses two AT pairs = 4 bytes).
     // Only the first (target) pair GRAT1 is used by the template-0 context.
@@ -288,29 +282,21 @@ pub fn decode_text_region(
                 (PlacedSymbol::Borrowed(symbol), hi)
             };
 
-            // Non-transposed placement: top-left corner at (cur_s, t_i); the
-            // reference corner only shifts the vertical anchor. CURS advances by
-            // the reference WI-1.
-            let s_left = cur_s;
-            let t_top = match ref_corner {
-                // BOTTOMLEFT / BOTTOMRIGHT: anchor is the glyph's bottom row.
-                0 | 2 => t_i - (placed_height - 1),
-                // TOPLEFT / TOPRIGHT.
-                _ => t_i,
-            };
+            // Placement (all four reference corners, transposed or not). The
+            // placed glyph is the reference symbol, or its refinement when RI=1;
+            // CURS advances by the *placed* glyph extent, matching jbig2dec.
             let placed_width = placed.bitmap().width() as i64;
-            bitmap.combine(
+            place_symbol(
+                &mut bitmap,
                 placed.bitmap(),
-                clamp_i32(s_left),
-                clamp_i32(t_top),
+                ref_corner,
+                transposed,
+                &mut cur_s,
+                t_i,
+                placed_width,
+                placed_height,
                 symbol_op,
-            );
-
-            // §6.4.5 3c x): advance by the *placed* glyph width (the refined
-            // bitmap when RI=1), matching jbig2dec exactly.
-            cur_s = cur_s
-                .checked_add(placed_width - 1)
-                .ok_or(DecodeError::Overflow { operation: "S advance" })?;
+            )?;
             n_inst += 1;
             if n_inst == num_instances {
                 return Ok(TextRegionResult {
@@ -501,13 +487,9 @@ fn decode_text_region_huffman(
     huffman_tables: &[Arc<HuffmanTable>],
     limits: &DecodeLimits,
 ) -> Result<TextRegionResult, DecodeError> {
-    if tf.transposed {
-        return Err(DecodeError::Unsupported(
-            UnsupportedFeature::TransposedTextRegion,
-        ));
-    }
     if tf.sbrefine {
-        // Huffman + refinement is Phase 5e.
+        // Huffman + refinement is deferred (rare; needs the Huffman refinement
+        // size handling of §6.4.11.5).
         return Err(DecodeError::Unsupported(UnsupportedFeature::RefinementRegion));
     }
 
@@ -616,6 +598,7 @@ fn decode_text_region_huffman(
                 &mut bitmap,
                 symbol,
                 tf.ref_corner,
+                tf.transposed,
                 &mut cur_s,
                 t_i,
                 wi,
@@ -635,13 +618,14 @@ fn decode_text_region_huffman(
     })
 }
 
-/// Non-transposed symbol placement (T.88 §6.4.5 4c vi–xi) for all four
-/// reference corners, advancing `cur_s` per the spec's before/after rules.
+/// Symbol placement (T.88 §6.4.5 4c vi–xi) for all four reference corners and
+/// both axis orientations, advancing `cur_s` per the spec's before/after rules.
 #[allow(clippy::too_many_arguments)]
 fn place_symbol(
     bitmap: &mut MonoBitmap,
     symbol: &MonoBitmap,
     ref_corner: u8,
+    transposed: bool,
     cur_s: &mut i64,
     t_i: i64,
     wi: i64,
@@ -652,23 +636,43 @@ fn place_symbol(
     let right = ref_corner == 2 || ref_corner == 3;
     let bottom = ref_corner == 0 || ref_corner == 2;
 
-    // vi) right corners advance CURS by WI-1 *before* placement.
-    if right {
-        *cur_s = cur_s
-            .checked_add(wi - 1)
-            .ok_or(DecodeError::Overflow { operation: "S advance (pre)" })?;
-    }
-    let si = *cur_s;
-    // viii) placement corner → top-left of the bitmap.
-    let s_left = if right { si - (wi - 1) } else { si };
-    let t_top = if bottom { t_i - (hi - 1) } else { t_i };
-    bitmap.combine(symbol, clamp_i32(s_left), clamp_i32(t_top), op);
-
-    // xi) left corners advance CURS by WI-1 *after* placement.
-    if !right {
-        *cur_s = cur_s
-            .checked_add(wi - 1)
-            .ok_or(DecodeError::Overflow { operation: "S advance (post)" })?;
+    if !transposed {
+        // vi) right corners advance CURS (the X axis) by WI-1 before placement.
+        if right {
+            *cur_s = cur_s
+                .checked_add(wi - 1)
+                .ok_or(DecodeError::Overflow { operation: "S advance (pre)" })?;
+        }
+        let si = *cur_s;
+        // viii) SBREG[SI, TI] with the given reference corner → top-left.
+        let x_left = if right { si - (wi - 1) } else { si };
+        let y_top = if bottom { t_i - (hi - 1) } else { t_i };
+        bitmap.combine(symbol, clamp_i32(x_left), clamp_i32(y_top), op);
+        // xi) left corners advance CURS by WI-1 after placement.
+        if !right {
+            *cur_s = cur_s
+                .checked_add(wi - 1)
+                .ok_or(DecodeError::Overflow { operation: "S advance (post)" })?;
+        }
+    } else {
+        // Transposed: the S axis is Y and the T axis is X (§6.4.5).
+        // vi) bottom corners advance CURS (the Y axis) by HI-1 before placement.
+        if bottom {
+            *cur_s = cur_s
+                .checked_add(hi - 1)
+                .ok_or(DecodeError::Overflow { operation: "S advance (pre)" })?;
+        }
+        let si = *cur_s;
+        // viii) SBREG[TI, SI] with the given reference corner → top-left.
+        let x_left = if right { t_i - (wi - 1) } else { t_i };
+        let y_top = if bottom { si - (hi - 1) } else { si };
+        bitmap.combine(symbol, clamp_i32(x_left), clamp_i32(y_top), op);
+        // xi) top corners advance CURS by HI-1 after placement.
+        if !bottom {
+            *cur_s = cur_s
+                .checked_add(hi - 1)
+                .ok_or(DecodeError::Overflow { operation: "S advance (post)" })?;
+        }
     }
     Ok(())
 }
