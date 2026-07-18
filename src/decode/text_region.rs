@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use crate::decode::arith::ArithmeticDecoder;
-use crate::decode::error::{DecodeError, LimitError, UnsupportedFeature};
+use crate::decode::error::{DecodeError, LimitError};
 use crate::decode::huffman::{standard_table, BitReader, HuffmanTable, HuffmanValue};
 use crate::decode::iaid::IaidContexts;
 use crate::decode::integer::{DecodedInteger, IntegerContexts};
@@ -126,9 +126,11 @@ pub fn decode_text_region(
                 sb_comb_op,
                 sb_def_pixel,
                 sb_ds_offset,
+                sb_rtemplate,
             },
             symbols,
             huffman_tables,
+            refine_ctx,
             limits,
         );
     }
@@ -373,6 +375,7 @@ struct TextFlags {
     sb_comb_op: u8,
     sb_def_pixel: bool,
     sb_ds_offset: i32,
+    sb_rtemplate: u8,
 }
 
 /// Select an FS/DS/DT/... Huffman table from a two-bit selection, consuming a
@@ -512,8 +515,9 @@ fn decode_symbol_id_table(
     HuffmanTable::from_code_lengths(&lengths)
 }
 
-/// Decode a Huffman-coded text region (SBHUFF=1). Non-transposed, non-refined
-/// (SBREFINE=0) — transposed and refined Huffman text regions are Phase 5e.
+/// Decode a Huffman-coded text region (SBHUFF=1), including SBREFINE=1 (the
+/// symbol IDs and positions are Huffman-coded; each refinement bitmap is a
+/// byte-aligned arithmetic block of the Huffman-coded size, §6.4.11.5).
 #[allow(clippy::too_many_arguments)]
 fn decode_text_region_huffman(
     r: &mut Reader<'_>,
@@ -522,20 +526,29 @@ fn decode_text_region_huffman(
     tf: TextFlags,
     symbols: &[Arc<MonoBitmap>],
     huffman_tables: &[Arc<HuffmanTable>],
+    refine_ctx: &mut [MqContext],
     limits: &DecodeLimits,
 ) -> Result<TextRegionResult, DecodeError> {
-    if tf.sbrefine {
-        // Huffman + refinement is deferred (rare; needs the Huffman refinement
-        // size handling of §6.4.11.5).
-        return Err(DecodeError::Unsupported(UnsupportedFeature::RefinementRegion));
-    }
-
     // §7.4.3.1.2 text region Huffman flags (16-bit).
     let hflags = r.read_u16_be()?;
     let fs_sel = (hflags & 0x0003) as u32;
     let ds_sel = ((hflags >> 2) & 0x0003) as u32;
     let dt_sel = ((hflags >> 4) & 0x0003) as u32;
-    // RDW/RDH/RDX/RDY/RSIZE selections are only meaningful when SBREFINE=1.
+    let rdw_sel = ((hflags >> 6) & 0x0003) as u32;
+    let rdh_sel = ((hflags >> 8) & 0x0003) as u32;
+    let rdx_sel = ((hflags >> 10) & 0x0003) as u32;
+    let rdy_sel = ((hflags >> 12) & 0x0003) as u32;
+    let rsize_sel = (hflags >> 14) & 0x0001 != 0;
+
+    // §7.4.3.1.3 SBRAT: present when SBREFINE=1 and SBRTEMPLATE=0.
+    let mut grat: (i8, i8) = (-1, -1);
+    if tf.sbrefine && tf.sb_rtemplate == 0 {
+        let g1x = r.read_i8()?;
+        let g1y = r.read_i8()?;
+        let _g2x = r.read_i8()?;
+        let _g2y = r.read_i8()?;
+        grat = (g1x, g1y);
+    }
 
     // §7.4.3.1.4 SBNUMINSTANCES.
     let num_instances = r.read_u32_be()?;
@@ -547,11 +560,38 @@ fn decode_text_region_huffman(
         }));
     }
 
-    // Select FS/DS/DT tables (custom tables consumed in field order).
+    // Select FS/DS/DT (+ refinement) tables (custom tables consumed in order:
+    // §7.4.3.1.6 FS, DS, DT, RDW, RDH, RDX, RDY, RSIZE).
     let mut custom = huffman_tables.iter();
     let fs_table = tr_select(fs_sel, 6, 7, None, &mut custom)?;
     let ds_table = tr_select(ds_sel, 8, 9, Some(10), &mut custom)?;
     let dt_table = tr_select(dt_sel, 11, 12, Some(13), &mut custom)?;
+    let (rdw_table, rdh_table, rdx_table, rdy_table, rsize_table);
+    if tf.sbrefine {
+        rdw_table = tr_select(rdw_sel, 14, 15, None, &mut custom)?;
+        rdh_table = tr_select(rdh_sel, 14, 15, None, &mut custom)?;
+        rdx_table = tr_select(rdx_sel, 14, 15, None, &mut custom)?;
+        rdy_table = tr_select(rdy_sel, 14, 15, None, &mut custom)?;
+        rsize_table = if rsize_sel {
+            custom
+                .next()
+                .map(|t| TrTable::Shared(t.clone()))
+                .ok_or(DecodeError::Malformed {
+                    reason: "custom SBHUFFRSIZE table not supplied",
+                })?
+        } else {
+            TrTable::Owned(standard_table(1)?) // Table B.1
+        };
+        for c in refine_ctx.iter_mut() {
+            *c = MqContext(0);
+        }
+    } else {
+        rdw_table = TrTable::Owned(standard_table(1)?);
+        rdh_table = TrTable::Owned(standard_table(1)?);
+        rdx_table = TrTable::Owned(standard_table(1)?);
+        rdy_table = TrTable::Owned(standard_table(1)?);
+        rsize_table = TrTable::Owned(standard_table(1)?);
+    }
 
     // The symbol-ID table and the strip data share one bit stream starting at
     // the current byte position (§7.4.3.1.5 then the strip data).
@@ -628,18 +668,85 @@ fn decode_text_region_huffman(
             let symbol = symbols.get(id).ok_or(DecodeError::Malformed {
                 reason: "symbol id out of range",
             })?;
-            let wi = symbol.width() as i64;
-            let hi = symbol.height() as i64;
+
+            // §6.4.11 refinement indicator (one bit when SBHUFF=1).
+            let ri = if tf.sbrefine { br.read_bit() } else { 0 };
+            let (placed, placed_w, placed_h): (PlacedSymbol<'_>, i64, i64) = if ri != 0 {
+                let rdw = huff_value(rdw_table.get().decode(&mut br)?)? as i64;
+                let rdh = huff_value(rdh_table.get().decode(&mut br)?)? as i64;
+                let rdx = huff_value(rdx_table.get().decode(&mut br)?)?;
+                let rdy = huff_value(rdy_table.get().decode(&mut br)?)?;
+                // §6.4.11.5 refinement bitmap data size, then byte-align.
+                let bmsize = match rsize_table.get().decode(&mut br)? {
+                    HuffmanValue::Value(v) if v >= 0 => v as usize,
+                    _ => {
+                        return Err(DecodeError::Malformed {
+                            reason: "invalid Huffman refinement bitmap size",
+                        });
+                    }
+                };
+                br.align_to_byte();
+                let grw = symbol.width() as i64 + rdw;
+                let grh = symbol.height() as i64 + rdh;
+                if grw <= 0
+                    || grh <= 0
+                    || grw > limits.max_width as i64
+                    || grh > limits.max_height as i64
+                {
+                    return Err(DecodeError::Malformed {
+                        reason: "refined glyph dimensions out of range",
+                    });
+                }
+                let grdx = (rdw.div_euclid(2) as i32).saturating_add(rdx);
+                let grdy = (rdh.div_euclid(2) as i32).saturating_add(rdy);
+                // The refinement is a byte-aligned arithmetic block; per §6.4.11
+                // the Huffman GR statistics are fresh for each such block.
+                for c in refine_ctx.iter_mut() {
+                    *c = MqContext(0);
+                }
+                let refine_bytes = br.remaining_from_byte();
+                let block = if bmsize > 0 && bmsize <= refine_bytes.len() {
+                    &refine_bytes[..bmsize]
+                } else {
+                    refine_bytes
+                };
+                let mut rdec = ArithmeticDecoder::new(block);
+                let refined = decode_refinement_region_templated(
+                    &mut rdec,
+                    symbol,
+                    grw as u32,
+                    grh as u32,
+                    grdx,
+                    grdy,
+                    tf.sb_rtemplate,
+                    false,
+                    grat,
+                    refine_ctx,
+                    limits,
+                )?;
+                // §6.4.11.5 7): skip exactly BMSIZE bytes, then byte-align.
+                for _ in 0..bmsize {
+                    let _ = br.read_bits(8);
+                }
+                br.align_to_byte();
+                (PlacedSymbol::Owned(refined), grw, grh)
+            } else {
+                (
+                    PlacedSymbol::Borrowed(symbol),
+                    symbol.width() as i64,
+                    symbol.height() as i64,
+                )
+            };
 
             place_symbol(
                 &mut bitmap,
-                symbol,
+                placed.bitmap(),
                 tf.ref_corner,
                 tf.transposed,
                 &mut cur_s,
                 t_i,
-                wi,
-                hi,
+                placed_w,
+                placed_h,
                 symbol_op,
             )?;
 

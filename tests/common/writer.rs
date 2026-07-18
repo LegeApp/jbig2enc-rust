@@ -1147,6 +1147,107 @@ pub fn halftone_skip_page(
     stream
 }
 
+/// A page with a Huffman base dictionary (seg 1) and a Huffman text region
+/// (seg 2, SBHUFF=1 ∧ SBREFINE=1) placing each instance as a refinement of a
+/// base symbol. `instances` are `(base_id, s, target)`; each target has the same
+/// size as its base (RDW=RDH=RDX=RDY=0, GRDX=GRDY=0). TOPLEFT, SBSTRIPS=1.
+pub fn huffman_refine_text_page(
+    page_w: u32,
+    page_h: u32,
+    base: &[TestBitmap],
+    instances: &[(usize, i32, TestBitmap)],
+) -> Vec<u8> {
+    let mut stream = Vec::new();
+    let page_data = page_info_payload(page_w, page_h);
+    stream.extend_from_slice(&segment_header(0, 48, &[], 1, page_data.len() as u32));
+    stream.extend_from_slice(&page_data);
+
+    let base_dict = huffman_symbol_dict_payload(base);
+    stream.extend_from_slice(&segment_header(1, 0, &[], 1, base_dict.len() as u32));
+    stream.extend_from_slice(&base_dict);
+
+    // Build the text-region bit stream.
+    let num_syms = base.len();
+    let l = log2_ceil(num_syms).max(1);
+    let mut runcode_lengths = [0u32; 35];
+    runcode_lengths[0] = 1;
+    runcode_lengths[l as usize] = 1;
+    let runcode_table = HuffmanTable::from_code_lengths(&runcode_lengths).unwrap();
+    let sym_table = HuffmanTable::from_code_lengths(&vec![l as u32; num_syms]).unwrap();
+
+    let fs = standard_table(6).unwrap();
+    let ds = standard_table(8).unwrap();
+    let dt = standard_table(11).unwrap();
+    let b14 = standard_table(14).unwrap();
+    let b1 = standard_table(1).unwrap();
+
+    let mut w = BitWriter::new();
+    for len in runcode_lengths.iter() {
+        w.write_bits(*len as u64, 4);
+    }
+    let (rc_code, rc_len, _, _) = runcode_table.encode_value(l as i32).unwrap();
+    for _ in 0..num_syms {
+        w.write_bits(rc_code as u64, rc_len);
+    }
+    w.align();
+
+    emit_value(&mut w, &dt, 1); // DT0 -> STRIPT = -1
+    emit_value(&mut w, &dt, 1); // strip DT -> T = 0
+
+    let (_id0, s0, _) = &instances[0];
+    emit_value(&mut w, &fs, *s0);
+    let mut cur_s = *s0;
+    for (i, (id, s, target)) in instances.iter().enumerate() {
+        if i > 0 {
+            emit_value(&mut w, &ds, *s - cur_s);
+        }
+        // symbol ID.
+        let (code, len, _, _) = sym_table.encode_value(*id as i32).unwrap();
+        w.write_bits(code as u64, len);
+        // RI = 1.
+        w.write_bit(1);
+        // RDW=RDH=RDX=RDY=0 (Table B.14).
+        emit_value(&mut w, &b14, 0);
+        emit_value(&mut w, &b14, 0);
+        emit_value(&mut w, &b14, 0);
+        emit_value(&mut w, &b14, 0);
+        // Refinement block (fresh coder, offset 0), then BMSIZE (Table B.1).
+        let refine = refinement_arith_data(target, &base[*id], 0, false);
+        emit_value(&mut w, &b1, refine.len() as i32);
+        w.align();
+        for b in &refine {
+            w.write_bits(*b as u64, 8);
+        }
+        // Already byte-aligned; CURS advances by the placed width.
+        cur_s = *s + target.width as i32 - 1;
+    }
+    emit_oob(&mut w, &ds);
+    let data = w.into_bytes();
+
+    let mut region = Vec::new();
+    region.extend_from_slice(&page_w.to_be_bytes());
+    region.extend_from_slice(&page_h.to_be_bytes());
+    region.extend_from_slice(&0u32.to_be_bytes());
+    region.extend_from_slice(&0u32.to_be_bytes());
+    region.push(0);
+    // Text flags: SBHUFF=1, SBREFINE=1, REFCORNER=TOPLEFT.
+    let text_flags: u16 = 0x0001 | 0x0002 | (1 << 4);
+    region.extend_from_slice(&text_flags.to_be_bytes());
+    region.extend_from_slice(&0u16.to_be_bytes()); // Huffman flags: all standard
+    // SBRAT (SBREFINE=1, SBRTEMPLATE=0): nominal (-1,-1),(-1,-1).
+    region.push((-1i8) as u8);
+    region.push((-1i8) as u8);
+    region.push((-1i8) as u8);
+    region.push((-1i8) as u8);
+    region.extend_from_slice(&(instances.len() as u32).to_be_bytes());
+    region.extend_from_slice(&data);
+    stream.extend_from_slice(&segment_header(2, 6, &[1], 1, region.len() as u32));
+    stream.extend_from_slice(&region);
+
+    stream.extend_from_slice(&segment_header(3, 49, &[], 1, 0));
+    stream
+}
+
 fn emit_symbol_id(w: &mut BitWriter, sym_table: &HuffmanTable, id: usize) {
     let (code, len, _, _) = sym_table
         .encode_value(id as i32)
