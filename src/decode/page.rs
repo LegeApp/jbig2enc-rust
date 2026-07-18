@@ -236,6 +236,10 @@ pub fn process_document_with_globals(
     let mut store = SegmentStore::new();
     let globals_store = globals.map(|g| g.store());
 
+    // Surface any parse-time recoveries (Compatible mode, jbig2decplan.md §20).
+    ctx.recovery_events.clear();
+    ctx.recovery_events.extend(doc.recovery.iter().cloned());
+
     for seg in &doc.segments {
         let ty = seg.header.segment_type();
         match ty {

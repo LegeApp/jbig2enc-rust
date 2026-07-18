@@ -19,12 +19,22 @@ use crate::shared::mq_table::MqContext;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DecodeStrictness {
     /// Enforce reserved bits, reject inconsistent counts and unsupported flag
-    /// combinations. This is the only mode wired up in Phase 1.
+    /// combinations, and treat any malformation as a hard error.
     #[default]
     Strict,
-    /// Permit documented recovery for malformed PDFs. Defined but unused until
-    /// a real corpus case motivates each recovery (Phase 5).
+    /// Permit documented recovery for malformed streams; each recovery records
+    /// a [`RecoveryEvent`] in the [`DecoderContext`].
     Compatible,
+}
+
+/// A malformation tolerated in [`DecodeStrictness::Compatible`] mode
+/// (jbig2decplan.md §20). Recorded in [`DecoderContext::recovery_events`] so the
+/// caller can log or reject the stream after the fact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecoveryEvent {
+    /// Trailing bytes after the last well-formed segment did not parse as a
+    /// segment header; they were ignored. `offset` is where they began.
+    TrailingGarbage { offset: usize, bytes: usize },
 }
 
 /// Options controlling a decode (jbig2decplan.md §5, §20).
@@ -81,6 +91,10 @@ pub struct DecoderContext {
     /// Scratch for a temporary region bitmap when a region cannot decode
     /// straight into the page.
     pub temporary_bitmap: MonoBitmap,
+    /// Malformations tolerated during the last decode in
+    /// [`DecodeStrictness::Compatible`] mode (jbig2decplan.md §20). Cleared at
+    /// the start of each decode.
+    pub recovery_events: Vec<RecoveryEvent>,
 }
 
 impl DecoderContext {

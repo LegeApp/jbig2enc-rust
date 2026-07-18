@@ -59,7 +59,7 @@ pub fn decode_globals(
     data: &[u8],
     options: &DecodeOptions,
 ) -> Result<DecodedGlobals, DecodeError> {
-    let doc = file::parse_auto(data, &options.limits)?;
+    let doc = file::parse_auto_with(data, &options.limits, options.strictness)?;
     let mut ctx = DecoderContext::new();
     let mut store = SegmentStore::new();
     let mut symbol_dictionaries = Vec::new();

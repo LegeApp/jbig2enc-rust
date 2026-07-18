@@ -3,6 +3,7 @@
 //! segment sequence. Parsing is separated from execution — this module only
 //! locates segment boundaries and slices payloads; nothing is decoded here.
 
+use crate::decode::context::{DecodeStrictness, RecoveryEvent};
 use crate::decode::error::{DecodeError, ParseError, UnsupportedFeature};
 use crate::decode::segment::{SegmentHeader, ensure_known_length, parse_segment_header};
 use crate::shared::limits::DecodeLimits;
@@ -33,13 +34,23 @@ pub struct ParsedSegment<'a> {
 pub struct ParsedDocument<'a> {
     pub organization: FileOrganization,
     pub segments: Vec<ParsedSegment<'a>>,
+    /// Malformations tolerated in [`DecodeStrictness::Compatible`] mode.
+    pub recovery: Vec<RecoveryEvent>,
 }
 
-/// Parse a standalone JBIG2 file (T.88 Annex D). Only sequential organisation
-/// is supported; random access returns a typed `Unsupported` error.
+/// Parse a standalone JBIG2 file (T.88 Annex D) in strict mode.
 pub fn parse_file<'a>(
     data: &'a [u8],
     limits: &DecodeLimits,
+) -> Result<ParsedDocument<'a>, DecodeError> {
+    parse_file_with(data, limits, DecodeStrictness::Strict)
+}
+
+/// Parse a standalone JBIG2 file with an explicit strictness.
+pub fn parse_file_with<'a>(
+    data: &'a [u8],
+    limits: &DecodeLimits,
+    strictness: DecodeStrictness,
 ) -> Result<ParsedDocument<'a>, DecodeError> {
     let mut reader = Reader::new(data);
 
@@ -59,19 +70,17 @@ pub fn parse_file<'a>(
         let _n_pages = reader.read_u32_be()?;
     }
 
-    if sequential {
-        let segments = parse_segment_sequence(&mut reader, limits)?;
-        Ok(ParsedDocument {
-            organization: FileOrganization::Sequential,
-            segments,
-        })
+    let mut recovery = Vec::new();
+    let segments = if sequential {
+        parse_segment_sequence(&mut reader, limits, strictness, &mut recovery)?
     } else {
-        let segments = parse_random_access(&mut reader, limits)?;
-        Ok(ParsedDocument {
-            organization: FileOrganization::Sequential,
-            segments,
-        })
-    }
+        parse_random_access(&mut reader, limits)?
+    };
+    Ok(ParsedDocument {
+        organization: FileOrganization::Sequential,
+        segments,
+        recovery,
+    })
 }
 
 /// Parse the random-access organisation (T.88 §D.2): all segment headers first
@@ -134,18 +143,34 @@ pub fn parse_embedded<'a>(
     data: &'a [u8],
     limits: &DecodeLimits,
 ) -> Result<ParsedDocument<'a>, DecodeError> {
+    parse_embedded_with(data, limits, DecodeStrictness::Strict)
+}
+
+/// Parse a bare embedded segment sequence with an explicit strictness.
+pub fn parse_embedded_with<'a>(
+    data: &'a [u8],
+    limits: &DecodeLimits,
+    strictness: DecodeStrictness,
+) -> Result<ParsedDocument<'a>, DecodeError> {
     let mut reader = Reader::new(data);
-    let segments = parse_segment_sequence(&mut reader, limits)?;
+    let mut recovery = Vec::new();
+    let segments = parse_segment_sequence(&mut reader, limits, strictness, &mut recovery)?;
     Ok(ParsedDocument {
         organization: FileOrganization::Embedded,
         segments,
+        recovery,
     })
 }
 
 /// Parse consecutive `[header][data]` segments until the reader is exhausted.
+/// In [`DecodeStrictness::Compatible`] mode, trailing bytes after the last
+/// well-formed segment that fail to parse as a segment header are tolerated and
+/// recorded as a [`RecoveryEvent::TrailingGarbage`].
 fn parse_segment_sequence<'a>(
     reader: &mut Reader<'a>,
     limits: &DecodeLimits,
+    strictness: DecodeStrictness,
+    recovery: &mut Vec<RecoveryEvent>,
 ) -> Result<Vec<ParsedSegment<'a>>, DecodeError> {
     let mut segments = Vec::new();
     while !reader.is_empty() {
@@ -156,7 +181,23 @@ fn parse_segment_sequence<'a>(
                 limit: limits.max_segments as u64,
             }));
         }
-        let header = parse_segment_header(reader).map_err(DecodeError::Parse)?;
+        let seg_start = reader.position();
+        let remaining_at_start = reader.remaining();
+        let header = match parse_segment_header(reader) {
+            Ok(h) => h,
+            Err(e) => {
+                // A malformed header after at least one good segment, in
+                // Compatible mode, is treated as trailing garbage.
+                if strictness == DecodeStrictness::Compatible && !segments.is_empty() {
+                    recovery.push(RecoveryEvent::TrailingGarbage {
+                        offset: seg_start,
+                        bytes: remaining_at_start,
+                    });
+                    break;
+                }
+                return Err(DecodeError::Parse(e));
+            }
+        };
         if header.referred_to.len() > limits.max_referred_segments {
             return Err(DecodeError::limit(crate::decode::error::LimitError::Count {
                 what: "referred-to segments",
@@ -230,15 +271,24 @@ pub fn has_file_magic(data: &[u8]) -> bool {
 }
 
 /// Parse either a standalone file (if the magic is present) or an embedded
-/// stream (otherwise).
+/// stream (otherwise), in strict mode.
 pub fn parse_auto<'a>(
     data: &'a [u8],
     limits: &DecodeLimits,
 ) -> Result<ParsedDocument<'a>, DecodeError> {
+    parse_auto_with(data, limits, DecodeStrictness::Strict)
+}
+
+/// Parse either organisation with an explicit strictness.
+pub fn parse_auto_with<'a>(
+    data: &'a [u8],
+    limits: &DecodeLimits,
+    strictness: DecodeStrictness,
+) -> Result<ParsedDocument<'a>, DecodeError> {
     if has_file_magic(data) {
-        parse_file(data, limits)
+        parse_file_with(data, limits, strictness)
     } else {
-        parse_embedded(data, limits)
+        parse_embedded_with(data, limits, strictness)
     }
 }
 

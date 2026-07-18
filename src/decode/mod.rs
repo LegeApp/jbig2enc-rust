@@ -30,7 +30,7 @@ pub mod store;
 pub mod symbol_dictionary;
 pub mod text_region;
 
-pub use context::{DecodeOptions, DecodeStrictness, DecoderContext};
+pub use context::{DecodeOptions, DecodeStrictness, DecoderContext, RecoveryEvent};
 pub use error::{DecodeError, LimitError, ParseError, UnsupportedFeature};
 pub use file::{FileOrganization, ParsedDocument, ParsedSegment};
 pub use globals::{decode_globals, DecodedGlobals};
@@ -69,7 +69,7 @@ pub fn decode_file_with_context(
     options: &DecodeOptions,
     ctx: &mut DecoderContext,
 ) -> Result<DecodedDocument, DecodeError> {
-    let doc = file::parse_auto(data, &options.limits)?;
+    let doc = file::parse_auto_with(data, &options.limits, options.strictness)?;
     let organization = doc.organization;
     let pages = page::process_document(&doc, &options.limits, ctx)?;
     Ok(DecodedDocument { organization, pages })
@@ -116,7 +116,7 @@ pub fn decode_embedded_with_globals(
     options: &DecodeOptions,
     ctx: &mut DecoderContext,
 ) -> Result<MonoBitmap, DecodeError> {
-    let doc = file::parse_auto(page_data, &options.limits)?;
+    let doc = file::parse_auto_with(page_data, &options.limits, options.strictness)?;
     let mut pages =
         page::process_document_with_globals(&doc, globals, &options.limits, ctx)?;
     if pages.is_empty() {
