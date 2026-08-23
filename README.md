@@ -1,5 +1,7 @@
 # jbig2enc-rust
 
+> **Archived:** The newest version of this codec is maintained in the [Lege monorepo](https://github.com/LegeApp/Lege/tree/main/lege-codecs/jbig2enc-rust).
+
 A JBIG2 encoder and decoder in Rust for bilevel (black-and-white) images —
 scanned documents, PDF-embedded streams, and standalone JBIG2 files.
 
